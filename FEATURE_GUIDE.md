@@ -203,7 +203,7 @@ Keep ambient drones running between songs or beneath prayers:
 ## 15. Mixer Console, 16 Sub-Mix Buses & Hardware Routing
 
 - Reorder stems by dragging strips, double-click faders or adjust Pan dials, and toggle Solo (`S`), Mute (`M`), and **Solo Safe** (so Click and Guide never mute when you solo an instrument).
-- Switch the bottom view between **Faders** and **Buses** (`Click, Guide, Drums, Percussion, Loops, Bass, Piano, Keys, Electric Guitars, Acoustic Guitars, Strings, Horns, Pad, Vocals, FX, Aux`). Tracks named *Synth Pad* automatically route to the **Keys** bus.
+- Switch the bottom view between **Faders** and **Buses** (`Click, Guide, Drums, Percussion, Loops, Bass, Piano, Keys, Electric Guitars, Acoustic Guitars, Strings, Horns, Pad, Vocals, FX, Aux`).
 - Open **Settings → Configure Buses, Routing, & MIDI...** to pick your CoreAudio interface, inspect detected hardware output channels, route each of the 16 buses to any Stereo Pair (`Out 1/2`, `Out 3/4`, etc.) or Mono output (`Out 1`, `Out 2`, etc.), and reassign any stem's bus.
 
 ---
@@ -217,7 +217,7 @@ Automate lighting, lyric slides, patch changes, and external gear across **8 col
 - Push updated MIDI cues and ProPresenter settings back to the master `.pbsong` (Local or Cloud) or pull updates from the library via **Song Menu**.
 - Configure **Playlist** (`F-1`, Note `17`) and **Playlist Item** (`F#-1`, Note `18`) in **Song Menu** to trigger ProPresenter slides when a song starts.
 - In **Configure Buses, Routing, & MIDI... → MIDI Buses**, output **24 PPQN MIDI Beat Clock** (Start / Clock / Stop) synced to song tempo and mid-song meter/tempo changes to selected MIDI destinations.
-- Use **Mute MIDI** in the right sidebar to silence all outgoing MIDI cues during rehearsals.
+- Use **Mute MIDI** in the right sidebar to silence all outgoing MIDI cues.
 
 ---
 
@@ -267,7 +267,7 @@ Click any highlighted control on screen (Transport buttons, Song cards `1–10`,
 | **`P`** | Toggle Ambient Pad Player |
 | **`Cmd + P`** | Stop Ambient Pad immediately |
 | **`←` / `→`** | Previous / Next Section |
-| **`Enter`** | Select / Fire queued action *(via Keyboard Mapping)* |
+| **`Enter`** | Select / Fire queued action |
 | **`L`** | Toggle Single Section Loop (`1x`) |
 | **`I`** | Toggle Infinite Section Loop (`∞`) |
 | **`1` – `0`** | Select Setlist Song `1` through `10` |
