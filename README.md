@@ -15,6 +15,8 @@ No account login walls at soundcheck. No per-seat cloud fees. No "Pro" tier payw
 
 ![PeanutButter Home Screen — no login, ready to build or load a setlist.](assets/peanutbutter-console.png)
 
+*PeanutButter Home Screen — no login, ready to build or load a setlist.*
+
 ---
 
 ## Why Teams Switch to PeanutButter
