@@ -80,6 +80,12 @@ Use the built-in 4-step **Import from Playback...** wizard to read your local Mu
 
 ---
 
+## Download
+
+Download the latest signed and notarized Universal macOS installer (`PeanutButter.dmg`) from **[Releases](https://github.com/rghapro/PeanutButter/releases/latest)**, open it, and drag **PeanutButter.app** into **Applications**.
+
+---
+
 ## Quick Start (Build from Source)
 
 ### Requirements

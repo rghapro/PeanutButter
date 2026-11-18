@@ -3,6 +3,7 @@ set -euo pipefail
 
 DO_NOTARIZE=0
 NATIVE_ONLY=0
+DO_DMG=0
 for arg in "$@"; do
     case "$arg" in
         --notarize)
@@ -11,9 +12,12 @@ for arg in "$@"; do
         --native-only)
             NATIVE_ONLY=1
             ;;
+        --dmg)
+            DO_DMG=1
+            ;;
         *)
             echo "Unknown argument: $arg" >&2
-            echo "Usage: ./build.sh [--notarize] [--native-only]" >&2
+            echo "Usage: ./build.sh [--notarize] [--native-only] [--dmg]" >&2
             exit 1
             ;;
     esac
@@ -129,6 +133,14 @@ if [ "$DO_NOTARIZE" -eq 1 ]; then
     echo "Packaging notarized PeanutButter.zip..."
     rm -f "PeanutButter.zip"
     ditto -c -k --sequesterRsrc --keepParent "$STAGE_DIR/PeanutButter.app" "PeanutButter.zip"
+
+    echo "Packaging and notarizing PeanutButter.dmg..."
+    chmod +x "./scripts/make_dmg.sh"
+    ./scripts/make_dmg.sh "$STAGE_DIR/PeanutButter.app" "PeanutButter.dmg" "$SIGN_IDENTITY" "$NOTARY_PROFILE"
+elif [ "$DO_DMG" -eq 1 ]; then
+    echo "Packaging PeanutButter.dmg..."
+    chmod +x "./scripts/make_dmg.sh"
+    ./scripts/make_dmg.sh "PeanutButter.app" "PeanutButter.dmg" "$SIGN_IDENTITY"
 fi
 
 echo "Build and packaging successful! You can now launch 'PeanutButter.app' or run 'open \"PeanutButter.app\"'."
