@@ -123,15 +123,22 @@ public final class OfflineBounceEngine {
     @MainActor
     public static func bounceSessionReference(
         engine: MultitrackAudioEngine,
+        includedSongIds: Set<UUID>? = nil,
         includeClick: Bool,
         includeGuide: Bool,
         format: BounceAudioFormat,
         outputURL: URL,
         progress: @escaping @Sendable (Double, String) -> Void
     ) async throws {
-        let songs = engine.currentSetlist.songs
+        let songs: [Song]
+        if let includedIds = includedSongIds {
+            songs = engine.currentSetlist.songs.filter { includedIds.contains($0.id) }
+        } else {
+            songs = engine.currentSetlist.songs
+        }
         guard !songs.isEmpty else {
-            throw NSError(domain: "OfflineBounceEngine", code: 1, userInfo: [NSLocalizedDescriptionKey: "Setlist has no songs to bounce."])
+            let message = includedSongIds != nil ? "Select at least one song to bounce." : "Setlist has no songs to bounce."
+            throw NSError(domain: "OfflineBounceEngine", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
         }
 
         let sampleRate: Double = 44100.0

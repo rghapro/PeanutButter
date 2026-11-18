@@ -19,6 +19,8 @@ public struct OfflineBounceSheetView: View {
     @State private var includeGuide: Bool = true
     @State private var selectedFormat: BounceAudioFormat = .mp3
     @State private var selectedInstruments: Set<PracticeInstrument> = Set(PracticeInstrument.allCases)
+    @State private var selectedSongIds: Set<UUID>
+    @State private var knownSongIds: Set<UUID>
 
     @State private var isBouncing: Bool = false
     @State private var progressValue: Double = 0.0
@@ -39,14 +41,26 @@ public struct OfflineBounceSheetView: View {
         self.embeddedInPopover = embeddedInPopover
         self.onDismiss = onDismiss
         self._mode = State(initialValue: initialMode)
+        let initialIds = Set(engine.currentSetlist.songs.map(\.id))
+        self._selectedSongIds = State(initialValue: initialIds)
+        self._knownSongIds = State(initialValue: initialIds)
     }
 
     private var effectiveSong: Song {
         targetSong ?? engine.currentSong
     }
 
+    private var selectedSongs: [Song] {
+        engine.currentSetlist.songs.filter { selectedSongIds.contains($0.id) }
+    }
+
+    private var allSongsSelected: Bool {
+        let songs = engine.currentSetlist.songs
+        return !songs.isEmpty && songs.allSatisfy { selectedSongIds.contains($0.id) }
+    }
+
     public var body: some View {
-        VStack(alignment: .leading, spacing: embeddedInPopover ? 12 : 14) {
+        VStack(alignment: .leading, spacing: embeddedInPopover ? 10 : 14) {
             // Header
             if embeddedInPopover {
                 HStack {
@@ -170,7 +184,7 @@ public struct OfflineBounceSheetView: View {
                             .font(.system(size: 12.5, weight: .semibold))
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(isBouncing || engine.currentSetlist.songs.isEmpty)
+                    .disabled(isBouncing || selectedSongs.isEmpty)
                 } else {
                     Button(action: startPracticeTracksBounce) {
                         Label("Bounce Practice Tracks...", systemImage: "folder.badge.plus")
@@ -181,22 +195,105 @@ public struct OfflineBounceSheetView: View {
                 }
             }
         }
-        .padding(embeddedInPopover ? 16 : (lockMode && mode == .sessionReference ? 14 : 18))
+        .padding(embeddedInPopover ? 16 : (lockMode && mode == .sessionReference ? 16 : 18))
         .frame(
-            width: embeddedInPopover ? 325 : (lockMode && mode == .sessionReference ? 340 : 420),
-            height: embeddedInPopover ? 460 : (lockMode && mode == .sessionReference ? 285 : 410)
+            width: embeddedInPopover ? 325 : (lockMode && mode == .sessionReference ? 380 : 420),
+            height: embeddedInPopover ? 460 : (lockMode && mode == .sessionReference ? 440 : 480)
         )
         .background(Color(red: 0.12, green: 0.13, blue: 0.15))
+        .onChange(of: engine.currentSetlist.songs.map(\.id)) { _, newIds in
+            let newSet = Set(newIds)
+            let addedIds = newSet.subtracting(knownSongIds)
+            selectedSongIds = selectedSongIds.intersection(newSet).union(addedIds)
+            knownSongIds = newSet
+        }
     }
 
     private var sessionReferenceSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Continuous Service Reference Mix")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(.white)
-            Text("Renders all \(engine.currentSetlist.songs.count) songs in \"\(engine.currentSetlist.name)\" faster than real-time. Songs set to \"Stay In Song\" or \"Cue Next Song\" automatically insert a 5-second gap before the next song.")
-                .font(.system(size: 11.5))
-                .foregroundColor(Color(white: 0.65))
+        let songs = engine.currentSetlist.songs
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Songs to Include (\(selectedSongs.count)/\(songs.count))")
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                if !songs.isEmpty {
+                    Button(allSongsSelected ? "Select None" : "Select All") {
+                        if allSongsSelected {
+                            selectedSongIds.removeAll()
+                        } else {
+                            selectedSongIds = Set(songs.map(\.id))
+                        }
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color(red: 0.28, green: 0.68, blue: 0.98))
+                    .buttonStyle(.plain)
+                    .disabled(isBouncing)
+                }
+            }
+
+            if songs.isEmpty {
+                Text("No songs in current setlist.")
+                    .font(.system(size: 11.5))
+                    .foregroundColor(Color(white: 0.55))
+                    .padding(.vertical, 8)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 4) {
+                        ForEach(Array(songs.enumerated()), id: \.element.id) { idx, song in
+                            let isChecked = selectedSongIds.contains(song.id)
+                            let displayKey = (!song.currentTransposedKey.isEmpty && song.currentTransposedKey != "—")
+                                ? song.currentTransposedKey
+                                : song.musicalKey
+                            Button(action: {
+                                if isChecked {
+                                    selectedSongIds.remove(song.id)
+                                } else {
+                                    selectedSongIds.insert(song.id)
+                                }
+                            }) {
+                                HStack(spacing: 8) {
+                                    Image(systemName: isChecked ? "checkmark.square.fill" : "square")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundColor(isChecked ? Color(red: 0.28, green: 0.68, blue: 0.98) : Color(white: 0.45))
+
+                                    Text("\(idx + 1). \(song.title.isEmpty ? "Untitled" : song.title)")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(isChecked ? .white : Color(white: 0.55))
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+
+                                    Spacer()
+
+                                    if !displayKey.isEmpty && displayKey != "—" {
+                                        Text(displayKey)
+                                            .font(.system(size: 10.5, weight: .bold))
+                                            .foregroundColor(isChecked ? Color(red: 0.28, green: 0.68, blue: 0.98) : Color(white: 0.45))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 2)
+                                            .background(Color.white.opacity(0.07))
+                                            .cornerRadius(4)
+                                    }
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(Color.white.opacity(isChecked ? 0.05 : 0.02))
+                                .cornerRadius(5)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isBouncing)
+                        }
+                    }
+                }
+                .frame(maxHeight: embeddedInPopover ? 140 : 165)
+            }
+
+            Text("Songs set to \"Stay In Song\" or \"Cue Next Song\" automatically insert a 5-second gap before the next song.")
+                .font(.system(size: 10.5))
+                .foregroundColor(Color(white: 0.58))
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(10)
@@ -255,6 +352,7 @@ public struct OfflineBounceSheetView: View {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
+        let chosenIds = selectedSongIds
         errorText = nil
         isBouncing = true
         progressValue = 0.0
@@ -268,6 +366,7 @@ public struct OfflineBounceSheetView: View {
             do {
                 try await OfflineBounceEngine.bounceSessionReference(
                     engine: engine,
+                    includedSongIds: chosenIds,
                     includeClick: includeClick,
                     includeGuide: includeGuide,
                     format: selectedFormat,
