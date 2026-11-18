@@ -63,6 +63,9 @@ public struct SetlistLibraryItem: Identifiable {
     public let isDownloaded: Bool
     public let hasCloudUpdate: Bool
     public let changeDescription: String?
+    public let hasUnresolvedServerUpdate: Bool
+    public let lastSavedRevisionId: UUID?
+    public let lastSavedByDeviceId: String?
 
     public init(
         id: URL,
@@ -76,7 +79,10 @@ public struct SetlistLibraryItem: Identifiable {
         source: LibrarySource,
         isDownloaded: Bool,
         hasCloudUpdate: Bool,
-        changeDescription: String? = nil
+        changeDescription: String? = nil,
+        hasUnresolvedServerUpdate: Bool = false,
+        lastSavedRevisionId: UUID? = nil,
+        lastSavedByDeviceId: String? = nil
     ) {
         self.id = id
         self.url = url
@@ -90,6 +96,9 @@ public struct SetlistLibraryItem: Identifiable {
         self.isDownloaded = isDownloaded
         self.hasCloudUpdate = hasCloudUpdate
         self.changeDescription = changeDescription
+        self.hasUnresolvedServerUpdate = hasUnresolvedServerUpdate
+        self.lastSavedRevisionId = lastSavedRevisionId
+        self.lastSavedByDeviceId = lastSavedByDeviceId
     }
 }
 
@@ -163,9 +172,30 @@ public final class LibraryBrowserManager: ObservableObject {
                 item: item
             )
         }
+
+        func invalidate(url: URL) {
+            let key = url.standardizedFileURL
+            lock.lock()
+            entries.removeValue(forKey: key)
+            lock.unlock()
+        }
+
+        func invalidateAll() {
+            lock.lock()
+            entries.removeAll()
+            lock.unlock()
+        }
     }
 
     private nonisolated static let setlistPackageCache = SetlistPackageCache()
+
+    public nonisolated static func invalidateSetlistPackageCache(for url: URL? = nil) {
+        if let url = url {
+            setlistPackageCache.invalidate(url: url)
+        } else {
+            setlistPackageCache.invalidateAll()
+        }
+    }
 
     public var isCloudConnected: Bool { cloudRootURL != nil }
 
@@ -499,17 +529,33 @@ public final class LibraryBrowserManager: ObservableObject {
         Task.detached(priority: .userInitiated) {
             let localItems = Self.scanSetlistsSync(in: localDir, source: .local)
             var localModByKey: [String: Date] = [:]
+            var localRevByKey: [String: UUID] = [:]
             for local in localItems {
                 let key = Self.sanitizedPackageFilename(local.name, ext: "pbsession").lowercased()
-                localModByKey[key] = max(localModByKey[key] ?? .distantPast, local.modifiedDate)
+                let prevMod = localModByKey[key] ?? .distantPast
+                if local.modifiedDate >= prevMod {
+                    localModByKey[key] = local.modifiedDate
+                    if let rev = local.lastSavedRevisionId {
+                        localRevByKey[key] = rev
+                    }
+                }
             }
 
+            let currentDeviceId = PlaybackFileManager.currentDeviceInstanceId
             var combined = localItems
             if let cDir = cloudDir {
                 let cloudItems = Self.scanSetlistsSync(in: cDir, source: .cloud).map { item -> SetlistLibraryItem in
                     let key = Self.sanitizedPackageFilename(item.name, ext: "pbsession").lowercased()
-                    let isNewerThanLocal = localModByKey[key].map { item.modifiedDate.timeIntervalSince($0) > 2.0 } ?? false
-                    if item.hasCloudUpdate || isNewerThanLocal {
+                    let isSelfAuthored = (item.lastSavedByDeviceId != nil && item.lastSavedByDeviceId == currentDeviceId) && !item.hasUnresolvedServerUpdate
+                    let isNewerThanLocal: Bool = {
+                        guard !isSelfAuthored, let localMod = localModByKey[key] else { return false }
+                        if let cRev = item.lastSavedRevisionId, let lRev = localRevByKey[key] {
+                            return (cRev != lRev) && (item.modifiedDate > localMod)
+                        }
+                        return item.modifiedDate.timeIntervalSince(localMod) > 2.0
+                    }()
+                    let resolvedHasUpdate = item.hasUnresolvedServerUpdate || isNewerThanLocal
+                    if resolvedHasUpdate != item.hasCloudUpdate {
                         return SetlistLibraryItem(
                             id: item.id,
                             url: item.url,
@@ -521,8 +567,11 @@ public final class LibraryBrowserManager: ObservableObject {
                             modifiedDate: item.modifiedDate,
                             source: item.source,
                             isDownloaded: item.isDownloaded,
-                            hasCloudUpdate: true,
-                            changeDescription: item.changeDescription
+                            hasCloudUpdate: resolvedHasUpdate,
+                            changeDescription: item.changeDescription,
+                            hasUnresolvedServerUpdate: item.hasUnresolvedServerUpdate,
+                            lastSavedRevisionId: item.lastSavedRevisionId,
+                            lastSavedByDeviceId: item.lastSavedByDeviceId
                         )
                     }
                     return item
@@ -535,6 +584,54 @@ public final class LibraryBrowserManager: ObservableObject {
                 self.setlists = finalItems
                 self.isScanningSetlists = false
             }
+        }
+    }
+
+    /// Immediately clears cloud-update indicators on matching in-memory setlist items after a local or cloud save on this Mac.
+    public func markSetlistSavedOnThisDevice(urls: [URL], setlistName: String, revisionId: UUID) {
+        if urls.isEmpty {
+            Self.invalidateSetlistPackageCache(for: nil)
+        } else {
+            for u in urls {
+                Self.invalidateSetlistPackageCache(for: u)
+            }
+        }
+        let targetStdPaths = Set(urls.map { $0.standardizedFileURL.path })
+        let targetFileName = Self.sanitizedPackageFilename(setlistName, ext: "pbsession").lowercased()
+        let deviceId = PlaybackFileManager.currentDeviceInstanceId
+        let now = Date()
+        var didModify = false
+        var updated = setlists
+        for idx in updated.indices {
+            let item = updated[idx]
+            let matchesURL = targetStdPaths.contains(item.url.standardizedFileURL.path)
+            let matchesName = !targetFileName.isEmpty && (
+                Self.sanitizedPackageFilename(item.name, ext: "pbsession").lowercased() == targetFileName
+                    || item.url.lastPathComponent.lowercased() == targetFileName
+            )
+            if matchesURL || matchesName {
+                updated[idx] = SetlistLibraryItem(
+                    id: item.id,
+                    url: item.url,
+                    name: item.name,
+                    songCount: item.songCount,
+                    formattedDate: item.formattedDate,
+                    formattedDuration: item.formattedDuration,
+                    artworks: item.artworks,
+                    modifiedDate: matchesURL ? max(item.modifiedDate, now) : item.modifiedDate,
+                    source: item.source,
+                    isDownloaded: matchesURL ? true : item.isDownloaded,
+                    hasCloudUpdate: false,
+                    changeDescription: item.changeDescription,
+                    hasUnresolvedServerUpdate: false,
+                    lastSavedRevisionId: matchesURL ? revisionId : item.lastSavedRevisionId,
+                    lastSavedByDeviceId: matchesURL ? deviceId : item.lastSavedByDeviceId
+                )
+                didModify = true
+            }
+        }
+        if didModify {
+            setlists = updated
         }
     }
 
@@ -832,6 +929,17 @@ public final class LibraryBrowserManager: ObservableObject {
         return true
     }
 
+    private nonisolated static func hasServerUpdateResourceValues(_ values: URLResourceValues) -> Bool {
+        if values.ubiquitousItemHasUnresolvedConflicts == true {
+            return true
+        }
+        // While an item is still uploading from this Mac, do not mistake it for an incoming server update.
+        if values.ubiquitousItemIsUploading == true || values.ubiquitousItemIsUploaded == false {
+            return false
+        }
+        return values.ubiquitousItemDownloadingStatus == .downloaded
+    }
+
     /// Returns `true` when an iCloud Drive item has a newer version on the server (`.downloaded`
     /// stale local copy or unresolved conflict) compared to what is currently on disk.
     public nonisolated static func checkHasCloudUpdate(at packageURL: URL) -> Bool {
@@ -839,25 +947,27 @@ public final class LibraryBrowserManager: ObservableObject {
         guard fm.fileExists(atPath: packageURL.path) else {
             return false
         }
+        let keys: Set<URLResourceKey> = [
+            .ubiquitousItemDownloadingStatusKey,
+            .ubiquitousItemHasUnresolvedConflictsKey,
+            .ubiquitousItemIsUploadingKey,
+            .ubiquitousItemIsUploadedKey
+        ]
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: packageURL.path, isDirectory: &isDir), isDir.boolValue else {
-            if let vals = try? packageURL.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey, .ubiquitousItemHasUnresolvedConflictsKey]) {
-                if vals.ubiquitousItemHasUnresolvedConflicts == true || vals.ubiquitousItemDownloadingStatus == .downloaded {
-                    return true
-                }
+            if let vals = try? packageURL.resourceValues(forKeys: keys), hasServerUpdateResourceValues(vals) {
+                return true
             }
             return false
         }
         if let enumerator = fm.enumerator(
             at: packageURL,
-            includingPropertiesForKeys: [.ubiquitousItemDownloadingStatusKey, .ubiquitousItemHasUnresolvedConflictsKey],
+            includingPropertiesForKeys: Array(keys),
             options: []
         ) {
             for case let child as URL in enumerator {
-                if let vals = try? child.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey, .ubiquitousItemHasUnresolvedConflictsKey]) {
-                    if vals.ubiquitousItemHasUnresolvedConflicts == true || vals.ubiquitousItemDownloadingStatus == .downloaded {
-                        return true
-                    }
+                if let vals = try? child.resourceValues(forKeys: keys), hasServerUpdateResourceValues(vals) {
+                    return true
                 }
             }
         }
@@ -1086,13 +1196,13 @@ public final class LibraryBrowserManager: ObservableObject {
         let isDir = values?.isDirectory ?? false
         let modDate = packageModificationDate(at: url)
         let downloaded = checkIsDownloaded(at: url)
-        let cloudUpdate = (source == .cloud) ? checkHasCloudUpdate(at: url) : false
+        let rawServerCloudUpdate = (source == .cloud) ? checkHasCloudUpdate(at: url) : false
 
         if let cached = setlistPackageCache.get(
             url: url,
             modDate: modDate,
             isDownloaded: downloaded,
-            hasCloudUpdate: cloudUpdate,
+            hasCloudUpdate: rawServerCloudUpdate,
             source: source
         ) {
             return cached
@@ -1174,14 +1284,17 @@ public final class LibraryBrowserManager: ObservableObject {
                 modifiedDate: modDate,
                 source: source,
                 isDownloaded: allSongsDownloaded,
-                hasCloudUpdate: cloudUpdate,
-                changeDescription: meta.changeDescription
+                hasCloudUpdate: rawServerCloudUpdate,
+                changeDescription: meta.changeDescription,
+                hasUnresolvedServerUpdate: rawServerCloudUpdate,
+                lastSavedRevisionId: meta.lastSavedRevisionId,
+                lastSavedByDeviceId: meta.lastSavedByDeviceId
             )
             setlistPackageCache.set(
                 url: url,
                 modDate: modDate,
                 isDownloaded: downloaded,
-                hasCloudUpdate: cloudUpdate,
+                hasCloudUpdate: rawServerCloudUpdate,
                 source: source,
                 item: item
             )
@@ -1199,13 +1312,14 @@ public final class LibraryBrowserManager: ObservableObject {
             modifiedDate: modDate,
             source: source,
             isDownloaded: downloaded,
-            hasCloudUpdate: cloudUpdate
+            hasCloudUpdate: rawServerCloudUpdate,
+            hasUnresolvedServerUpdate: rawServerCloudUpdate
         )
         setlistPackageCache.set(
             url: url,
             modDate: modDate,
             isDownloaded: downloaded,
-            hasCloudUpdate: cloudUpdate,
+            hasCloudUpdate: rawServerCloudUpdate,
             source: source,
             item: item
         )

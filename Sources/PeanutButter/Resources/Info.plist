@@ -13,9 +13,19 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.3</string>
+    <string>1.0.4</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>5</string>
+    <key>NSUpdateSecurityPolicy</key>
+    <dict>
+        <key>AllowProcesses</key>
+        <dict>
+            <key>M9F8W3VQ4P</key>
+            <array>
+                <string>com.peanutbutter.app</string>
+            </array>
+        </dict>
+    </dict>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIconName</key>

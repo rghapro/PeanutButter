@@ -269,6 +269,14 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         targetFormat: AVAudioFormat
     ) -> SpokenPhraseData? {
         let isRitaFallback = fallbackVoice == .rita || fallbackVoice.rawValue.caseInsensitiveCompare("rita") == .orderedSame
+        if let fbPackId = fallbackVoice.customPackId,
+           let packSample = CustomSampleLibraryManager.shared.getGuidePhraseSample(
+               phrase: cleanPhrase,
+               packId: fbPackId,
+               targetFormat: targetFormat
+           ) {
+            return packSample
+        }
         let primaryFallback: GuideVoice
         if fallbackVoice.isCustom || (isRitaFallback && !allowRita) {
             primaryFallback = .zoe
@@ -301,7 +309,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         let cleanPhrase = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanPhrase.isEmpty else { return nil }
         
-        // 0. User Custom Guide Voice sample pack handler
+        // 0. User & Included Custom Guide Voice sample pack handler
         if let customPackId = voice.customPackId {
             if let customSample = CustomSampleLibraryManager.shared.getGuidePhraseSample(
                 phrase: cleanPhrase,
@@ -310,6 +318,13 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             ) {
                 return customSample
             }
+            if CustomSampleLibraryManager.shared.guidePack(forId: customPackId)?.isBundled == true,
+               let userSample = CustomSampleLibraryManager.shared.getAnyUserCustomPhraseSample(
+                   phrase: cleanPhrase,
+                   targetFormat: targetFormat
+               ) {
+                return userSample
+            }
             return resolveFallbackPhrase(cleanPhrase, fallbackVoice: fallbackVoice, allowRita: true, targetFormat: targetFormat)
         }
         
@@ -317,6 +332,12 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         if voice == .rita || voice.rawValue.caseInsensitiveCompare("rita") == .orderedSame {
             if let ritaSample = AudioSampleBank.shared.getRitaPhraseSample(phrase: cleanPhrase, targetFormat: targetFormat) {
                 return ritaSample
+            }
+            if let userSample = CustomSampleLibraryManager.shared.getAnyUserCustomPhraseSample(
+                phrase: cleanPhrase,
+                targetFormat: targetFormat
+            ) {
+                return userSample
             }
             let defVoice = CustomSampleLibraryManager.shared.defaultGuideVoice
             if defVoice != .rita && defVoice.rawValue.caseInsensitiveCompare("rita") != .orderedSame {

@@ -390,7 +390,12 @@ public struct MainView: View {
             openSessionDialog()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("PlaybackSaveSession"))) { _ in
-            saveSessionDialog()
+            if engine.currentSessionURL != nil {
+                engine.saveQuickSession()
+                showStatus("Saved Setlist")
+            } else {
+                saveSessionDialog()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ToggleSetlistDrawer"))) { _ in
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -1754,6 +1759,14 @@ public struct MainView: View {
                             Image(systemName: "line.3.horizontal")
                                 .font(.system(size: 21, weight: .semibold))
                                 .foregroundColor(Color(white: 0.78))
+                                .overlay(alignment: .topTrailing) {
+                                    if updateManager.availableRelease != nil {
+                                        Circle()
+                                            .fill(Color(red: 0.95, green: 0.25, blue: 0.25))
+                                            .frame(width: 7, height: 7)
+                                            .offset(x: 5, y: -4)
+                                    }
+                                }
                                 .frame(width: 69, height: 67)
                                 .background(isSettingsMenuOpen ? Color(red: 0.20, green: 0.75, blue: 0.95).opacity(0.35) : boxBackground)
                                 .cornerRadius(4)
@@ -2678,8 +2691,11 @@ public struct MainView: View {
         panel.prompt = "Save Session"
         
         if panel.runModal() == .OK, let url = panel.url {
+            let revisionId = UUID()
+            engine.clearSaveAndCloudUpdateIndicators(revisionId: revisionId, targetURLs: [url])
             do {
-                try engine.saveSession(to: url)
+                try engine.saveSession(to: url, revisionId: revisionId)
+                LibraryBrowserManager.shared.refreshSetlists()
                 showStatus("Saved session to \(url.lastPathComponent)")
             } catch {
                 showStatus("Save error: \(error.localizedDescription)")

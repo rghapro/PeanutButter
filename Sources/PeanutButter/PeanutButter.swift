@@ -11,6 +11,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         expandMainWindowOnFirstLargeLaunchIfNeeded()
         DispatchQueue.main.async { [weak self] in
             self?.expandMainWindowOnFirstLargeLaunchIfNeeded()
+            MainActor.assumeIsolated {
+                AppUpdateManager.shared.promptMoveToApplicationsIfNeeded()
+            }
         }
     }
 

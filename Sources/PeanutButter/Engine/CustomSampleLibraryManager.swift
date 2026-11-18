@@ -58,6 +58,26 @@ public struct CustomClickPack: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+/// Controls where an unrecognized user-uploaded custom guide cue is surfaced in menus
+public enum CustomGuideCueKind: String, Codable, CaseIterable, Sendable {
+    case directional = "directional"
+    case songSection = "section"
+
+    public var displayName: String {
+        switch self {
+        case .directional: return "Directional Cue"
+        case .songSection: return "Song Section"
+        }
+    }
+
+    public var shortLabel: String {
+        switch self {
+        case .directional: return "Directional"
+        case .songSection: return "Section"
+        }
+    }
+}
+
 /// Metadata representing a user-uploaded custom spoken guide voice sample pack
 public struct CustomGuidePack: Identifiable, Codable, Hashable, Sendable {
     public let id: String
@@ -67,6 +87,30 @@ public struct CustomGuidePack: Identifiable, Codable, Hashable, Sendable {
     public var phraseFiles: [String: String]
     public var isCloud: Bool
     public var isBundled: Bool = false
+    /// Classification overrides for non-standard user-uploaded guide cues (.directional vs .songSection)
+    public var customCueKinds: [String: CustomGuideCueKind] = [:]
+    /// Preserved display casing for custom guide cues (e.g. "Horns In", "Altar Call")
+    public var customCueLabels: [String: String] = [:]
+
+    public init(
+        id: String,
+        name: String,
+        folderPath: String,
+        phraseFiles: [String: String],
+        isCloud: Bool,
+        isBundled: Bool = false,
+        customCueKinds: [String: CustomGuideCueKind] = [:],
+        customCueLabels: [String: String] = [:]
+    ) {
+        self.id = id
+        self.name = name
+        self.folderPath = folderPath
+        self.phraseFiles = phraseFiles
+        self.isCloud = isCloud
+        self.isBundled = isBundled
+        self.customCueKinds = customCueKinds
+        self.customCueLabels = customCueLabels
+    }
     
     public var folderURL: URL {
         URL(fileURLWithPath: folderPath, isDirectory: true)
@@ -84,6 +128,20 @@ public struct CustomGuidePack: Identifiable, Codable, Hashable, Sendable {
         guard let filename = phraseFiles[key], !filename.isEmpty else { return nil }
         let url = folderURL.appendingPathComponent(filename)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    public func displayLabel(forNormalizedPhrase key: String) -> String {
+        if let saved = customCueLabels[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !saved.isEmpty {
+            return saved
+        }
+        return CustomSampleLibraryManager.formatPhraseDisplayLabel(key)
+    }
+
+    public func cueKind(forNormalizedPhrase key: String) -> CustomGuideCueKind {
+        if let explicit = customCueKinds[key] {
+            return explicit
+        }
+        return CustomSampleLibraryManager.inferDefaultCueKind(forNormalizedPhrase: key)
     }
 }
 
@@ -107,6 +165,8 @@ private struct CustomGuidePackManifest: Codable {
     var id: String
     var name: String
     var phraseFiles: [String: String]
+    var customCueKinds: [String: CustomGuideCueKind]?
+    var customCueLabels: [String: String]?
 }
 
 /// Manages default Click Sound / Guide Voice preferences and user-uploaded custom Click & Guide sample packs.
@@ -120,37 +180,149 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
     public static let supportedAudioExtensions: Set<String> = [
         "wav", "aif", "aiff", "m4a", "mp3", "caf", "flac"
     ]
+
+    public static let standardCountInCues: [String] = ["1", "2", "3", "4", "5", "6", "7", "8"]
+
+    public static let standardSongSectionCues: [String] = [
+        "Intro", "Verse", "Verse 1", "Verse 2", "Verse 3", "Verse 4", "Verse 5", "Verse 6",
+        "Pre Chorus", "Pre Chorus 1", "Pre Chorus 2", "Pre Chorus 3", "Pre Chorus 4",
+        "Chorus", "Chorus 1", "Chorus 2", "Chorus 3", "Chorus 4", "Post Chorus",
+        "Bridge", "Bridge 1", "Bridge 2", "Bridge 3", "Bridge 4", "Bridge 5",
+        "Instrumental", "Interlude", "Vamp", "Tag", "Turnaround",
+        "Breakdown", "Solo", "Acapella", "Refrain", "Passage", "Rap", "Exhortation",
+        "Outro", "Ending"
+    ]
+
+    public static let standardDirectionalCues: [String] = [
+        "Ad Lib", "All In", "All Out", "Band In", "Band Out",
+        "Bass", "Big", "Big Ending", "Break", "Bring It Down",
+        "Build", "Drop", "Drums", "Drums Build", "Drums In",
+        "Drums Out", "Fade Out", "Guitars", "Hits", "Hold",
+        "Key Change Down", "Key Change Up", "Keys", "Last Time", "Repeat",
+        "Slowly Build", "Softly", "Stop", "Swell", "Vocals Only",
+        "Worship Freely"
+    ]
+
+    /// All 33 studio-recorded directional cues bundled with PeanutButter (31 pure directional + Acapella & Breakdown)
+    public static let includedDirectionalMenuOptions: [String] = (
+        standardDirectionalCues + ["Acapella", "Breakdown"]
+    ).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     
     public static let standardGuideCueCategories: [StandardGuideCueCategory] = [
         StandardGuideCueCategory(
             id: "countin",
             title: "Count-In",
-            phrases: ["1", "2", "3", "4", "5", "6", "7"]
+            phrases: standardCountInCues
         ),
         StandardGuideCueCategory(
             id: "sections",
             title: "Song Sections",
-            phrases: [
-                "Intro", "Verse", "Verse 1", "Verse 2", "Verse 3", "Verse 4", "Verse 5", "Verse 6",
-                "Pre Chorus", "Pre Chorus 1", "Pre Chorus 2", "Pre Chorus 3", "Pre Chorus 4",
-                "Chorus", "Chorus 1", "Chorus 2", "Chorus 3", "Chorus 4", "Post Chorus",
-                "Bridge", "Bridge 1", "Bridge 2", "Bridge 3", "Bridge 4", "Bridge 5",
-                "Instrumental", "Interlude", "Vamp", "Tag", "Turnaround",
-                "Breakdown", "Solo", "Acapella", "Refrain", "Passage", "Rap", "Exhortation",
-                "Outro", "Ending"
-            ]
+            phrases: standardSongSectionCues
         ),
         StandardGuideCueCategory(
             id: "dynamic",
             title: "Directional & Dynamic Cues",
-            phrases: [
-                "All In", "All Out", "Band In", "Band Out",
-                "Big", "Build", "Slowly Build", "Bring It Down", "Drop", "Hold",
-                "Drums", "Drums Out", "Drums Build", "Keys", "Guitars", "Bass", "Vocals Only",
-                "Last Time", "Repeat", "Stop", "Fade Out"
-            ]
+            phrases: standardDirectionalCues
         )
     ]
+
+    public static let standardCountInNormalizedKeys: Set<String> = {
+        var keys = Set(standardCountInCues.map { AudioSampleBank.shared.normalizePhraseKey($0) })
+        keys.insert("count in")
+        keys.insert("count off")
+        return keys
+    }()
+
+    public static let standardSectionNormalizedKeys: Set<String> = Set(
+        standardSongSectionCues.map { AudioSampleBank.shared.normalizePhraseKey($0) }
+    )
+
+    public static let standardDirectionalNormalizedKeys: Set<String> = Set(
+        standardDirectionalCues.map { AudioSampleBank.shared.normalizePhraseKey($0) }
+    )
+
+    public static let standardNormalizedKeys: Set<String> = standardCountInNormalizedKeys
+        .union(standardSectionNormalizedKeys)
+        .union(standardDirectionalNormalizedKeys)
+
+    public static func isStandardRecognizedGuidePhrase(_ rawPhrase: String) -> Bool {
+        recognizedStandardCategoryTitle(forPhrase: rawPhrase) != nil
+    }
+
+    public static func recognizedStandardCategoryTitle(forPhrase rawPhrase: String) -> String? {
+        let key = AudioSampleBank.shared.normalizePhraseKey(rawPhrase)
+        guard !key.isEmpty else { return nil }
+        if standardCountInNormalizedKeys.contains(key) {
+            return "Count-In"
+        }
+        if standardDirectionalNormalizedKeys.contains(key) {
+            return "Directional Cue"
+        }
+        if standardSectionNormalizedKeys.contains(key) {
+            return "Song Section"
+        }
+        return nil
+    }
+
+    public static func inferDefaultCueKind(forNormalizedPhrase key: String) -> CustomGuideCueKind {
+        let norm = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !norm.isEmpty else { return .directional }
+        let words = Set(norm.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
+        let sectionKeywords: Set<String> = [
+            "intro", "verse", "chorus", "pre", "post", "bridge",
+            "instrumental", "interlude", "vamp", "tag", "turnaround",
+            "solo", "refrain", "passage", "rap", "exhortation",
+            "outro", "ending", "spontaneous", "altar", "ministry", "selah"
+        ]
+        if !words.isDisjoint(with: sectionKeywords) {
+            return .songSection
+        }
+        return .directional
+    }
+
+    public static func formatPhraseDisplayLabel(_ raw: String) -> String {
+        let cleaned = raw
+            .replacingOccurrences(of: "_", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return "" }
+        let collapsed = cleaned.split(whereSeparator: { $0.isWhitespace }).map(String.init).joined(separator: " ")
+        if collapsed == collapsed.lowercased() {
+            return collapsed
+                .split(separator: " ")
+                .map { word in
+                    guard let first = word.first else { return "" }
+                    return String(first).uppercased() + word.dropFirst()
+                }
+                .joined(separator: " ")
+        }
+        return collapsed
+    }
+
+    public static func cleanDisplayLabel(fromFilename filename: String, fallbackKey: String) -> String {
+        var stem = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let dashRange = stem.range(of: " - ") {
+            let suffix = String(stem[dashRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if !suffix.isEmpty {
+                stem = suffix
+            }
+        }
+        if let regex = try? NSRegularExpression(pattern: #"^\d+[\s._-]+([A-Za-z].*)$"#) {
+            let ns = stem as NSString
+            if let match = regex.firstMatch(in: stem, range: NSRange(location: 0, length: ns.length)),
+               match.numberOfRanges > 1 {
+                stem = ns.substring(with: match.range(at: 1))
+            }
+        }
+        stem = stem.replacingOccurrences(of: "_", with: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+        if stem.isEmpty || stem == stem.lowercased() {
+            return formatPhraseDisplayLabel(stem.isEmpty ? fallbackKey : stem)
+        }
+        return stem
+    }
     
     @Published public private(set) var customClickPacks: [CustomClickPack] = []
     @Published public private(set) var customGuidePacks: [CustomGuidePack] = []
@@ -429,17 +601,25 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
                     folderPath: dir.path,
                     phraseFiles: manifest.phraseFiles,
                     isCloud: isCloud,
-                    isBundled: isBundled
+                    isBundled: isBundled,
+                    customCueKinds: manifest.customCueKinds ?? [:],
+                    customCueLabels: manifest.customCueLabels ?? [:]
                 )
                 packs.append(pack)
             } else {
                 let files = audioFiles(in: dir)
                 guard !files.isEmpty else { continue }
                 var phraseFiles: [String: String] = [:]
+                var customKinds: [String: CustomGuideCueKind] = [:]
+                var customLabels: [String: String] = [:]
                 for file in files {
                     let key = detectGuidePhraseKey(fromFilename: file.lastPathComponent)
                     if !key.isEmpty && phraseFiles[key] == nil {
                         phraseFiles[key] = file.lastPathComponent
+                        if !Self.standardNormalizedKeys.contains(key) {
+                            customKinds[key] = Self.inferDefaultCueKind(forNormalizedPhrase: key)
+                            customLabels[key] = Self.cleanDisplayLabel(fromFilename: file.lastPathComponent, fallbackKey: key)
+                        }
                     }
                 }
                 guard !phraseFiles.isEmpty else { continue }
@@ -449,7 +629,9 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
                     folderPath: dir.path,
                     phraseFiles: phraseFiles,
                     isCloud: isCloud,
-                    isBundled: isBundled
+                    isBundled: isBundled,
+                    customCueKinds: customKinds,
+                    customCueLabels: customLabels
                 )
                 packs.append(pack)
             }
@@ -662,6 +844,15 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
             if (try? fm.copyItem(at: srcURL, to: destURL)) != nil {
                 AudioSampleBank.shared.invalidateCachedBuffers(matchingPathPrefix: destURL.path)
                 pack.phraseFiles[key] = destName
+                if Self.standardNormalizedKeys.contains(key) {
+                    pack.customCueKinds.removeValue(forKey: key)
+                    pack.customCueLabels.removeValue(forKey: key)
+                } else {
+                    if pack.customCueKinds[key] == nil {
+                        pack.customCueKinds[key] = Self.inferDefaultCueKind(forNormalizedPhrase: key)
+                    }
+                    pack.customCueLabels[key] = Self.cleanDisplayLabel(fromFilename: srcURL.lastPathComponent, fallbackKey: key)
+                }
                 importedCount += 1
             }
         }
@@ -672,7 +863,12 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
     }
     
     @discardableResult
-    public func setGuidePhraseFile(packId: String, phrase: String, sourceURL: URL?) -> Bool {
+    public func setGuidePhraseFile(
+        packId: String,
+        phrase: String,
+        sourceURL: URL?,
+        cueKind: CustomGuideCueKind? = nil
+    ) -> Bool {
         guard var pack = guidePack(forId: packId) else { return false }
         let key = AudioSampleBank.shared.normalizePhraseKey(phrase)
         guard !key.isEmpty else { return false }
@@ -695,13 +891,69 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
             guard (try? fm.copyItem(at: src, to: destURL)) != nil else { return false }
             AudioSampleBank.shared.invalidateCachedBuffers(matchingPathPrefix: destURL.path)
             pack.phraseFiles[key] = destName
+            if Self.standardNormalizedKeys.contains(key) {
+                pack.customCueKinds.removeValue(forKey: key)
+                pack.customCueLabels.removeValue(forKey: key)
+            } else {
+                pack.customCueKinds[key] = cueKind ?? pack.customCueKinds[key] ?? Self.inferDefaultCueKind(forNormalizedPhrase: key)
+                let formatted = Self.formatPhraseDisplayLabel(phrase)
+                if !formatted.isEmpty {
+                    pack.customCueLabels[key] = formatted
+                }
+            }
         } else {
             pack.phraseFiles.removeValue(forKey: key)
+            pack.customCueKinds.removeValue(forKey: key)
+            pack.customCueLabels.removeValue(forKey: key)
         }
         
         writeGuideManifest(pack)
         refreshPacks()
         return true
+    }
+
+    public func setCustomGuideCueKind(packId: String, phraseKey: String, kind: CustomGuideCueKind) {
+        guard var pack = guidePack(forId: packId) else { return }
+        let key = AudioSampleBank.shared.normalizePhraseKey(phraseKey)
+        guard !key.isEmpty, pack.phraseFiles[key] != nil else { return }
+        pack.customCueKinds[key] = kind
+        writeGuideManifest(pack)
+        refreshPacks()
+    }
+
+    /// Returns deduplicated custom guide cue labels of the requested kind from all user custom guide packs,
+    /// prioritizing the currently active / default custom guide pack first.
+    public func userCustomCueOptions(ofKind kind: CustomGuideCueKind, preferredVoice: GuideVoice? = nil) -> [String] {
+        let packs = userCustomGuidePacks
+        var orderedPacks: [CustomGuidePack] = []
+        var addedPackIds = Set<String>()
+        for candidateId in [preferredVoice?.customPackId, defaultGuideVoice.customPackId].compactMap({ $0 }) {
+            if !addedPackIds.contains(candidateId), let match = packs.first(where: { $0.id == candidateId }) {
+                orderedPacks.append(match)
+                addedPackIds.insert(candidateId)
+            }
+        }
+        for pack in packs where !addedPackIds.contains(pack.id) {
+            orderedPacks.append(pack)
+            addedPackIds.insert(pack.id)
+        }
+
+        var seenLower = Set<String>()
+        var result: [String] = []
+        for pack in orderedPacks {
+            let labels = pack.phraseFiles.keys
+                .filter { !Self.standardNormalizedKeys.contains($0) && pack.cueKind(forNormalizedPhrase: $0) == kind }
+                .map { pack.displayLabel(forNormalizedPhrase: $0) }
+                .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            for label in labels {
+                let lower = label.lowercased()
+                if !seenLower.contains(lower) {
+                    seenLower.insert(lower)
+                    result.append(label)
+                }
+            }
+        }
+        return result
     }
     
     public func renameGuidePack(id: String, newName: String) {
@@ -748,6 +1000,21 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
             return nil
         }
         return AudioSampleBank.shared.loadCustomPhraseData(at: url, targetFormat: targetFormat)
+    }
+
+    public func getAnyUserCustomPhraseSample(
+        phrase: String,
+        targetFormat: AVAudioFormat
+    ) -> SpokenPhraseData? {
+        let normalized = AudioSampleBank.shared.normalizePhraseKey(phrase)
+        guard !normalized.isEmpty else { return nil }
+        for pack in userCustomGuidePacks {
+            if let url = pack.fileURL(forNormalizedPhrase: normalized),
+               let data = AudioSampleBank.shared.loadCustomPhraseData(at: url, targetFormat: targetFormat) {
+                return data
+            }
+        }
+        return nil
     }
     
     /// Ensures uploaded custom click samples have healthy transient headroom matching built-in studio clicks
@@ -875,7 +1142,12 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         }
     }
     
-    public func promptAssignGuidePhrase(packId: String, phrase: String, completion: ((Bool) -> Void)? = nil) {
+    public func promptAssignGuidePhrase(
+        packId: String,
+        phrase: String,
+        cueKind: CustomGuideCueKind? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         let panel = NSOpenPanel()
         panel.title = "Select Sample for \"\(phrase)\""
         panel.message = "Choose an audio file (.wav, .m4a, .mp3, .aiff) for the \"\(phrase)\" guide cue."
@@ -889,7 +1161,7 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
                 completion?(false)
                 return
             }
-            let ok = self?.setGuidePhraseFile(packId: packId, phrase: phrase, sourceURL: url) ?? false
+            let ok = self?.setGuidePhraseFile(packId: packId, phrase: phrase, sourceURL: url, cueKind: cueKind) ?? false
             completion?(ok)
         }
     }
@@ -1012,7 +1284,9 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         let manifest = CustomGuidePackManifest(
             id: pack.id,
             name: pack.name,
-            phraseFiles: pack.phraseFiles
+            phraseFiles: pack.phraseFiles,
+            customCueKinds: pack.customCueKinds.isEmpty ? nil : pack.customCueKinds,
+            customCueLabels: pack.customCueLabels.isEmpty ? nil : pack.customCueLabels
         )
         let url = pack.folderURL.appendingPathComponent("pack.json")
         if let data = try? JSONEncoder().encode(manifest) {

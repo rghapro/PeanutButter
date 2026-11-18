@@ -5,6 +5,7 @@ import SwiftUI
 /// Accurately anchors to either the playhead '+' button or per-section '+' buttons.
 public struct AddSongSectionPopoverView: View {
     @ObservedObject var engine: MultitrackAudioEngine
+    @ObservedObject private var customSamples = CustomSampleLibraryManager.shared
     let insertAfterIndex: Int?
     let atTime: TimeInterval?
     let onClose: () -> Void
@@ -261,6 +262,23 @@ public struct AddSongSectionPopoverView: View {
                 let dummy = SongSection(name: name, abbreviation: abbrev, startTime: 0, duration: 8)
                 results.append(SectionPresetItem(
                     id: "std_\(name)",
+                    name: name,
+                    abbreviation: abbrev,
+                    color: dummy.color,
+                    sourceSection: nil
+                ))
+                seenNames.insert(key)
+            }
+        }
+
+        // Include user-uploaded custom guide cues marked as Song Section cues
+        for name in customSamples.userCustomCueOptions(ofKind: .songSection, preferredVoice: engine.currentSong.guideVoice) {
+            let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !key.isEmpty && !seenNames.contains(key) {
+                let abbrev = SongSection.abbreviation(for: name)
+                let dummy = SongSection(name: name, abbreviation: abbrev, startTime: 0, duration: 8)
+                results.append(SectionPresetItem(
+                    id: "guide_sec_\(name)",
                     name: name,
                     abbreviation: abbrev,
                     color: dummy.color,

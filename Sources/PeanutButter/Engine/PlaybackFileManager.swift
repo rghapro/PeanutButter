@@ -363,6 +363,8 @@ public struct SessionPackageMetadata: Codable, Sendable {
     public var currentSongIndex: Int
     public var associatedSessionPath: String?
     public var changeDescription: String?
+    public var lastSavedRevisionId: UUID?
+    public var lastSavedByDeviceId: String?
     public var songEntries: [SongPackageMetadata]
     
     public init(
@@ -376,6 +378,8 @@ public struct SessionPackageMetadata: Codable, Sendable {
         currentSongIndex: Int = 0,
         associatedSessionPath: String? = nil,
         changeDescription: String? = nil,
+        lastSavedRevisionId: UUID? = nil,
+        lastSavedByDeviceId: String? = nil,
         songEntries: [SongPackageMetadata] = []
     ) {
         self.version = version
@@ -388,6 +392,8 @@ public struct SessionPackageMetadata: Codable, Sendable {
         self.currentSongIndex = currentSongIndex
         self.associatedSessionPath = associatedSessionPath
         self.changeDescription = changeDescription
+        self.lastSavedRevisionId = lastSavedRevisionId
+        self.lastSavedByDeviceId = lastSavedByDeviceId
         self.songEntries = songEntries
     }
 }
@@ -395,6 +401,31 @@ public struct SessionPackageMetadata: Codable, Sendable {
 /// Robust, high-speed file management for saving & loading self-contained .pbsong and .pbsession packages
 public final class PlaybackFileManager: @unchecked Sendable {
     public static let shared = PlaybackFileManager()
+
+    private static let deviceInstanceDefaultsKey = "PeanutButter_DeviceInstanceID"
+    private static let deviceInstanceLock = NSLock()
+    private nonisolated(unsafe) static var cachedDeviceInstanceId: String?
+    public nonisolated(unsafe) static var overrideDeviceInstanceIdForTesting: String?
+
+    /// Persistent per-Mac instance identifier stored only in local UserDefaults (never synced to Cloud).
+    public nonisolated static var currentDeviceInstanceId: String {
+        deviceInstanceLock.lock()
+        defer { deviceInstanceLock.unlock() }
+        if let override = overrideDeviceInstanceIdForTesting, !override.isEmpty {
+            return override
+        }
+        if let cached = cachedDeviceInstanceId {
+            return cached
+        }
+        if let existing = UserDefaults.standard.string(forKey: deviceInstanceDefaultsKey), !existing.isEmpty {
+            cachedDeviceInstanceId = existing
+            return existing
+        }
+        let generated = UUID().uuidString
+        UserDefaults.standard.set(generated, forKey: deviceInstanceDefaultsKey)
+        cachedDeviceInstanceId = generated
+        return generated
+    }
     
     private let cacheQueue = DispatchQueue(label: "com.peanutbutter.stemcache", qos: .utility, attributes: .concurrent)
     private let cacheLock = NSLock()
@@ -621,10 +652,13 @@ public final class PlaybackFileManager: @unchecked Sendable {
         preserveVocalFormants: Bool = true,
         bpm: Double? = nil,
         originalBPM: Double? = nil,
-        buffers: [UUID: AVAudioPCMBuffer]
+        buffers: [UUID: AVAudioPCMBuffer],
+        overwrite: Bool = false
     ) {
         let tempoChanged = (bpm != nil && originalBPM != nil && abs(bpm! - originalBPM!) > 0.005)
         guard semitones != 0 || tempoChanged else { return }
+        let validBuffers = buffers.filter { $0.value.frameLength > 100 }
+        guard !validBuffers.isEmpty else { return }
         let dir = transposedStemCacheDirectory(
             songId: songId,
             semitones: semitones,
@@ -634,17 +668,23 @@ public final class PlaybackFileManager: @unchecked Sendable {
         )
         cacheQueue.async { [weak self] in
             guard let self = self else { return }
-            for (trackId, buf) in buffers {
+            let fm = FileManager.default
+            for (trackId, buf) in validBuffers {
                 let targetURL = dir.appendingPathComponent("\(trackId.uuidString).wav")
-                guard !FileManager.default.fileExists(atPath: targetURL.path) else { continue }
+                if !overwrite && fm.fileExists(atPath: targetURL.path) {
+                    let existingSize = (try? fm.attributesOfItem(atPath: targetURL.path)[.size] as? Int64) ?? 0
+                    if existingSize > 8192 {
+                        continue
+                    }
+                }
                 let tmp = dir.appendingPathComponent("tmp_\(UUID().uuidString).wav")
-                defer { try? FileManager.default.removeItem(at: tmp) }
+                defer { try? fm.removeItem(at: tmp) }
                 do {
                     try self.writeWAVBuffer(buf, to: tmp)
-                    if FileManager.default.fileExists(atPath: targetURL.path) {
-                        try? FileManager.default.removeItem(at: targetURL)
+                    if fm.fileExists(atPath: targetURL.path) {
+                        try? fm.removeItem(at: targetURL)
                     }
-                    try FileManager.default.moveItem(at: tmp, to: targetURL)
+                    try fm.moveItem(at: tmp, to: targetURL)
                 } catch {}
             }
         }
@@ -715,7 +755,10 @@ public final class PlaybackFileManager: @unchecked Sendable {
         }
         DispatchQueue.concurrentPerform(iterations: count) { idx in
             let fileURL = resolvedURLs[idx]
-            guard let raw = try? self.readPCMBuffer(from: fileURL) else { return }
+            guard let raw = try? self.readPCMBuffer(from: fileURL), raw.frameLength > 100 else {
+                try? FileManager.default.removeItem(at: fileURL)
+                return
+            }
             box[idx] = Self.normalizeBuffer(raw, to: canonicalFormat)
         }
         var result: [UUID: AVAudioPCMBuffer] = [:]
@@ -1328,6 +1371,12 @@ public final class PlaybackFileManager: @unchecked Sendable {
             }
 
             meta.associatedSessionPath = nil
+            if isCloudDest {
+                if meta.lastSavedRevisionId == nil {
+                    meta.lastSavedRevisionId = UUID()
+                }
+                meta.lastSavedByDeviceId = Self.currentDeviceInstanceId
+            }
             meta.songEntries = updatedEntries
             try encoder.encode(meta).write(to: stagingDir.appendingPathComponent("session.json"), options: .atomic)
         }
@@ -1336,6 +1385,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
             try fm.removeItem(at: destinationURL)
         }
         try fm.moveItem(at: stagingDir, to: destinationURL)
+        if !isSong {
+            LibraryBrowserManager.invalidateSetlistPackageCache(for: destinationURL)
+        }
     }
 
     // MARK: - Song Package Export (.pbsong / .multitrack)
@@ -1733,7 +1785,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
         to destinationURL: URL,
         asDirectoryPackage: Bool = true,
         associatedSessionPath: String? = nil,
-        changeDescription: String? = nil
+        changeDescription: String? = nil,
+        revisionId: UUID? = nil,
+        authorDeviceId: String? = nil
     ) throws {
         let fileManager = FileManager.default
         let isCloudDest = LibraryBrowserManager.isURLInCloudLibrary(destinationURL)
@@ -1944,7 +1998,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 var peaks = track.waveformPeaks
                 var resolvedDuration: TimeInterval? = track.duration > 0 ? track.duration : nil
                 if peaks.isEmpty && track.includeInWaveform {
-                    if let buf = job.buffer {
+                    if let buf = job.buffer, buf.frameLength > 100 {
                         peaks = Self.extractPeaks(from: buf, samplesCount: 4000)
                         if resolvedDuration == nil && buf.frameLength > 0 {
                             resolvedDuration = Double(buf.frameLength) / buf.format.sampleRate
@@ -2004,6 +2058,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
             }
         }
         
+        let effectiveRevisionId = revisionId ?? UUID()
+        let effectiveDeviceId = authorDeviceId ?? Self.currentDeviceInstanceId
         let sessionMeta = SessionPackageMetadata(
             id: setlist.id,
             name: setlist.name,
@@ -2014,6 +2070,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
             currentSongIndex: currentSongIndex,
             associatedSessionPath: associatedSessionPath,
             changeDescription: changeDescription,
+            lastSavedRevisionId: effectiveRevisionId,
+            lastSavedByDeviceId: effectiveDeviceId,
             songEntries: songPackageEntries
         )
         
@@ -2054,6 +2112,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 try zipFolder(folderURL: stagingDir, toArchiveURL: destinationURL)
             }
         }
+        LibraryBrowserManager.invalidateSetlistPackageCache(for: destinationURL)
     }
     
     /// Peek at `associatedSessionPath` inside an uncompressed session directory (e.g. AutoSaveSession.pbsession) without loading audio
@@ -2153,6 +2212,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
         public let needsArchiveExtractionForStems: Bool
         public let metadataRootFolder: URL
         public let cleanupFolder: URL?
+        public let lastSavedRevisionId: UUID?
+        public let lastSavedByDeviceId: String?
     }
     
     /// Stage 1: Reads `session.json` and artwork in a few milliseconds without decoding audio stems,
@@ -2367,8 +2428,23 @@ public final class PlaybackFileManager: @unchecked Sendable {
             isDirectorySource: isDirectorySource,
             needsArchiveExtractionForStems: !isDirectorySource && anyMissingFromStemCache,
             metadataRootFolder: rootFolder,
-            cleanupFolder: cleanupFolder
+            cleanupFolder: cleanupFolder,
+            lastSavedRevisionId: sessionMeta.lastSavedRevisionId,
+            lastSavedByDeviceId: sessionMeta.lastSavedByDeviceId
         )
+    }
+
+    public func loadSongTrackMetadataFromSession(songId: UUID, sessionURL: URL) -> [TrackFileMetadata]? {
+        let jsonURL = sessionURL.appendingPathComponent("session.json")
+        guard FileManager.default.fileExists(atPath: jsonURL.path) else { return nil }
+        if LibraryBrowserManager.isCloudStorageURL(jsonURL) && !LibraryBrowserManager.checkIsDownloaded(at: jsonURL) {
+            return nil
+        }
+        guard let data = try? Data(contentsOf: jsonURL),
+              let sessionMeta = try? JSONDecoder().decode(SessionPackageMetadata.self, from: data) else {
+            return nil
+        }
+        return sessionMeta.songEntries.first(where: { $0.id == songId })?.tracks
     }
     
     public struct LocalLibrarySongEntry: @unchecked Sendable {
@@ -2673,7 +2749,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 if !tempoChanged, let transRel = tm.relativeTransposedAudioPath, !transRel.isEmpty, tm.transposedSemitones == songEntry.transposeSemitones {
                     if let transAudioURL = self.resolvePackageStemURL(relativePath: transRel, rootFolder: rootFolder),
                        fm.fileExists(atPath: transAudioURL.path),
-                       let rawTrans = try? self.readPCMBuffer(from: transAudioURL) {
+                       let rawTrans = try? self.readPCMBuffer(from: transAudioURL),
+                       rawTrans.frameLength > 100 {
                         transposedBuffer = canonicalFormat != nil ? Self.normalizeBuffer(rawTrans, to: canonicalFormat!) : rawTrans
                     }
                 }
@@ -2695,8 +2772,12 @@ public final class PlaybackFileManager: @unchecked Sendable {
                         let diskWavURL = cacheDir.appendingPathComponent("\(tm.id.uuidString).wav")
                         let diskM4aURL = cacheDir.appendingPathComponent("\(tm.id.uuidString).m4a")
                         let diskTransURL = fm.fileExists(atPath: diskWavURL.path) ? diskWavURL : diskM4aURL
-                        if fm.fileExists(atPath: diskTransURL.path), let rawTrans = try? self.readPCMBuffer(from: diskTransURL) {
-                            transposedBuffer = canonicalFormat != nil ? Self.normalizeBuffer(rawTrans, to: canonicalFormat!) : rawTrans
+                        if fm.fileExists(atPath: diskTransURL.path) {
+                            if let rawTrans = try? self.readPCMBuffer(from: diskTransURL), rawTrans.frameLength > 100 {
+                                transposedBuffer = canonicalFormat != nil ? Self.normalizeBuffer(rawTrans, to: canonicalFormat!) : rawTrans
+                            } else {
+                                try? fm.removeItem(at: diskTransURL)
+                            }
                         }
                     }
                 }

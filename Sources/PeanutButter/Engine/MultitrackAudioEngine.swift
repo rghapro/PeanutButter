@@ -272,12 +272,15 @@ final class RealTimeMixEngineState: @unchecked Sendable {
         os_unfair_lock_unlock(&lock)
     }
     
-    func setPlayhead(seconds: TimeInterval) {
+    func setPlayhead(seconds: TimeInterval, resumePlaying: Bool = false) {
         os_unfair_lock_lock(&lock)
         let sr = sampleRate > 0 ? sampleRate : 44100.0
         self.currentTimelineFrame = max(0, Int64(round(seconds * sr)))
         self.seekGeneration &+= 1
         self.didReachEndOfSong = false
+        if resumePlaying {
+            self.isPlaying = true
+        }
         self.hasQueuedJump = false
         self.queuedBoundaryFrame = -1
         self.queuedTargetFrame = -1
@@ -306,7 +309,7 @@ final class RealTimeMixEngineState: @unchecked Sendable {
         os_unfair_lock_unlock(&lock)
     }
     
-    func pollStatus() -> (currentSeconds: TimeInterval, completedSingleLoop: Bool, didRepeatSingleLoop: Bool, reachedEnd: Bool, transitionedToNextSong: Bool, didJumpToQueuedSection: Bool, isPreRollActive: Bool, preRollTargetSeconds: TimeInterval) {
+    func pollStatus() -> (currentSeconds: TimeInterval, completedSingleLoop: Bool, didRepeatSingleLoop: Bool, reachedEnd: Bool, transitionedToNextSong: Bool, didJumpToQueuedSection: Bool, isPreRollActive: Bool, preRollTargetSeconds: TimeInterval, engineIsPlaying: Bool, atOrPastEnd: Bool) {
         os_unfair_lock_lock(&lock)
         let sr = sampleRate > 0 ? sampleRate : 44100.0
         let sec = Double(currentTimelineFrame) / sr
@@ -317,13 +320,15 @@ final class RealTimeMixEngineState: @unchecked Sendable {
         let didJump = didTriggerQueuedJump
         let isPreRolling = preRollActive && currentTimelineFrame < preRollTargetDownbeatFrame
         let targetSec = Double(preRollTargetDownbeatFrame) / sr
+        let stillPlaying = isPlaying
+        let atEnd = totalTimelineFrames > 0 && currentTimelineFrame >= totalTimelineFrames
         didCompleteSingleLoop = false
         didTriggerSingleLoopRepeat = false
         didReachEndOfSong = false
         didTransitionToNextSong = false
         didTriggerQueuedJump = false
         os_unfair_lock_unlock(&lock)
-        return (sec, singleDone, singleRepeated, endReached, transitioned, didJump, isPreRolling, targetSec)
+        return (sec, singleDone, singleRepeated, endReached, transitioned, didJump, isPreRolling, targetSec, stillPlaying, atEnd)
     }
     
     func consumeMasterPeaks() -> (Float, Float) {
@@ -422,7 +427,7 @@ final class RealTimeMixEngineState: @unchecked Sendable {
                 var hitEndOfSong = false
                 var promotedToNextSong = false
 
-                if playing && !localTracks.isEmpty && totalFrames > 0 {
+                if playing && totalFrames > 0 {
                     var framesRemaining = frameCount
                     var outOffset = 0
 
@@ -887,7 +892,7 @@ final class RealTimeMixEngineState: @unchecked Sendable {
 
                 // 11. Single consolidated unlock commit for playhead, flags, redundancy phase, and Master VU peaks
                 os_unfair_lock_lock(&lock)
-                if playing && !localTracks.isEmpty && totalFrames > 0 {
+                if playing && totalFrames > 0 {
                     if seekGeneration == localSeekGen {
                         currentTimelineFrame = playhead
                         if self.preRollActive && playhead >= self.preRollTargetDownbeatFrame {
@@ -1063,6 +1068,9 @@ public final class MultitrackAudioEngine: ObservableObject {
     private var uiDisplayLink: CADisplayLink?
     private var uiDisplayLinkProxy: DisplayLinkTickProxy?
     private var uiDisplayLinkScreenNumber: CGDirectDisplayID?
+    private var transportWatchdogTimer: DispatchSourceTimer?
+    private var lastPlaybackClockTickTimestamp: CFTimeInterval = 0
+    private var playbackActivityToken: NSObjectProtocol?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     public private(set) var cachedEffectiveBeatGrid: [BeatGridMarker] = []
     public private(set) var precomputedDownbeatMarkers: [BeatGridMarker] = []
@@ -1774,6 +1782,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         startAudioClockTransportTimer()
         startMeteringTimer()
+        updatePlaybackActivityAssertion()
     }
     
     public func playSection(_ section: SongSection) {
@@ -2140,10 +2149,13 @@ public final class MultitrackAudioEngine: ObservableObject {
     )
     @Published public var currentSessionURL: URL? = nil
     @Published public var currentSessionLoadedModDate: Date? = nil
+    @Published public var currentSessionLoadedRevisionId: UUID? = nil
     
     // Unsaved Changes & Cloud Update Tracking (Setlist Menu Indicator Dot)
     @Published public var hasUnsavedChanges: Bool = false
     @Published public var hasCloudSetlistUpdate: Bool = false
+    private var acknowledgedCloudRevisionIds: Set<UUID> = []
+    private var acknowledgedCloudModDatesByFileName: [String: Date] = [:]
     @Published public private(set) var canUndo: Bool = false
     @Published public private(set) var canRedo: Bool = false
     private var undoStack: [SessionUndoSnapshot] = []
@@ -2284,7 +2296,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         if snapshot.currentSong.id != prevSongId {
             currentSongIndex = snapshot.currentSongIndex
             if !snapshot.tracks.isEmpty && (songBuffersCache[snapshot.currentSong.id]?.isEmpty ?? true) {
-                songBuffersCache[snapshot.currentSong.id] = snapshot.tracks.compactMap { snap in
+                let restoredForTarget: [(StemTrack, AVAudioPCMBuffer)] = snapshot.tracks.compactMap { snap in
                     guard let buf = snap.pristineBuffer ?? snap.activeBuffer else { return nil }
                     let trk = StemTrack(
                         id: snap.id,
@@ -2304,6 +2316,11 @@ public final class MultitrackAudioEngine: ObservableObject {
                     trk.duration = snap.duration
                     trk.waveformPeaks = snap.waveformPeaks
                     return (trk, buf)
+                }
+                songBuffersCache[snapshot.currentSong.id] = restoredForTarget
+                recordTrackMetadataBackup(for: snapshot.currentSong.id, tracks: restoredForTarget.map { $0.0 })
+                if restoredForTarget.contains(where: { $0.1.frameLength > 100 }) {
+                    memoryEvictedSongIds.remove(snapshot.currentSong.id)
                 }
             }
             if !snapshot.currentSong.title.isEmpty || !snapshot.tracks.isEmpty {
@@ -2419,9 +2436,14 @@ public final class MultitrackAudioEngine: ObservableObject {
             tracks = restoredTracks
         }
         if !currentSong.title.isEmpty {
-            songBuffersCache[currentSong.id] = restoredTracks.compactMap { track in
+            let restoredCache: [(StemTrack, AVAudioPCMBuffer)] = restoredTracks.compactMap { track in
                 guard let buf = pristineMasterBuffers[track.id] ?? channels[track.id]?.buffer else { return nil }
                 return (track, buf)
+            }
+            songBuffersCache[currentSong.id] = restoredCache
+            recordTrackMetadataBackup(for: currentSong.id, tracks: restoredCache.map { $0.0 })
+            if restoredCache.contains(where: { $0.1.frameLength > 100 }) {
+                memoryEvictedSongIds.remove(currentSong.id)
             }
         }
 
@@ -2511,6 +2533,54 @@ public final class MultitrackAudioEngine: ObservableObject {
         objectWillChange.send()
     }
 
+    /// Authoritative check for whether a Cloud Library setlist represents a newer revision authored by another device
+    /// or waiting on iCloud Drive, suppressing self-authored saves made on this Mac.
+    public func shouldShowCloudUpdate(for item: SetlistLibraryItem) -> Bool {
+        guard item.source == .cloud else { return false }
+        if let authorId = item.lastSavedByDeviceId,
+           authorId == PlaybackFileManager.currentDeviceInstanceId,
+           !item.hasUnresolvedServerUpdate {
+            return false
+        }
+
+        let isSameURL = currentSessionURL.map { $0.standardizedFileURL == item.url.standardizedFileURL } ?? false
+        let matchesOpenSession: Bool = {
+            guard let curURL = currentSessionURL else { return false }
+            if isSameURL { return true }
+            let isLocalSession = !LibraryBrowserManager.isURLInCloudLibrary(curURL)
+            return isLocalSession && item.url.lastPathComponent.lowercased() == curURL.lastPathComponent.lowercased()
+        }()
+
+        guard matchesOpenSession else {
+            return item.hasCloudUpdate
+        }
+
+        if !item.hasUnresolvedServerUpdate {
+            if let itemRev = item.lastSavedRevisionId {
+                if itemRev == currentSessionLoadedRevisionId || acknowledgedCloudRevisionIds.contains(itemRev) {
+                    return false
+                }
+            } else if let ackMod = acknowledgedCloudModDatesByFileName[item.url.lastPathComponent.lowercased()],
+                      item.modifiedDate.timeIntervalSince(ackMod) <= 2.0 {
+                return false
+            }
+        }
+
+        if item.hasUnresolvedServerUpdate {
+            return true
+        }
+        if let itemRev = item.lastSavedRevisionId, let loadedRev = currentSessionLoadedRevisionId {
+            if isSameURL {
+                return itemRev != loadedRev
+            }
+            return itemRev != loadedRev && (currentSessionLoadedModDate.map { item.modifiedDate > $0 } ?? true)
+        }
+        if let loadedMod = currentSessionLoadedModDate {
+            return item.modifiedDate.timeIntervalSince(loadedMod) > 2.0
+        }
+        return item.hasCloudUpdate
+    }
+
     public func updateCloudSetlistUpdateFlag(from setlists: [SetlistLibraryItem]) {
         guard let curURL = currentSessionURL else {
             hasCloudSetlistUpdate = false
@@ -2523,11 +2593,45 @@ public final class MultitrackAudioEngine: ObservableObject {
             let matchesOpenSession = (curURL.standardizedFileURL == item.url.standardizedFileURL)
                 || (isLocalSession && item.url.lastPathComponent.lowercased() == currentFileName)
             guard matchesOpenSession else { return false }
-            if let loadedMod = currentSessionLoadedModDate {
-                return item.modifiedDate.timeIntervalSince(loadedMod) > 2.0
-            }
-            return item.hasCloudUpdate
+            return shouldShowCloudUpdate(for: item)
         }
+    }
+
+    /// Immediately clears both the unsaved (red) and cloud-update (cyan) Setlist Menu indicators when initiating
+    /// or completing an explicit save on this Mac, preventing self-authored saves or stale cloud items from re-arming them.
+    @MainActor
+    public func clearSaveAndCloudUpdateIndicators(revisionId: UUID, targetURLs: [URL] = []) {
+        hasUnsavedChanges = false
+        hasCloudSetlistUpdate = false
+        currentSessionLoadedRevisionId = revisionId
+        acknowledgedCloudRevisionIds.insert(revisionId)
+        currentSessionLoadedModDate = max(currentSessionLoadedModDate ?? .distantPast, Date())
+
+        var targetFileNames = Set(targetURLs.map { $0.lastPathComponent.lowercased() })
+        if let cur = currentSessionURL {
+            targetFileNames.insert(cur.lastPathComponent.lowercased())
+        }
+        let setlistName = currentSetlist.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !setlistName.isEmpty {
+            targetFileNames.insert(LibraryBrowserManager.sanitizedPackageFilename(setlistName, ext: "pbsession").lowercased())
+        }
+
+        for item in LibraryBrowserManager.shared.setlists where item.source == .cloud {
+            if targetFileNames.contains(item.url.lastPathComponent.lowercased()) {
+                if let rev = item.lastSavedRevisionId {
+                    acknowledgedCloudRevisionIds.insert(rev)
+                }
+                let fileKey = item.url.lastPathComponent.lowercased()
+                let prevAck = acknowledgedCloudModDatesByFileName[fileKey] ?? .distantPast
+                acknowledgedCloudModDatesByFileName[fileKey] = max(prevAck, max(item.modifiedDate, Date()))
+            }
+        }
+
+        LibraryBrowserManager.shared.markSetlistSavedOnThisDevice(
+            urls: targetURLs,
+            setlistName: currentSetlist.name,
+            revisionId: revisionId
+        )
     }
     
     public func markSessionChanged() {
@@ -2643,9 +2747,278 @@ public final class MultitrackAudioEngine: ObservableObject {
     
     // Audio buffers cache for all songs currently in the setlist
     private var songBuffersCache: [UUID: [(track: StemTrack, buffer: AVAudioPCMBuffer)]] = [:]
+    private var memoryEvictedSongIds: Set<UUID> = []
+    private var songTrackMetadataBackup: [UUID: [StemTrack]] = [:]
     private var songWaveformCache: [UUID: (peaks: [Float], image: NSImage?)] = [:]
     // Transformed audio buffers cache for transposed / tempo-shifted songs in the setlist
     private var songTransposedBuffersCache: [UUID: (semitones: Int, preserveVocalFormants: Bool, bpmHundredths: Int, buffers: [UUID: AVAudioPCMBuffer])] = [:]
+
+    private nonisolated static func isLikelyUUIDString(_ value: String) -> Bool {
+        UUID(uuidString: value.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
+    }
+
+    private func recordTrackMetadataBackup(for songId: UUID, tracks: [StemTrack]) {
+        let nonUUIDTracks = tracks.filter { !Self.isLikelyUUIDString($0.name) }
+        guard !nonUUIDTracks.isEmpty else { return }
+        songTrackMetadataBackup[songId] = nonUUIDTracks
+    }
+
+    private static func hasLocalBackingAudioFile(for track: StemTrack) -> Bool {
+        if PlaybackFileManager.shared.hasValidCachedStem(for: track.id) {
+            return true
+        }
+        for candidate in [track.fileURL, track.sourceFileURL].compactMap({ $0 }) {
+            guard candidate.pathExtension.lowercased() == "m4a" else { continue }
+            if LibraryBrowserManager.isCloudStorageURL(candidate) && !LibraryBrowserManager.checkIsDownloaded(at: candidate) {
+                continue
+            }
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func resolveLocalBackingURL(for track: StemTrack) -> URL? {
+        if PlaybackFileManager.shared.hasValidCachedStem(for: track.id) {
+            return PlaybackFileManager.shared.cachedStemURL(for: track.id)
+        }
+        for candidate in [track.fileURL, track.sourceFileURL].compactMap({ $0 }) {
+            if LibraryBrowserManager.isCloudStorageURL(candidate) && !LibraryBrowserManager.checkIsDownloaded(at: candidate) {
+                continue
+            }
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func rehydrateEvictedSongBuffersIfNeeded(for song: Song) {
+        let existingEntry = songBuffersCache[song.id]
+        let hasEvictionMarker = memoryEvictedSongIds.contains(song.id)
+        let missingCacheWithBackup = ((existingEntry?.isEmpty ?? true) && songTrackMetadataBackup[song.id] != nil && downloadingSongProgress[song.id] == nil)
+        guard hasEvictionMarker || missingCacheWithBackup else { return }
+
+        let savedTracks = (existingEntry?.isEmpty == false ? existingEntry?.map { $0.track } : nil)
+            ?? songTrackMetadataBackup[song.id]
+            ?? []
+        guard !savedTracks.isEmpty else { return }
+
+        let canonicalFormat = getCanonicalProcessingFormat()
+        let isActiveSong = (currentSong.id == song.id)
+        var rehydrated: [(track: StemTrack, buffer: AVAudioPCMBuffer)] = []
+        rehydrated.reserveCapacity(savedTracks.count)
+
+        for track in savedTracks {
+            let cat = StemCategory.category(for: track.name, role: track.role)
+            if cat == .click { track.role = .click }
+            else if cat == .guide { track.role = .guide }
+
+            if let localURL = resolveLocalBackingURL(for: track),
+               let fileBuf = try? PlaybackFileManager.shared.readPCMBuffer(from: localURL) {
+                let norm = normalizeBufferToCanonical(buffer: fileBuf, targetFormat: canonicalFormat)
+                if track.fileURL == nil {
+                    track.fileURL = localURL
+                }
+                if cat == .click {
+                    if norm.frameLength > 100 {
+                        uploadedClickBuffers[song.id] = norm
+                    }
+                    if song.clickSource == .generated {
+                        if let genClick = generatedClickBuffers[song.id], genClick.frameLength > 1 {
+                            rehydrated.append((track, genClick))
+                        } else if let stub = makeSilentStub(format: canonicalFormat) {
+                            rehydrated.append((track, stub))
+                        }
+                    } else {
+                        rehydrated.append((track, norm))
+                    }
+                } else if cat == .guide {
+                    if norm.frameLength > 100 {
+                        uploadedGuideBuffers[song.id] = norm
+                    }
+                    if song.guideSource == .generated {
+                        let expectedState = isActiveSong ? currentLiveGuideLoopState() : Self.defaultGuideLoopState(for: song)
+                        if let genGuide = generatedGuideBuffers[song.id],
+                           genGuide.frameLength > 1,
+                           generatedGuideLoopStates[song.id] == expectedState {
+                            rehydrated.append((track, genGuide))
+                        } else if let stub = makeSilentStub(format: canonicalFormat) {
+                            rehydrated.append((track, stub))
+                        }
+                    } else {
+                        rehydrated.append((track, norm))
+                    }
+                } else {
+                    if norm.frameLength > 10 {
+                        track.duration = Double(norm.frameLength) / norm.format.sampleRate
+                    }
+                    if track.waveformPeaks.isEmpty && track.includeInWaveform && norm.frameLength > 100 {
+                        track.waveformPeaks = extractWaveformPeaks(from: norm, samplesCount: 4000)
+                    }
+                    rehydrated.append((track, norm))
+                }
+            } else if cat == .click && song.clickSource == .generated {
+                if let genClick = generatedClickBuffers[song.id], genClick.frameLength > 1 {
+                    rehydrated.append((track, genClick))
+                } else if let stub = makeSilentStub(format: canonicalFormat) {
+                    rehydrated.append((track, stub))
+                }
+            } else if cat == .guide && song.guideSource == .generated {
+                let expectedState = isActiveSong ? currentLiveGuideLoopState() : Self.defaultGuideLoopState(for: song)
+                if let genGuide = generatedGuideBuffers[song.id],
+                   genGuide.frameLength > 1,
+                   generatedGuideLoopStates[song.id] == expectedState {
+                    rehydrated.append((track, genGuide))
+                } else if let stub = makeSilentStub(format: canonicalFormat) {
+                    rehydrated.append((track, stub))
+                }
+            } else if let existingBuf = existingEntry?.first(where: { $0.track.id == track.id })?.buffer {
+                rehydrated.append((track, existingBuf))
+            }
+        }
+
+        if rehydrated.contains(where: { Self.isClickTrack($0.0) && $0.0.fileURL != nil }) {
+            rehydrated.removeAll { Self.isClickTrack($0.0) && $0.0.fileURL == nil }
+        }
+        if rehydrated.contains(where: { Self.isGuideTrack($0.0) && $0.0.fileURL != nil }) {
+            rehydrated.removeAll { Self.isGuideTrack($0.0) && $0.0.fileURL == nil }
+        }
+
+        guard !rehydrated.isEmpty else { return }
+        songBuffersCache[song.id] = rehydrated
+        recordTrackMetadataBackup(for: song.id, tracks: rehydrated.map { $0.0 })
+        if rehydrated.contains(where: { !Self.isClickOrGuideTrack($0.0) && $0.1.frameLength > 100 })
+            || !rehydrated.contains(where: { !Self.isClickOrGuideTrack($0.0) }) {
+            memoryEvictedSongIds.remove(song.id)
+        }
+    }
+
+    private func reconstructTracksFromStemURLs(for song: Song, canonicalFormat: AVAudioFormat) -> [(track: StemTrack, buffer: AVAudioPCMBuffer)] {
+        var backupById: [UUID: StemTrack] = [:]
+        if let backed = songTrackMetadataBackup[song.id] {
+            for t in backed {
+                backupById[t.id] = t
+            }
+        }
+        var diskMetaById: [UUID: TrackFileMetadata] = [:]
+        if backupById.isEmpty, let sessURL = currentSessionURL {
+            let metaTracks = PlaybackFileManager.shared.loadSongTrackMetadataFromSession(songId: song.id, sessionURL: sessURL)
+                ?? (song.sourceSongId.flatMap { PlaybackFileManager.shared.loadSongTrackMetadataFromSession(songId: $0, sessionURL: sessURL) })
+            if let metaTracks = metaTracks {
+                for tm in metaTracks where !Self.isLikelyUUIDString(tm.name) {
+                    diskMetaById[tm.id] = tm
+                }
+            }
+        }
+
+        let isActiveSong = (currentSong.id == song.id)
+        var loaded: [(track: StemTrack, buffer: AVAudioPCMBuffer)] = []
+        loaded.reserveCapacity(song.stemURLs.count)
+
+        for url in song.stemURLs {
+            guard let fileBuf = try? PlaybackFileManager.shared.readPCMBuffer(from: url) else { continue }
+            let norm = normalizeBufferToCanonical(buffer: fileBuf, targetFormat: canonicalFormat)
+            let baseName = url.deletingPathExtension().lastPathComponent
+
+            let track: StemTrack
+            if let uuid = UUID(uuidString: baseName), let backedTrack = backupById[uuid] {
+                backedTrack.fileURL = url
+                track = backedTrack
+            } else if let uuid = UUID(uuidString: baseName), let tm = diskMetaById[uuid] {
+                let t = StemTrack(
+                    id: tm.id,
+                    name: tm.name,
+                    role: tm.role,
+                    fileURL: url,
+                    sourceFileURL: tm.sourceFilePath.map { URL(fileURLWithPath: $0) },
+                    volume: tm.volume,
+                    pan: tm.pan,
+                    isMuted: tm.isMuted,
+                    isSoloed: tm.isSoloed,
+                    isSoloSafe: tm.isSoloSafe,
+                    routing: tm.routing,
+                    assignedBusName: tm.assignedBusName,
+                    includeInWaveform: tm.includeInWaveform
+                )
+                if let dur = tm.duration, dur > 0 {
+                    t.duration = dur
+                }
+                t.waveformPeaks = TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
+                track = t
+            } else {
+                let cat = StemCategory.category(for: baseName)
+                let role: TrackRole = (cat == .click) ? .click : ((cat == .guide) ? .guide : .stem)
+                track = StemTrack(name: baseName, role: role, fileURL: url)
+            }
+
+            let cat = StemCategory.category(for: track.name, role: track.role)
+            if cat == .click {
+                track.role = .click
+                if norm.frameLength > 100 {
+                    uploadedClickBuffers[song.id] = norm
+                }
+                if song.clickSource == .generated {
+                    if let genClick = generatedClickBuffers[song.id], genClick.frameLength > 1 {
+                        loaded.append((track, genClick))
+                    } else if let stub = makeSilentStub(format: canonicalFormat) {
+                        loaded.append((track, stub))
+                    }
+                    continue
+                }
+            } else if cat == .guide {
+                track.role = .guide
+                if norm.frameLength > 100 {
+                    uploadedGuideBuffers[song.id] = norm
+                }
+                if song.guideSource == .generated {
+                    let expectedState = isActiveSong ? currentLiveGuideLoopState() : Self.defaultGuideLoopState(for: song)
+                    if let genGuide = generatedGuideBuffers[song.id],
+                       genGuide.frameLength > 1,
+                       generatedGuideLoopStates[song.id] == expectedState {
+                        loaded.append((track, genGuide))
+                    } else if let stub = makeSilentStub(format: canonicalFormat) {
+                        loaded.append((track, stub))
+                    }
+                    continue
+                }
+            }
+
+            if norm.frameLength > 10 {
+                track.duration = Double(norm.frameLength) / norm.format.sampleRate
+            }
+            if track.waveformPeaks.isEmpty && track.includeInWaveform && norm.frameLength > 100 {
+                track.waveformPeaks = extractWaveformPeaks(from: norm, samplesCount: 4000)
+            }
+            loaded.append((track, norm))
+        }
+
+        if loaded.contains(where: { Self.isClickTrack($0.0) && $0.0.fileURL != nil }) {
+            loaded.removeAll { Self.isClickTrack($0.0) && $0.0.fileURL == nil }
+        }
+        if loaded.contains(where: { Self.isGuideTrack($0.0) && $0.0.fileURL != nil }) {
+            loaded.removeAll { Self.isGuideTrack($0.0) && $0.0.fileURL == nil }
+        }
+
+        if loaded.count > 1 {
+            loaded.sort { a, b in
+                let ord1 = StemCategory.playbackOrder(for: a.0.name, role: a.0.role)
+                let ord2 = StemCategory.playbackOrder(for: b.0.name, role: b.0.role)
+                if ord1 != ord2 { return ord1 < ord2 }
+                let cat1 = StemCategory.category(for: a.0.name, role: a.0.role)
+                let cat2 = StemCategory.category(for: b.0.name, role: b.0.role)
+                if cat1 != cat2 { return cat1 < cat2 }
+                return a.0.name.localizedStandardCompare(b.0.name) == .orderedAscending
+            }
+        }
+
+        if !loaded.isEmpty {
+            recordTrackMetadataBackup(for: song.id, tracks: loaded.map { $0.0 })
+            memoryEvictedSongIds.remove(song.id)
+        }
+        return loaded
+    }
     
     private func cachedTransformedBuffers(for song: Song) -> [UUID: AVAudioPCMBuffer]? {
         let needsTransform = song.transposeSemitones != 0 || song.isTempoShifted
@@ -2653,7 +3026,9 @@ public final class MultitrackAudioEngine: ObservableObject {
               let entry = songTransposedBuffersCache[song.id],
               entry.semitones == song.transposeSemitones,
               entry.preserveVocalFormants == song.preserveVocalFormants,
-              entry.bpmHundredths == PlaybackFileManager.cacheBPMHundredths(song.bpm) else {
+              entry.bpmHundredths == PlaybackFileManager.cacheBPMHundredths(song.bpm),
+              !entry.buffers.isEmpty,
+              entry.buffers.values.allSatisfy({ $0.frameLength > 100 }) else {
             return nil
         }
         return entry.buffers
@@ -2935,6 +3310,10 @@ public final class MultitrackAudioEngine: ObservableObject {
     deinit {
         uiFallbackTimer?.invalidate()
         uiDisplayLink?.invalidate()
+        transportWatchdogTimer?.cancel()
+        if let token = playbackActivityToken {
+            ProcessInfo.processInfo.endActivity(token)
+        }
         memoryPressureSource?.cancel()
         fadeTimer?.invalidate()
         crossfadeTimer?.invalidate()
@@ -2955,7 +3334,8 @@ public final class MultitrackAudioEngine: ObservableObject {
     }
 
     /// Graceful fallback for lower-RAM Macs under memory pressure: preserves active + immediate next song
-    /// in RAM for 0.00ms transitions while unloading distant session-backed song buffers.
+    /// in RAM for 0.00ms transitions while unloading distant session-backed song PCM buffers without ever
+    /// discarding track metadata (names, roles, mutes, faders, routing, or buses).
     public func handleMemoryPressure(critical: Bool) {
         guard currentSessionURL != nil, currentSetlist.songs.count > 2 else { return }
         var protectedIds = Set<UUID>()
@@ -2964,9 +3344,49 @@ public final class MultitrackAudioEngine: ObservableObject {
         if nextIdx >= 0 && nextIdx < currentSetlist.songs.count {
             protectedIds.insert(currentSetlist.songs[nextIdx].id)
         }
+        if !critical {
+            let prevIdx = currentSongIndex - 1
+            if prevIdx >= 0 && prevIdx < currentSetlist.songs.count {
+                protectedIds.insert(currentSetlist.songs[prevIdx].id)
+            }
+        }
         for song in currentSetlist.songs where !protectedIds.contains(song.id) {
-            songBuffersCache.removeValue(forKey: song.id)
+            if downloadingSongProgress[song.id] != nil ||
+               transposeTasksBySong[song.id] != nil ||
+               transposingSongId == song.id {
+                continue
+            }
+
             songTransposedBuffersCache.removeValue(forKey: song.id)
+
+            if critical || currentSetlist.songs.count > 3 {
+                if let existing = songBuffersCache[song.id],
+                   !existing.isEmpty,
+                   existing.contains(where: { $0.buffer.frameLength > 100 }) {
+                    let allHaveLocalFiles = existing.allSatisfy { (track, _) in
+                        if track.fileURL == nil && Self.isClickOrGuideTrack(track) {
+                            return true
+                        }
+                        return Self.hasLocalBackingAudioFile(for: track)
+                    }
+                    if allHaveLocalFiles, let stub = makeSilentStub(format: getCanonicalProcessingFormat()) {
+                        recordTrackMetadataBackup(for: song.id, tracks: existing.map { $0.track })
+                        var stubbed: [(track: StemTrack, buffer: AVAudioPCMBuffer)] = []
+                        stubbed.reserveCapacity(existing.count)
+                        for (track, _) in existing {
+                            if track.fileURL == nil && PlaybackFileManager.shared.hasValidCachedStem(for: track.id) {
+                                track.fileURL = PlaybackFileManager.shared.cachedStemURL(for: track.id)
+                            }
+                            stubbed.append((track: track, buffer: stub))
+                        }
+                        songBuffersCache[song.id] = stubbed
+                        uploadedClickBuffers.removeValue(forKey: song.id)
+                        uploadedGuideBuffers.removeValue(forKey: song.id)
+                        memoryEvictedSongIds.insert(song.id)
+                    }
+                }
+            }
+
             if critical {
                 songWaveformCache.removeValue(forKey: song.id)
             }
@@ -3469,7 +3889,7 @@ public final class MultitrackAudioEngine: ObservableObject {
             return
         }
 
-        let targetWindow = NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible })
+        let targetWindow = NSApp?.mainWindow ?? NSApp?.windows.first(where: { $0.isVisible && $0.canBecomeMain && !($0 is NSPanel) })
         let targetScreen = targetWindow?.screen ?? NSScreen.main ?? NSScreen.screens.first
         let maxFPS = Float(max(30, min(120, targetScreen?.maximumFramesPerSecond ?? 60)))
 
@@ -3497,7 +3917,7 @@ public final class MultitrackAudioEngine: ObservableObject {
 
     private func rebindUIDisplayLinkIfNeeded() {
         guard uiDisplayLink != nil else { return }
-        let targetWindow = NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible })
+        let targetWindow = NSApp?.mainWindow ?? NSApp?.windows.first(where: { $0.isVisible && $0.canBecomeMain && !($0 is NSPanel) })
         let targetScreen = targetWindow?.screen ?? NSScreen.main ?? NSScreen.screens.first
         let currentScreenID = screenDisplayID(for: targetScreen)
         if currentScreenID != uiDisplayLinkScreenNumber {
@@ -3507,6 +3927,43 @@ public final class MultitrackAudioEngine: ObservableObject {
             let maxFPS = Float(max(30, min(120, screen.maximumFramesPerSecond)))
             link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: maxFPS, preferred: maxFPS)
         }
+    }
+
+    private func updatePlaybackActivityAssertion() {
+        let active = (playbackState == .playing) || isPadActive
+        if active && playbackActivityToken == nil {
+            playbackActivityToken = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+                reason: "Live multitrack audio and MIDI playback"
+            )
+        } else if !active, let token = playbackActivityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            playbackActivityToken = nil
+        }
+    }
+
+    private func startTransportWatchdogTimer() {
+        if transportWatchdogTimer != nil { return }
+        lastPlaybackClockTickTimestamp = CACurrentMediaTime()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(25), repeating: .milliseconds(25), leeway: .milliseconds(5))
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            guard self.playbackState == .playing else {
+                self.stopTransportWatchdogTimer()
+                return
+            }
+            if CACurrentMediaTime() - self.lastPlaybackClockTickTimestamp >= 0.030 {
+                self.tickPlaybackClock()
+            }
+        }
+        transportWatchdogTimer = timer
+        timer.resume()
+    }
+
+    private func stopTransportWatchdogTimer() {
+        transportWatchdogTimer?.cancel()
+        transportWatchdogTimer = nil
     }
 
     private func stopUIDisplayLink() {
@@ -4305,24 +4762,12 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         let nextSong = currentSetlist.songs[currentSongIndex + 1]
         let canonicalFormat = getCanonicalProcessingFormat()
+        rehydrateEvictedSongBuffersIfNeeded(for: nextSong)
         let nextSongItems: [(track: StemTrack, buffer: AVAudioPCMBuffer)]
         if let cached = songBuffersCache[nextSong.id], !cached.isEmpty {
             nextSongItems = cached
         } else if !nextSong.stemURLs.isEmpty {
-            var loaded: [(track: StemTrack, buffer: AVAudioPCMBuffer)] = []
-            for url in nextSong.stemURLs {
-                if let buf = try? PlaybackFileManager.shared.readPCMBuffer(from: url) {
-                    let norm = normalizeBufferToCanonical(buffer: buf, targetFormat: canonicalFormat)
-                    let cat = StemCategory.category(for: url.deletingPathExtension().lastPathComponent)
-                    let role: TrackRole = (cat == .click) ? .click : ((cat == .guide) ? .guide : .stem)
-                    let trk = StemTrack(name: url.deletingPathExtension().lastPathComponent, role: role, fileURL: url)
-                    trk.duration = Double(norm.frameLength) / norm.format.sampleRate
-                    if trk.includeInWaveform {
-                        trk.waveformPeaks = extractWaveformPeaks(from: norm, samplesCount: 4000)
-                    }
-                    loaded.append((trk, norm))
-                }
-            }
+            let loaded = reconstructTracksFromStemURLs(for: nextSong, canonicalFormat: canonicalFormat)
             songBuffersCache[nextSong.id] = loaded
             nextSongItems = loaded
         } else {
@@ -4654,6 +5099,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         startAudioClockTransportTimer()
         startMeteringTimer()
+        updatePlaybackActivityAssertion()
     }
     
     public func pause() {
@@ -4679,6 +5125,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         stopTransportClock()
         MIDICueEngine.shared.stopMIDIClock()
         resetPeakLevels()
+        updatePlaybackActivityAssertion()
     }
     
     public func stop() {
@@ -4697,13 +5144,13 @@ public final class MultitrackAudioEngine: ObservableObject {
         hasTriggeredDualTransitionPad = false
         pendingTransitionNextSongIndex = nil
         pendingTransitionStartOffset = 0.0
+        playbackState = .stopped
         stopTransportClock()
         playbackOffsetSeconds = 0.0
         scheduledStartOffset = 0.0
         currentPlayingSectionId = nil
         queuedNextSection = nil
         isBeatFlashing = false
-        playbackState = .stopped
         MIDICueEngine.shared.stopMIDIClock()
         updateTransportPosition(to: 0.0)
         rebuildPrecomputedBeatGrid()
@@ -4729,6 +5176,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                 regenerateGuideTrack()
             }
         }
+        updatePlaybackActivityAssertion()
     }
     
     public func togglePlayPause() {
@@ -4856,10 +5304,16 @@ public final class MultitrackAudioEngine: ObservableObject {
         preRollTargetSectionId = nil
         hasTriggeredEarlyTransition = false
         hasTriggeredDualTransitionPad = false
-        let clampedTime = max(0.0, min(time, currentSongDuration))
+        let isPlayingNow = (playbackState == .playing)
+        let clampedTime: TimeInterval
+        if isPlayingNow && currentSongDuration > 0 {
+            clampedTime = max(0.0, min(time, max(0.0, currentSongDuration - 0.02)))
+        } else {
+            clampedTime = max(0.0, min(time, currentSongDuration))
+        }
         playbackOffsetSeconds = clampedTime
         scheduledStartOffset = clampedTime
-        mixState.setPlayhead(seconds: clampedTime)
+        mixState.setPlayhead(seconds: clampedTime, resumePlaying: isPlayingNow)
         updateTransportPosition(to: clampedTime)
         applyAutomationAtTime(clampedTime)
         if isEditAutomationMode {
@@ -4885,6 +5339,7 @@ public final class MultitrackAudioEngine: ObservableObject {
     // MARK: - Hardware-Locked Sample Playhead Clock
     
     private func stopTransportClock() {
+        stopTransportWatchdogTimer()
         let padNeedsMeters = padPlayer.isPlaying || padPlayer.isFadingOut || padMeterPeakL > 0.0 || padMeterPeakR > 0.0
         if !padNeedsMeters {
             stopUIDisplayLink()
@@ -4893,13 +5348,15 @@ public final class MultitrackAudioEngine: ObservableObject {
 
     private func startAudioClockTransportTimer() {
         ensureUIDisplayLinkRunning()
+        startTransportWatchdogTimer()
     }
     
     private func tickPlaybackClock() {
         guard playbackState == .playing else { return }
         
         let prevSec = playbackOffsetSeconds
-        let (currentSec, completedSingleLoop, didRepeatSingleLoop, reachedEnd, transitionedToNextSong, didJumpToQueuedSection, isPreRollActive, preRollTargetSec) = mixState.pollStatus()
+        let (currentSec, completedSingleLoop, didRepeatSingleLoop, reachedEnd, transitionedToNextSong, didJumpToQueuedSection, isPreRollActive, preRollTargetSec, engineIsPlaying, atOrPastEnd) = mixState.pollStatus()
+        lastPlaybackClockTickTimestamp = CACurrentMediaTime()
         
         // During Section Pre-Roll, audio is rendering from the X bars before the downbeat,
         // but the playhead stays anchored at the section the user played!
@@ -4994,7 +5451,7 @@ public final class MultitrackAudioEngine: ObservableObject {
             return
         }
         
-        if reachedEnd || (currentSec >= currentSongDuration && currentSongDuration > 0) {
+        if reachedEnd || atOrPastEnd || !engineIsPlaying || (currentSongDuration > 0 && currentSec >= currentSongDuration - 0.0005) {
             handleSongEndTransition()
             return
         }
@@ -5289,16 +5746,19 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
         isPadActive = true
         startMeteringTimer()
+        updatePlaybackActivityAssertion()
     }
     
     public func stopPadPlayer() {
         padPlayer.stop()
         isPadActive = false
+        updatePlaybackActivityAssertion()
     }
     
     public func stopPadPlayerImmediately() {
         padPlayer.stopImmediately()
         isPadActive = false
+        updatePlaybackActivityAssertion()
     }
     
     private func handleSectionTransitionForPad(activeSec: SongSection) {
@@ -5347,6 +5807,10 @@ public final class MultitrackAudioEngine: ObservableObject {
                     }
                 }
                 songBuffersCache[currentSong.id] = currentBuffers
+                recordTrackMetadataBackup(for: currentSong.id, tracks: currentBuffers.map { $0.0 })
+                if currentBuffers.contains(where: { $0.1.frameLength > 100 }) {
+                    memoryEvictedSongIds.remove(currentSong.id)
+                }
             }
         }
         
@@ -5358,6 +5822,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
         
         // Swap tracks, channels, and buffers in a single batched assignment (1 SwiftUI view diff instead of 20!)
+        rehydrateEvictedSongBuffersIfNeeded(for: nextSong)
         syncCachedClickAndGuideBuffers(forSongId: nextSong.id)
         let cachedItems = songBuffersCache[nextSong.id] ?? []
         var newTracks: [StemTrack] = []
@@ -5491,9 +5956,11 @@ public final class MultitrackAudioEngine: ObservableObject {
             currentPlayingSectionId = activeSec.id
         }
         updateTransportPosition(to: currentSeconds)
+        updatePlaybackActivityAssertion()
     }
     
     public func handleSongEndTransition() {
+        defer { updatePlaybackActivityAssertion() }
         let isLastSong = currentSongIndex >= currentSetlist.songs.count - 1
         let transition = currentSong.transitionType
         let continuePad = currentSong.continuePad
@@ -5507,14 +5974,14 @@ public final class MultitrackAudioEngine: ObservableObject {
                     self.currentPadKey = normalized
                     self.padPlayer.transitionToKey(normalized, packId: self.currentSong.padPresetId)
                 }
-            } else if !continuePad && self.isPadActive {
+            } else if !continuePad && (self.isPadActive || self.padPlayer.isPlaying) {
                 self.stopPadPlayer()
             }
         }
         
         if isLastSong {
             if transition == .stayInSong {
-                if !continuePad && isPadActive {
+                if !continuePad && (isPadActive || padPlayer.isPlaying) {
                     stopPadPlayer()
                 }
                 stop()
@@ -5529,7 +5996,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         switch transition {
         case .stayInSong:
-            if !continuePad && isPadActive {
+            if !continuePad && (isPadActive || padPlayer.isPlaying) {
                 stopPadPlayer()
             }
             stop()
@@ -5542,7 +6009,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                 selectSongInSetlist(at: currentSongIndex + 1)
                 play()
             } else {
-                if !continuePad && isPadActive {
+                if !continuePad && (isPadActive || padPlayer.isPlaying) {
                     stopPadPlayer()
                 }
                 stop()
@@ -9353,6 +9820,10 @@ public final class MultitrackAudioEngine: ObservableObject {
                     }
                 }
                 songBuffersCache[currentSong.id] = currentBuffers
+                recordTrackMetadataBackup(for: currentSong.id, tracks: currentBuffers.map { $0.0 })
+                if currentBuffers.contains(where: { $0.1.frameLength > 100 }) {
+                    memoryEvictedSongIds.remove(currentSong.id)
+                }
             }
         }
         
@@ -9441,6 +9912,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         transportDisplayClock.update(with: transportPosition)
         
         let canonicalFormat = getCanonicalProcessingFormat()
+        rehydrateEvictedSongBuffersIfNeeded(for: song)
         var loadedItems: [(StemTrack, AVAudioPCMBuffer)] = []
         
         // Check if we have cached stems in memory for this song
@@ -9452,17 +9924,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                 loadedItems.append((track, finalBuffer))
             }
         } else if !song.stemURLs.isEmpty {
-            loadedItems.reserveCapacity(song.stemURLs.count)
-            for url in song.stemURLs {
-                let trackName = url.deletingPathExtension().lastPathComponent
-                let cat = StemCategory.category(for: trackName)
-                let role: TrackRole = cat == .click ? .click : (cat == .guide ? .guide : .stem)
-                if let fileBuffer = try? PlaybackFileManager.shared.readPCMBuffer(from: url) {
-                    let finalBuffer = normalizeBufferToCanonical(buffer: fileBuffer, targetFormat: canonicalFormat)
-                    let track = StemTrack(name: trackName, role: role, fileURL: url)
-                    loadedItems.append((track, finalBuffer))
-                }
-            }
+            loadedItems = reconstructTracksFromStemURLs(for: song, canonicalFormat: canonicalFormat)
         }
         
         // Deduplicate synthesized utility tracks if an uploaded Click/Guide track already exists
@@ -9475,7 +9937,13 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         // Auto-generation & source switching for Click and Guide tracks
         // Guarantees Click and Guide channel strips are ALWAYS included, defaulting to generated if not uploaded
-        let isMetadataPlaceholder = loadedItems.contains { $0.0.fileURL != nil && $0.1.frameLength <= 1 }
+        let nonUtilityWithFiles = loadedItems.filter { !Self.isClickOrGuideTrack($0.0) && $0.0.fileURL != nil }
+        let isMetadataPlaceholder: Bool
+        if !nonUtilityWithFiles.isEmpty {
+            isMetadataPlaceholder = nonUtilityWithFiles.allSatisfy { $0.1.frameLength <= 1 }
+        } else {
+            isMetadataPlaceholder = downloadingSongProgress[song.id] != nil
+        }
         let baseDuration: TimeInterval
         if isMetadataPlaceholder {
             baseDuration = loadedItems.map { $0.0.duration }.max() ?? (song.totalDuration > 0 ? song.totalDuration : 240.0)
@@ -9630,6 +10098,10 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
         
         songBuffersCache[song.id] = loadedItems
+        recordTrackMetadataBackup(for: song.id, tracks: loadedItems.map { $0.0 })
+        if !isMetadataPlaceholder {
+            memoryEvictedSongIds.remove(song.id)
+        }
         
         // Single batched state assignment -> SwiftUI only diffs `MixerRackView` once!
         pristineMasterBuffers = newPristine
@@ -9787,6 +10259,32 @@ public final class MultitrackAudioEngine: ObservableObject {
         )
     }
 
+    private func areSongStemsHydratedForTransform(atIndex idx: Int) -> Bool {
+        guard idx >= 0 && idx < currentSetlist.songs.count else { return false }
+        let song = currentSetlist.songs[idx]
+        if downloadingSongProgress[song.id] != nil {
+            return false
+        }
+        let isTempoShifted = song.isTempoShifted
+        if idx == currentSongIndex && !channels.isEmpty {
+            let candidates = channels.values.filter { shouldRenderTransformedTrack($0.track, for: song, tempoShifted: isTempoShifted) }
+            guard !candidates.isEmpty else { return false }
+            return candidates.allSatisfy { ch in
+                let buf = pristineMasterBuffers[ch.track.id] ?? ch.buffer
+                return (buf?.frameLength ?? 0) > 100
+            }
+        }
+        if let cached = songBuffersCache[song.id], !cached.isEmpty {
+            let candidates = cached.filter { shouldRenderTransformedTrack($0.track, for: song, tempoShifted: isTempoShifted) }
+            guard !candidates.isEmpty else { return false }
+            if memoryEvictedSongIds.contains(song.id) {
+                return candidates.allSatisfy { $0.buffer.frameLength > 100 || Self.hasLocalBackingAudioFile(for: $0.track) }
+            }
+            return candidates.allSatisfy { $0.buffer.frameLength > 100 }
+        }
+        return !song.stemURLs.isEmpty && song.stemURLs.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
     public func setKeyAndTempo(
         semitones: Int? = nil,
         preserveVocalFormants: Bool? = nil,
@@ -9852,6 +10350,16 @@ public final class MultitrackAudioEngine: ObservableObject {
             objectWillChange.send()
             return
         }
+
+        guard areSongStemsHydratedForTransform(atIndex: idx) else {
+            // Stems are still downloading or holding 1-frame Stage-1 placeholders; defer Rubber Band render until hydration finishes!
+            songTransposedBuffersCache.removeValue(forKey: targetSongId)
+            if bpmChanged {
+                refreshGeneratedClickAndGuide(forSongId: targetSongId, atIndex: idx)
+            }
+            objectWillChange.send()
+            return
+        }
         
         // Fast path 2: Already cached in RAM at this exact transposition, formant & tempo setting!
         if !forceRerender,
@@ -9870,6 +10378,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
         
         // Fast path 3: Cached on disk!
+        rehydrateEvictedSongBuffersIfNeeded(for: song)
         let targetTrackIds: [UUID] = (idx == currentSongIndex && !channels.isEmpty)
             ? channels.values.filter { shouldRenderTransformedTrack($0.track, for: song, tempoShifted: isTempoShifted) }.map { $0.track.id }
             : ((songBuffersCache[targetSongId]?.filter { shouldRenderTransformedTrack($0.track, for: song, tempoShifted: isTempoShifted) }.map { $0.track.id }) ?? [])
@@ -9917,19 +10426,11 @@ public final class MultitrackAudioEngine: ObservableObject {
                 }
             } else if idx >= 0 && idx < currentSetlist.songs.count {
                 let s = currentSetlist.songs[idx]
-                var loaded: [(UUID, Bool, Bool, AVAudioPCMBuffer, URL?)] = []
-                for url in s.stemURLs {
-                    if let buf = try? PlaybackFileManager.shared.readPCMBuffer(from: url) {
-                        let norm = normalizeBufferToCanonical(buffer: buf, targetFormat: canonicalFormat)
-                        let cat = StemCategory.category(for: url.deletingPathExtension().lastPathComponent)
-                        let isClickGuide = (cat == .click || cat == .guide)
-                        if !isClickGuide || isTempoShifted {
-                            let losslessURL = (Self.isLosslessAudioURL(url) && FileManager.default.fileExists(atPath: url.path)) ? url : nil
-                            loaded.append((UUID(), !isClickGuide && cat == .vocals, isClickGuide, norm, losslessURL))
-                        }
-                    }
+                let reconstructed = reconstructTracksFromStemURLs(for: s, canonicalFormat: canonicalFormat)
+                return reconstructed.compactMap { (track, buf) in
+                    guard shouldRenderTransformedTrack(track, for: song, tempoShifted: isTempoShifted) else { return nil }
+                    return (track.id, Self.isVocalTrack(track), Self.isClickOrGuideTrack(track), buf, Self.resolveLosslessSourceURL(for: track))
                 }
-                return loaded
             }
             return []
         }()
@@ -9970,7 +10471,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         objectWillChange.send()
         
         let sendableSnapshot = snapshot.map { ($0.0, $0.1, $0.2, SendablePCMBufferRef($0.3), $0.4) }
-        let task = Task.detached(priority: .userInitiated) { [weak self, sendableSnapshot, canonicalFormat, targetSongId, clampedSemitones, newPreserveFormants, targetBPM, origBPM, tempoScale, bpmHundredths, activeGeneration, idx] in
+        let task = Task.detached(priority: .userInitiated) { [weak self, sendableSnapshot, canonicalFormat, targetSongId, clampedSemitones, newPreserveFormants, targetBPM, origBPM, tempoScale, bpmHundredths, activeGeneration, idx, forceRerender] in
             let total = max(1, sendableSnapshot.count)
             let maxConcurrency = max(2, min(6, ProcessInfo.processInfo.activeProcessorCount))
             var rendered: [UUID: AVAudioPCMBuffer] = [:]
@@ -10048,28 +10549,38 @@ public final class MultitrackAudioEngine: ObservableObject {
                 return "M4A"
             }()
             
+            let isValidRenderedSet = !finalRendered.isEmpty && finalRendered.values.allSatisfy { $0.frameLength > 100 }
             // Mark 100% complete
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
                 self.lastTransposeSourceBySong[targetSongId] = finalSourceLabel
-                self.songTransposedBuffersCache[targetSongId] = (clampedSemitones, newPreserveFormants, bpmHundredths, finalRendered)
+                if isValidRenderedSet {
+                    self.songTransposedBuffersCache[targetSongId] = (clampedSemitones, newPreserveFormants, bpmHundredths, finalRendered)
+                } else {
+                    self.songTransposedBuffersCache.removeValue(forKey: targetSongId)
+                }
                 self.transposeProgressBySong[targetSongId] = 1.0
                 if self.transposeGeneration == activeGeneration {
                     self.transposeProgress = 1.0
                 }
-                self.applyTransformedBuffers(finalRendered, forSongId: targetSongId, atIndex: idx, bpmChanged: false)
+                if isValidRenderedSet {
+                    self.applyTransformedBuffers(finalRendered, forSongId: targetSongId, atIndex: idx, bpmChanged: false)
+                }
                 self.objectWillChange.send()
             }
             
             // Background async disk cache write
-            PlaybackFileManager.shared.saveTransposedBuffersToDisk(
-                songId: targetSongId,
-                semitones: clampedSemitones,
-                preserveVocalFormants: newPreserveFormants,
-                bpm: targetBPM,
-                originalBPM: origBPM,
-                buffers: finalRendered
-            )
+            if isValidRenderedSet {
+                PlaybackFileManager.shared.saveTransposedBuffersToDisk(
+                    songId: targetSongId,
+                    semitones: clampedSemitones,
+                    preserveVocalFormants: newPreserveFormants,
+                    bpm: targetBPM,
+                    originalBPM: origBPM,
+                    buffers: finalRendered,
+                    overwrite: forceRerender
+                )
+            }
             
             // Hold at 100% briefly so the user sees complete status before dismissal
             try? await Task.sleep(nanoseconds: 350_000_000)
@@ -10513,6 +11024,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         guard idx >= 0 && idx < currentSetlist.songs.count else { return }
         let song = currentSetlist.songs[idx]
         guard song.transposeSemitones != 0 || song.isTempoShifted else { return }
+        guard areSongStemsHydratedForTransform(atIndex: idx) else { return }
         setKeyAndTempo(forSongIndex: idx)
     }
     
@@ -10536,6 +11048,8 @@ public final class MultitrackAudioEngine: ObservableObject {
         guard index >= 0 && index < currentSetlist.songs.count else { return }
         let removedSong = currentSetlist.songs.remove(at: index)
         songBuffersCache.removeValue(forKey: removedSong.id)
+        memoryEvictedSongIds.remove(removedSong.id)
+        songTrackMetadataBackup.removeValue(forKey: removedSong.id)
         songWaveformCache.removeValue(forKey: removedSong.id)
         songTransposedBuffersCache.removeValue(forKey: removedSong.id)
         
@@ -10565,10 +11079,15 @@ public final class MultitrackAudioEngine: ObservableObject {
         stop()
         clearAllTracks()
         songBuffersCache.removeAll()
+        memoryEvictedSongIds.removeAll()
+        songTrackMetadataBackup.removeAll()
         songWaveformCache.removeAll()
         songTransposedBuffersCache.removeAll()
         currentSessionURL = nil
+        currentSessionLoadedModDate = nil
+        currentSessionLoadedRevisionId = nil
         hasUnsavedChanges = false
+        hasCloudSetlistUpdate = false
         UserDefaults.standard.removeObject(forKey: "Playback_LastSessionPath")
         try? FileManager.default.removeItem(at: autoSaveSessionURL)
         currentSetlist = Setlist(
@@ -10597,6 +11116,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                 }
             }
             songBuffersCache[currentSong.id] = currentBuffers
+            recordTrackMetadataBackup(for: currentSong.id, tracks: currentBuffers.map { $0.0 })
         }
         
         stop()
@@ -10702,6 +11222,10 @@ public final class MultitrackAudioEngine: ObservableObject {
             return item1.0.name.localizedStandardCompare(item2.0.name) == .orderedAscending
         }
         songBuffersCache[mutableSong.id] = sortedTracks
+        recordTrackMetadataBackup(for: mutableSong.id, tracks: sortedTracks.map { $0.0 })
+        if !isStubLoad {
+            memoryEvictedSongIds.remove(mutableSong.id)
+        }
         currentSetlist.songs.append(mutableSong)
         selectSongInSetlist(at: currentSetlist.songs.count - 1, updateUndoBaseline: false)
         markSessionChanged()
@@ -10793,9 +11317,12 @@ public final class MultitrackAudioEngine: ObservableObject {
                 }
             }
             songBuffersCache[currentSong.id] = currentBuffers
+            recordTrackMetadataBackup(for: currentSong.id, tracks: currentBuffers.map { $0.0 })
         }
         
         songBuffersCache[newSong.id] = initialTracks
+        recordTrackMetadataBackup(for: newSong.id, tracks: initialTracks.map { $0.0 })
+        memoryEvictedSongIds.remove(newSong.id)
         currentSetlist.songs.append(newSong)
         selectSongInSetlist(at: currentSetlist.songs.count - 1, updateUndoBaseline: false)
         markSessionChanged()
@@ -11063,6 +11590,7 @@ public final class MultitrackAudioEngine: ObservableObject {
             }
             return (hasHydratedStem && !result.isEmpty) ? result : nil
         }
+        rehydrateEvictedSongBuffersIfNeeded(for: existingSong)
         if let cached = songBuffersCache[existingSong.id], !cached.isEmpty {
             let hasHydratedStem = cached.contains { !Self.isClickOrGuideTrack($0.track) && $0.buffer.frameLength > 100 }
             guard hasHydratedStem else { return nil }
@@ -11076,7 +11604,8 @@ public final class MultitrackAudioEngine: ObservableObject {
         recordAsLastSession: Bool = true,
         asDirectoryPackage: Bool = true,
         associatedSessionPath: String? = nil,
-        changeDescription: String? = nil
+        changeDescription: String? = nil,
+        revisionId: UUID? = nil
     ) throws {
         if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count && !currentSong.title.isEmpty {
             ensureCuesTaggedToSections(in: &currentSong)
@@ -11090,6 +11619,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                 }
             }
             songBuffersCache[currentSong.id] = currentBuffers
+            recordTrackMetadataBackup(for: currentSong.id, tracks: currentBuffers.map { $0.0 })
         }
         
         var allSongsData: [(song: Song, tracks: [StemTrack], buffers: [UUID: AVAudioPCMBuffer])] = []
@@ -11108,6 +11638,20 @@ public final class MultitrackAudioEngine: ObservableObject {
             }
             allSongsData.append((song: song, tracks: songTracks, buffers: buffersDict))
         }
+
+        let isAutoSave = (url.standardizedFileURL == autoSaveSessionURL.standardizedFileURL)
+        let effectiveRevisionId = isAutoSave ? currentSessionLoadedRevisionId : (revisionId ?? UUID())
+        if !isAutoSave, let revId = effectiveRevisionId {
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    clearSaveAndCloudUpdateIndicators(revisionId: revId, targetURLs: [url])
+                }
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.clearSaveAndCloudUpdateIndicators(revisionId: revId, targetURLs: [url])
+                }
+            }
+        }
         
         try PlaybackFileManager.shared.exportSession(
             setlist: currentSetlist,
@@ -11117,28 +11661,40 @@ public final class MultitrackAudioEngine: ObservableObject {
             to: url,
             asDirectoryPackage: asDirectoryPackage,
             associatedSessionPath: associatedSessionPath,
-            changeDescription: changeDescription
+            changeDescription: changeDescription,
+            revisionId: effectiveRevisionId
         )
-        if recordAsLastSession {
-            currentSessionURL = url
-            currentSessionLoadedModDate = LibraryBrowserManager.packageModificationDate(at: url)
-            UserDefaults.standard.set(url.path, forKey: "Playback_LastSessionPath")
-            if LibraryBrowserManager.isURLInCloudLibrary(url) {
-                hasCloudSetlistUpdate = false
+        if !isAutoSave {
+            let savedModDate = LibraryBrowserManager.packageModificationDate(at: url)
+            if recordAsLastSession {
+                currentSessionURL = url
+                currentSessionLoadedModDate = max(currentSessionLoadedModDate ?? .distantPast, savedModDate)
+                UserDefaults.standard.set(url.path, forKey: "Playback_LastSessionPath")
+                if url.standardizedFileURL != autoSaveSessionURL.standardizedFileURL {
+                    try? PlaybackFileManager.shared.exportSession(
+                        setlist: currentSetlist,
+                        currentSongIndex: currentSongIndex,
+                        allSongsData: allSongsData,
+                        transposedBuffersMap: songTransposedBuffersCache.mapValues { ($0.semitones, $0.buffers) },
+                        to: autoSaveSessionURL,
+                        asDirectoryPackage: true,
+                        associatedSessionPath: url.path,
+                        revisionId: effectiveRevisionId
+                    )
+                }
             } else {
-                updateCloudSetlistUpdateFlag(from: LibraryBrowserManager.shared.setlists)
+                currentSessionLoadedModDate = max(currentSessionLoadedModDate ?? .distantPast, savedModDate)
             }
-            markSessionSaved()
-            if url.standardizedFileURL != autoSaveSessionURL.standardizedFileURL {
-                try? PlaybackFileManager.shared.exportSession(
-                    setlist: currentSetlist,
-                    currentSongIndex: currentSongIndex,
-                    allSongsData: allSongsData,
-                    transposedBuffersMap: songTransposedBuffersCache.mapValues { ($0.semitones, $0.buffers) },
-                    to: autoSaveSessionURL,
-                    asDirectoryPackage: true,
-                    associatedSessionPath: url.path
-                )
+            if let revId = effectiveRevisionId {
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated {
+                        clearSaveAndCloudUpdateIndicators(revisionId: revId, targetURLs: [url])
+                    }
+                } else {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.clearSaveAndCloudUpdateIndicators(revisionId: revId, targetURLs: [url])
+                    }
+                }
             }
         }
     }
@@ -11148,7 +11704,8 @@ public final class MultitrackAudioEngine: ObservableObject {
         recordAsLastSession: Bool = true,
         asDirectoryPackage: Bool = true,
         associatedSessionPath: String? = nil,
-        changeDescription: String? = nil
+        changeDescription: String? = nil,
+        revisionId: UUID? = nil
     ) async throws {
         if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count && !currentSong.title.isEmpty {
             ensureCuesTaggedToSections(in: &currentSong)
@@ -11162,6 +11719,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                 }
             }
             songBuffersCache[currentSong.id] = currentBuffers
+            recordTrackMetadataBackup(for: currentSong.id, tracks: currentBuffers.map { $0.0 })
         }
 
         let setlistSnapshot = currentSetlist
@@ -11184,6 +11742,14 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
         let transposedSnapshot = songTransposedBuffersCache.mapValues { ($0.semitones, $0.buffers) }
         let autoSaveURL = autoSaveSessionURL
+        let isAutoSave = (url.standardizedFileURL == autoSaveURL.standardizedFileURL)
+        let effectiveRevisionId = isAutoSave ? currentSessionLoadedRevisionId : (revisionId ?? UUID())
+
+        if !isAutoSave, let revId = effectiveRevisionId {
+            await MainActor.run {
+                clearSaveAndCloudUpdateIndicators(revisionId: revId, targetURLs: [url])
+            }
+        }
 
         // Wrap non-Sendable AVAudioPCMBuffer snapshots cleanly for off-main export
         struct ExportPayload: @unchecked Sendable {
@@ -11208,7 +11774,8 @@ public final class MultitrackAudioEngine: ObservableObject {
                 to: url,
                 asDirectoryPackage: asDirectoryPackage,
                 associatedSessionPath: associatedSessionPath,
-                changeDescription: changeDescription
+                changeDescription: changeDescription,
+                revisionId: effectiveRevisionId
             )
             if recordAsLastSession, url.standardizedFileURL != autoSaveURL.standardizedFileURL {
                 try? PlaybackFileManager.shared.exportSession(
@@ -11219,33 +11786,105 @@ public final class MultitrackAudioEngine: ObservableObject {
                     to: autoSaveURL,
                     asDirectoryPackage: true,
                     associatedSessionPath: url.path,
-                    changeDescription: changeDescription
+                    changeDescription: changeDescription,
+                    revisionId: effectiveRevisionId
                 )
             }
         }.value
 
-        if recordAsLastSession {
-            currentSessionURL = url
-            currentSessionLoadedModDate = LibraryBrowserManager.packageModificationDate(at: url)
-            UserDefaults.standard.set(url.path, forKey: "Playback_LastSessionPath")
-            if LibraryBrowserManager.isURLInCloudLibrary(url) {
-                hasCloudSetlistUpdate = false
-            } else {
-                updateCloudSetlistUpdateFlag(from: LibraryBrowserManager.shared.setlists)
+        if !isAutoSave {
+            let savedModDate = LibraryBrowserManager.packageModificationDate(at: url)
+            await MainActor.run {
+                if recordAsLastSession {
+                    self.currentSessionURL = url
+                    UserDefaults.standard.set(url.path, forKey: "Playback_LastSessionPath")
+                }
+                self.currentSessionLoadedModDate = max(self.currentSessionLoadedModDate ?? .distantPast, savedModDate)
+                if let revId = effectiveRevisionId {
+                    self.clearSaveAndCloudUpdateIndicators(revisionId: revId, targetURLs: [url])
+                } else {
+                    self.hasCloudSetlistUpdate = false
+                    self.markSessionSaved()
+                }
             }
-            markSessionSaved()
-        } else if LibraryBrowserManager.isURLInCloudLibrary(url) {
-            currentSessionLoadedModDate = max(currentSessionLoadedModDate ?? .distantPast, LibraryBrowserManager.packageModificationDate(at: url))
-            hasCloudSetlistUpdate = false
+        }
+    }
+
+    /// Resolves primary + optional Cloud/Local mirror destinations and saves them under a shared revision ID
+    /// so both copies carry the identical `lastSavedRevisionId` and `lastSavedByDeviceId`, clearing both dots immediately.
+    @MainActor
+    public func saveQuickSession(changeDescription: String? = nil) {
+        let fm = FileManager.default
+        let fallbackName = LibraryBrowserManager.sanitizedPackageFilename(
+            currentSetlist.name.isEmpty ? "Untitled Session" : currentSetlist.name,
+            ext: "pbsession"
+        )
+        let primaryURL: URL
+        var mirrorURL: URL? = nil
+        let library = LibraryBrowserManager.shared
+
+        if let currentURL = currentSessionURL {
+            primaryURL = currentURL
+            if !LibraryBrowserManager.isURLInCloudLibrary(currentURL),
+               let cloudDir = library.cloudSetlistsDirectory {
+                let cloudByCurrent = cloudDir.appendingPathComponent(currentURL.lastPathComponent)
+                let cloudByName = cloudDir.appendingPathComponent(fallbackName)
+                if fm.fileExists(atPath: cloudByCurrent.path) {
+                    mirrorURL = cloudByCurrent
+                } else if fm.fileExists(atPath: cloudByName.path) {
+                    mirrorURL = cloudByName
+                }
+            } else if LibraryBrowserManager.isURLInCloudLibrary(currentURL) {
+                let localByCurrent = library.setlistsDirectory.appendingPathComponent(currentURL.lastPathComponent)
+                let localByName = library.setlistsDirectory.appendingPathComponent(fallbackName)
+                if fm.fileExists(atPath: localByCurrent.path) {
+                    mirrorURL = localByCurrent
+                } else if fm.fileExists(atPath: localByName.path) {
+                    mirrorURL = localByName
+                }
+            }
+        } else {
+            primaryURL = library.setlistsDirectory.appendingPathComponent(fallbackName)
+            if let cloudDir = library.cloudSetlistsDirectory {
+                let cloudDest = cloudDir.appendingPathComponent(fallbackName)
+                if fm.fileExists(atPath: cloudDest.path) {
+                    mirrorURL = cloudDest
+                }
+            }
+        }
+
+        let targetMirror = mirrorURL
+        let allTargets = [primaryURL, targetMirror].compactMap { $0 }
+        let sharedRevisionId = UUID()
+        clearSaveAndCloudUpdateIndicators(revisionId: sharedRevisionId, targetURLs: allTargets)
+
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            do {
+                try await self.saveSessionAsync(
+                    to: primaryURL,
+                    changeDescription: changeDescription,
+                    revisionId: sharedRevisionId
+                )
+                if let mirror = targetMirror {
+                    try? await self.saveSessionAsync(
+                        to: mirror,
+                        recordAsLastSession: false,
+                        changeDescription: changeDescription,
+                        revisionId: sharedRevisionId
+                    )
+                }
+                library.refreshSetlists()
+            } catch {
+                print("Save error: \(error.localizedDescription)")
+            }
         }
     }
 
     public func saveCurrentSession() {
-        if let url = currentSessionURL {
+        if currentSessionURL != nil {
             Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                try? await self.saveSessionAsync(to: url)
-                LibraryBrowserManager.shared.refreshSetlists()
+                self?.saveQuickSession()
             }
         } else {
             NotificationCenter.default.post(name: NSNotification.Name("PlaybackSaveSession"), object: nil)
@@ -11268,6 +11907,8 @@ public final class MultitrackAudioEngine: ObservableObject {
         stop()
         clearAllTracks()
         songBuffersCache.removeAll()
+        memoryEvictedSongIds.removeAll()
+        songTrackMetadataBackup.removeAll()
         songWaveformCache.removeAll()
         songTransposedBuffersCache.removeAll()
         generatedClickBuffers.removeAll()
@@ -11277,7 +11918,6 @@ public final class MultitrackAudioEngine: ObservableObject {
             currentSessionURL = url
             currentSessionLoadedModDate = LibraryBrowserManager.packageModificationDate(at: url)
             UserDefaults.standard.set(url.path, forKey: "Playback_LastSessionPath")
-            updateCloudSetlistUpdateFlag(from: LibraryBrowserManager.shared.setlists)
         }
         
         let canonicalFormat = getCanonicalProcessingFormat()
@@ -11300,6 +11940,9 @@ public final class MultitrackAudioEngine: ObservableObject {
         generation: Int
     ) {
         currentSetlist = hydrated.setlist
+        if recordAsLastSession || currentSessionLoadedRevisionId == nil {
+            currentSessionLoadedRevisionId = hydrated.lastSavedRevisionId
+        }
         for sIdx in 0..<currentSetlist.songs.count {
             for secIdx in 0..<currentSetlist.songs[sIdx].sections.count {
                 currentSetlist.songs[sIdx].sections[secIdx].abbreviation = SongSection.abbreviation(for: currentSetlist.songs[sIdx].sections[secIdx].name)
@@ -11312,6 +11955,8 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         for item in hydrated.songsPlaceholderData {
             songBuffersCache[item.song.id] = item.tracks
+            recordTrackMetadataBackup(for: item.song.id, tracks: item.tracks.map { $0.0 })
+            memoryEvictedSongIds.remove(item.song.id)
         }
         
         if !currentSetlist.songs.isEmpty {
@@ -11324,6 +11969,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         if recordAsLastSession {
             markSessionSaved()
+            updateCloudSetlistUpdateFlag(from: LibraryBrowserManager.shared.setlists)
         }
         resetUndoHistoryToCurrentState()
         
@@ -11516,7 +12162,13 @@ public final class MultitrackAudioEngine: ObservableObject {
         guard let songIdx = currentSetlist.songs.firstIndex(where: { $0.id == songId }) else { return }
         let song = currentSetlist.songs[songIdx]
         
-        if (song.transposeSemitones != 0 || song.isTempoShifted) && !decodedTransposed.isEmpty {
+        let requiredTransformIds = decodedTracks
+            .filter { shouldRenderTransformedTrack($0.0, for: song, tempoShifted: song.isTempoShifted) }
+            .map { $0.0.id }
+        let hasCompleteValidTransposed = !requiredTransformIds.isEmpty && requiredTransformIds.allSatisfy { tid in
+            (decodedTransposed[tid]?.frameLength ?? 0) > 100
+        }
+        if (song.transposeSemitones != 0 || song.isTempoShifted) && hasCompleteValidTransposed {
             songTransposedBuffersCache[songId] = (
                 song.transposeSemitones,
                 song.preserveVocalFormants,
@@ -11625,6 +12277,11 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
         
         songBuffersCache[songId] = hydratedItems
+        recordTrackMetadataBackup(for: songId, tracks: hydratedItems.map { $0.0 })
+        if hydratedItems.contains(where: { !Self.isClickOrGuideTrack($0.0) && $0.1.frameLength > 100 })
+            || !hydratedItems.contains(where: { !Self.isClickOrGuideTrack($0.0) }) {
+            memoryEvictedSongIds.remove(songId)
+        }
 
         // Fallback to generated Click/Guide if the song was marked `.uploaded` without an actual audio buffer
         if !currentSetlist.songs[songIdx].excludesClickAndGuide {
@@ -11762,6 +12419,8 @@ public final class MultitrackAudioEngine: ObservableObject {
         transposeTasksBySong.removeAll()
         transposeProgressBySong.removeAll()
         downloadingSongProgress.removeAll()
+        memoryEvictedSongIds.removeAll()
+        songTrackMetadataBackup.removeAll()
         clearCancelledSongDownloads()
         isTransposing = false
         transposeProgress = 0.0
@@ -11773,6 +12432,22 @@ public final class MultitrackAudioEngine: ObservableObject {
                     from: candidate.url,
                     canonicalFormat: canonicalFormat
                 )
+                if candidate.url.standardizedFileURL == autoURL.standardizedFileURL {
+                    let hasUUIDGibberishTrack = hydrated.songEntries.contains { entry in
+                        entry.tracks.contains { Self.isLikelyUUIDString($0.name) }
+                    }
+                    let hasEmptyTracksWhileExtHasTracks: Bool = {
+                        guard let extURL = candidate.overrideSessionURL else { return false }
+                        return hydrated.songEntries.contains { entry in
+                            entry.tracks.isEmpty &&
+                            (PlaybackFileManager.shared.loadSongTrackMetadataFromSession(songId: entry.id, sessionURL: extURL)?.isEmpty == false)
+                        }
+                    }()
+                    if hasUUIDGibberishTrack || hasEmptyTracksWhileExtHasTracks {
+                        try? fm.removeItem(at: autoURL)
+                        continue
+                    }
+                }
                 if candidate.recordAsLast {
                     self.currentSessionURL = candidate.url
                     self.currentSessionLoadedModDate = LibraryBrowserManager.packageModificationDate(at: candidate.url)
@@ -11781,6 +12456,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                     self.currentSessionURL = candidate.overrideSessionURL
                     self.currentSessionLoadedModDate = candidate.overrideSessionURL.map { LibraryBrowserManager.packageModificationDate(at: $0) }
                 }
+                self.currentSessionLoadedRevisionId = hydrated.lastSavedRevisionId
                 self.updateCloudSetlistUpdateFlag(from: LibraryBrowserManager.shared.setlists)
                 self.applyHydratedSessionMetadata(
                     hydrated: hydrated,

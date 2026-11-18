@@ -1224,11 +1224,7 @@ public struct SetlistMenuPopoverView: View {
     }
 
     private func setlistHasCloudUpdate(_ item: SetlistLibraryItem) -> Bool {
-        guard item.source == .cloud else { return false }
-        if engine.currentSessionURL?.standardizedFileURL == item.url.standardizedFileURL {
-            return engine.currentSessionLoadedModDate.map { item.modifiedDate.timeIntervalSince($0) > 2.0 } ?? false
-        }
-        return item.hasCloudUpdate
+        engine.shouldShowCloudUpdate(for: item)
     }
 
     private func openLibrarySetlistDetail(_ item: SetlistLibraryItem) {
@@ -1570,66 +1566,8 @@ public struct SetlistMenuPopoverView: View {
     }
     
     private func saveSessionQuick(changeDescription: String? = nil) {
-        let fm = FileManager.default
-        if let currentURL = engine.currentSessionURL {
-            let fallbackName = LibraryBrowserManager.sanitizedPackageFilename(
-                engine.currentSetlist.name.isEmpty ? "Untitled Session" : engine.currentSetlist.name,
-                ext: "pbsession"
-            )
-            var mirrorURL: URL? = nil
-            if !library.isURLInCloudLibrary(currentURL),
-               let cloudDir = library.cloudSetlistsDirectory {
-                let cloudByCurrent = cloudDir.appendingPathComponent(currentURL.lastPathComponent)
-                let cloudByName = cloudDir.appendingPathComponent(fallbackName)
-                if fm.fileExists(atPath: cloudByCurrent.path) {
-                    mirrorURL = cloudByCurrent
-                } else if fm.fileExists(atPath: cloudByName.path) {
-                    mirrorURL = cloudByName
-                }
-            } else if library.isURLInCloudLibrary(currentURL) {
-                let localByCurrent = library.setlistsDirectory.appendingPathComponent(currentURL.lastPathComponent)
-                let localByName = library.setlistsDirectory.appendingPathComponent(fallbackName)
-                if fm.fileExists(atPath: localByCurrent.path) {
-                    mirrorURL = localByCurrent
-                } else if fm.fileExists(atPath: localByName.path) {
-                    mirrorURL = localByName
-                }
-            }
-            let targetMirror = mirrorURL
-            onDismiss()
-            Task { @MainActor in
-                do {
-                    try await engine.saveSessionAsync(to: currentURL, changeDescription: changeDescription)
-                    if let mirror = targetMirror {
-                        try? await engine.saveSessionAsync(to: mirror, recordAsLastSession: false, changeDescription: changeDescription)
-                    }
-                    library.refreshSetlists()
-                } catch {
-                    print("Save error: \(error.localizedDescription)")
-                }
-            }
-        } else {
-            let defaultName = engine.currentSetlist.name.isEmpty ? "Untitled Session" : engine.currentSetlist.name
-            let fileName = LibraryBrowserManager.sanitizedPackageFilename(defaultName, ext: "pbsession")
-            let localDest = library.setlistsDirectory.appendingPathComponent(fileName)
-            let cloudDest: URL? = {
-                guard let cloudDir = library.cloudSetlistsDirectory else { return nil }
-                let dest = cloudDir.appendingPathComponent(fileName)
-                return fm.fileExists(atPath: dest.path) ? dest : nil
-            }()
-            onDismiss()
-            Task { @MainActor in
-                do {
-                    try await engine.saveSessionAsync(to: localDest, changeDescription: changeDescription)
-                    if let cDest = cloudDest {
-                        try? await engine.saveSessionAsync(to: cDest, recordAsLastSession: false, changeDescription: changeDescription)
-                    }
-                    library.refreshSetlists()
-                } catch {
-                    print("Save error: \(error.localizedDescription)")
-                }
-            }
-        }
+        onDismiss()
+        engine.saveQuickSession(changeDescription: changeDescription)
     }
     
     private func saveSessionAsNew() {
@@ -1644,10 +1582,12 @@ public struct SetlistMenuPopoverView: View {
         panel.prompt = "Save Session"
         
         if panel.runModal() == .OK, let url = panel.url {
+            let revisionId = UUID()
+            engine.clearSaveAndCloudUpdateIndicators(revisionId: revisionId, targetURLs: [url])
             onDismiss()
             Task { @MainActor in
                 do {
-                    try await engine.saveSessionAsync(to: url)
+                    try await engine.saveSessionAsync(to: url, revisionId: revisionId)
                     library.refreshSetlists()
                 } catch {
                     print("Save error: \(error.localizedDescription)")
@@ -1665,10 +1605,12 @@ public struct SetlistMenuPopoverView: View {
         let defaultName = engine.currentSetlist.name.isEmpty ? "Untitled Session" : engine.currentSetlist.name
         let fileName = LibraryBrowserManager.sanitizedPackageFilename(defaultName, ext: "pbsession")
         let destURL = targetDir.appendingPathComponent(fileName)
+        let revisionId = UUID()
+        engine.clearSaveAndCloudUpdateIndicators(revisionId: revisionId, targetURLs: [destURL])
         onDismiss()
         Task { @MainActor in
             do {
-                try await engine.saveSessionAsync(to: destURL, changeDescription: changeDescription)
+                try await engine.saveSessionAsync(to: destURL, changeDescription: changeDescription, revisionId: revisionId)
                 library.refreshSetlists()
             } catch {
                 print("Save error: \(error.localizedDescription)")

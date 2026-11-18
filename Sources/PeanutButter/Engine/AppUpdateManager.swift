@@ -14,6 +14,7 @@ public final class AppUpdateManager: ObservableObject {
 
     private static let lastCheckTimestampKey = "PeanutButter_LastUpdateCheckTimestamp"
     private static let skippedVersionKey = "PeanutButter_SkippedUpdateVersion"
+    private static let suppressMoveToApplicationsKey = "PeanutButter_SuppressMoveToApplications"
     private static let autoCheckInterval: TimeInterval = 86_400
     private static let expectedBundleIdentifier = "com.peanutbutter.app"
 
@@ -65,6 +66,7 @@ public final class AppUpdateManager: ObservableObject {
     private var activeDownloadDelegate: DownloadSessionDelegate?
     private var activeStagingRootURL: URL?
     private var hasSpawnedSwapHelper: Bool = false
+    private var hasPromptedMoveToApplications: Bool = false
 
     private init() {}
 
@@ -492,11 +494,72 @@ public final class AppUpdateManager: ObservableObject {
         }
     }
 
-    // MARK: - In-Place Bundle Swap (On Quit or Relaunch)
+    // MARK: - Move to Applications & In-Place Bundle Swap (On Quit or Relaunch)
+
+    public nonisolated static func shouldOfferMoveToApplications(bundlePath: String, downloadsPath: String? = nil) -> Bool {
+        guard bundlePath.hasSuffix(".app") else { return false }
+        let stdBundle = URL(fileURLWithPath: bundlePath).standardized.path
+        let userApps = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications").standardized.path
+        if stdBundle.hasPrefix("/Applications/") || stdBundle == "/Applications" ||
+           stdBundle.hasPrefix(userApps + "/") || stdBundle == userApps {
+            return false
+        }
+        if stdBundle.contains("/AppTranslocation/") {
+            return true
+        }
+        let resolvedDownloads = downloadsPath ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?.path
+        if let dl = resolvedDownloads, !dl.isEmpty {
+            let stdDownloads = URL(fileURLWithPath: dl).standardized.path
+            if stdBundle.hasPrefix(stdDownloads + "/") {
+                return true
+            }
+        }
+        return false
+    }
+
+    public func promptMoveToApplicationsIfNeeded() {
+        guard !hasPromptedMoveToApplications else { return }
+        guard !UserDefaults.standard.bool(forKey: Self.suppressMoveToApplicationsKey) else { return }
+        let bundlePath = Bundle.main.bundlePath
+        guard Self.shouldOfferMoveToApplications(bundlePath: bundlePath) else { return }
+        hasPromptedMoveToApplications = true
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Move PeanutButter to Applications?"
+        alert.informativeText = "PeanutButter is currently running from your Downloads folder. Moving it to Applications keeps future updates fast and password-free."
+        alert.addButton(withTitle: "Move to Applications")
+        alert.addButton(withTitle: "Not Now")
+        alert.addButton(withTitle: "Don't Ask Again")
+
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            let destURL = URL(fileURLWithPath: "/Applications/PeanutButter.app")
+            let downloadsAppURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("PeanutButter.app")
+            let extraCleanup = bundlePath.contains("/AppTranslocation/") ? downloadsAppURL : nil
+            onBeforeRelaunch?()
+            if spawnSwapHelper(
+                targetAppURL: destURL,
+                stagedAppURL: Bundle.main.bundleURL,
+                relaunch: true,
+                stagingRootPath: "",
+                extraCleanupAppPath: extraCleanup?.path ?? ""
+            ) {
+                hasSpawnedSwapHelper = true
+                NSApplication.shared.terminate(nil)
+            }
+        case .alertThirdButtonReturn:
+            UserDefaults.standard.set(true, forKey: Self.suppressMoveToApplicationsKey)
+        default:
+            break
+        }
+    }
 
     /// Returns a self-cleaning `/bin/sh` script that waits for `PID`, swaps the staged `.app` bundle
-    /// cleanly (with automatic rollback and an osascript admin prompt fallback if `/Applications` is locked),
-    /// deletes staging files, and optionally reopens the updated app.
+    /// cleanly (using instant `mv` when possible with `ditto` fallback, automatic rollback, and an osascript
+    /// admin prompt fallback if `/Applications` is locked), relaunches first, and cleans up in the background.
     public nonisolated static func buildSwapShellScript() -> String {
         return """
         #!/bin/sh
@@ -505,6 +568,7 @@ public final class AppUpdateManager: ObservableObject {
         STAGED_APP="$3"
         RELAUNCH="$4"
         STAGING_ROOT="$5"
+        EXTRA_CLEANUP_APP="${6:-}"
 
         if [ -n "$APP_PID" ] && [ "$APP_PID" -gt 0 ] 2>/dev/null; then
             TRIES=0
@@ -530,15 +594,18 @@ public final class AppUpdateManager: ObservableObject {
             if [ -e "$TARGET_APP" ]; then
                 mv "$TARGET_APP" "$BACKUP_APP" || return 1
             fi
-            if ! /usr/bin/ditto "$STAGED_APP" "$TARGET_APP"; then
-                rm -rf "$TARGET_APP" 2>/dev/null || true
-                if [ -e "$BACKUP_APP" ]; then
-                    mv "$BACKUP_APP" "$TARGET_APP" 2>/dev/null || true
+            if ! mv "$STAGED_APP" "$TARGET_APP" 2>/dev/null; then
+                if ! /usr/bin/ditto "$STAGED_APP" "$TARGET_APP"; then
+                    rm -rf "$TARGET_APP" 2>/dev/null || true
+                    if [ -e "$BACKUP_APP" ]; then
+                        mv "$BACKUP_APP" "$TARGET_APP" 2>/dev/null || true
+                    fi
+                    return 1
                 fi
-                return 1
             fi
-            /usr/bin/xattr -dr com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
-            rm -rf "$BACKUP_APP" 2>/dev/null || true
+            if /usr/bin/xattr -p com.apple.quarantine "$TARGET_APP" >/dev/null 2>&1; then
+                /usr/bin/xattr -dr com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
+            fi
             return 0
         }
 
@@ -551,7 +618,7 @@ public final class AppUpdateManager: ObservableObject {
             ESC_TARGET=$(printf '%s' "$TARGET_APP" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
             ESC_STAGED=$(printf '%s' "$STAGED_APP" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
             ESC_BACKUP=$(printf '%s' "$BACKUP_APP" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
-            ADMIN_CMD="rm -rf \\"${ESC_BACKUP}\\" && mv \\"${ESC_TARGET}\\" \\"${ESC_BACKUP}\\" && (/usr/bin/ditto \\"${ESC_STAGED}\\" \\"${ESC_TARGET}\\" || (rm -rf \\"${ESC_TARGET}\\"; mv \\"${ESC_BACKUP}\\" \\"${ESC_TARGET}\\"; exit 1)) && /usr/bin/xattr -dr com.apple.quarantine \\"${ESC_TARGET}\\" 2>/dev/null; rm -rf \\"${ESC_BACKUP}\\""
+            ADMIN_CMD="rm -rf \\"${ESC_BACKUP}\\" && ([ ! -e \\"${ESC_TARGET}\\" ] || mv \\"${ESC_TARGET}\\" \\"${ESC_BACKUP}\\") && (mv \\"${ESC_STAGED}\\" \\"${ESC_TARGET}\\" 2>/dev/null || /usr/bin/ditto \\"${ESC_STAGED}\\" \\"${ESC_TARGET}\\" || (rm -rf \\"${ESC_TARGET}\\"; [ -e \\"${ESC_BACKUP}\\" ] && mv \\"${ESC_BACKUP}\\" \\"${ESC_TARGET}\\"; exit 1)) && /usr/bin/xattr -dr com.apple.quarantine \\"${ESC_TARGET}\\" 2>/dev/null; rm -rf \\"${ESC_BACKUP}\\""
             ESC_ADMIN=$(printf '%s' "$ADMIN_CMD" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
             if ! /usr/bin/osascript -e "do shell script \\"${ESC_ADMIN}\\" with administrator privileges" >/dev/null 2>&1; then
                 rm -f "$0"
@@ -559,17 +626,36 @@ public final class AppUpdateManager: ObservableObject {
             fi
         fi
 
+        if [ "$RELAUNCH" = "1" ]; then
+            /usr/bin/open "$TARGET_APP" >/dev/null 2>&1 || true
+        fi
+
+        if [ -e "$BACKUP_APP" ]; then
+            rm -rf "$BACKUP_APP" 2>/dev/null || true
+        fi
+
         if [ -n "$STAGING_ROOT" ] && [ -d "$STAGING_ROOT" ]; then
             rm -rf "$STAGING_ROOT" 2>/dev/null || true
         fi
 
-        if [ "$RELAUNCH" = "1" ]; then
-            /usr/bin/open "$TARGET_APP" >/dev/null 2>&1 || true
+        if [ -n "$EXTRA_CLEANUP_APP" ] && [ "$EXTRA_CLEANUP_APP" != "$TARGET_APP" ] && [ -d "$EXTRA_CLEANUP_APP" ]; then
+            rm -rf "$EXTRA_CLEANUP_APP" 2>/dev/null || true
         fi
 
         rm -f "$0"
         exit 0
         """
+    }
+
+    private func resolvedInstallTargetAndCleanup() -> (targetURL: URL, extraCleanupPath: String) {
+        if Bundle.main.bundlePath.contains("/AppTranslocation/") {
+            let destURL = URL(fileURLWithPath: "/Applications/PeanutButter.app")
+            let downloadsApp = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("PeanutButter.app")
+            let extra = (downloadsApp != nil && FileManager.default.fileExists(atPath: downloadsApp!.path)) ? downloadsApp!.path : ""
+            return (destURL, extra)
+        }
+        return (Bundle.main.bundleURL, "")
     }
 
     public func installAndRelaunchNow() {
@@ -586,7 +672,13 @@ public final class AppUpdateManager: ObservableObject {
         }
 
         onBeforeRelaunch?()
-        guard spawnSwapHelper(targetAppURL: Bundle.main.bundleURL, stagedAppURL: stagedURL, relaunch: true) else {
+        let resolved = resolvedInstallTargetAndCleanup()
+        guard spawnSwapHelper(
+            targetAppURL: resolved.targetURL,
+            stagedAppURL: stagedURL,
+            relaunch: true,
+            extraCleanupAppPath: resolved.extraCleanupPath
+        ) else {
             phase = .error("Could not launch installer helper. Please drag the update manually.")
             return
         }
@@ -606,12 +698,24 @@ public final class AppUpdateManager: ObservableObject {
             return
         }
 
-        if spawnSwapHelper(targetAppURL: Bundle.main.bundleURL, stagedAppURL: stagedURL, relaunch: false) {
+        let resolved = resolvedInstallTargetAndCleanup()
+        if spawnSwapHelper(
+            targetAppURL: resolved.targetURL,
+            stagedAppURL: stagedURL,
+            relaunch: false,
+            extraCleanupAppPath: resolved.extraCleanupPath
+        ) {
             hasSpawnedSwapHelper = true
         }
     }
 
-    private func spawnSwapHelper(targetAppURL: URL, stagedAppURL: URL, relaunch: Bool) -> Bool {
+    private func spawnSwapHelper(
+        targetAppURL: URL,
+        stagedAppURL: URL,
+        relaunch: Bool,
+        stagingRootPath: String? = nil,
+        extraCleanupAppPath: String = ""
+    ) -> Bool {
         let scriptURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("pb_install_update_\(UUID().uuidString).sh")
         let scriptContent = Self.buildSwapShellScript()
@@ -622,7 +726,7 @@ public final class AppUpdateManager: ObservableObject {
             return false
         }
 
-        let stagingRoot = activeStagingRootURL?.path ?? stagedAppURL.deletingLastPathComponent().deletingLastPathComponent().path
+        let stagingRoot = stagingRootPath ?? (activeStagingRootURL?.path ?? stagedAppURL.deletingLastPathComponent().deletingLastPathComponent().path)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/sh")
         proc.arguments = [
@@ -631,7 +735,8 @@ public final class AppUpdateManager: ObservableObject {
             targetAppURL.path,
             stagedAppURL.path,
             relaunch ? "1" : "0",
-            stagingRoot
+            stagingRoot,
+            extraCleanupAppPath
         ]
         proc.standardInput = FileHandle.nullDevice
         proc.standardOutput = FileHandle.nullDevice

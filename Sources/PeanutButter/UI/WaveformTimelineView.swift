@@ -2624,8 +2624,8 @@ struct DirectionalCuePopoverPresenter: NSViewRepresentable {
             }
             
             let hostingController = NSHostingController(rootView: contentView)
-            let fittingSize = hostingController.sizeThatFits(in: NSSize(width: 320, height: 600))
-            let finalSize = NSSize(width: max(fittingSize.width, 270), height: max(fittingSize.height, 140))
+            let fittingSize = hostingController.sizeThatFits(in: NSSize(width: 340, height: 600))
+            let finalSize = NSSize(width: max(fittingSize.width, 340), height: max(fittingSize.height, 140))
             hostingController.preferredContentSize = finalSize
             p.contentSize = finalSize
             p.contentViewController = hostingController

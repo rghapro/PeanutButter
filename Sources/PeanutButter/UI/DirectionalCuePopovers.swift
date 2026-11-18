@@ -1,8 +1,76 @@
 import SwiftUI
 
+/// Shared scrollable preset picker displaying user-classified Custom Directional Cues
+/// followed by all included studio directional cues bundled with PeanutButter.
+private struct DirectionalCuePresetPickerView: View {
+    @Binding var selectedLabel: String
+    let customOptions: [String]
+    let includedOptions: [String]
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 6),
+        GridItem(.flexible(), spacing: 6)
+    ]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                if !customOptions.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("CUSTOM DIRECTIONAL CUES")
+                            .font(.system(size: 8.5, weight: .black))
+                            .foregroundColor(Color(red: 0.30, green: 0.88, blue: 0.98))
+
+                        LazyVGrid(columns: columns, spacing: 6) {
+                            ForEach(customOptions, id: \.self) { preset in
+                                presetChip(preset)
+                            }
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("INCLUDED DIRECTIONAL CUES (\(includedOptions.count))")
+                        .font(.system(size: 8.5, weight: .black))
+                        .foregroundColor(Color(white: 0.5))
+
+                    LazyVGrid(columns: columns, spacing: 6) {
+                        ForEach(includedOptions, id: \.self) { preset in
+                            presetChip(preset)
+                        }
+                    }
+                }
+            }
+            .padding(.trailing, 4)
+        }
+        .frame(height: 235)
+    }
+
+    @ViewBuilder
+    private func presetChip(_ preset: String) -> some View {
+        let isSelected = (selectedLabel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == preset.lowercased())
+        Button(action: {
+            selectedLabel = preset
+        }) {
+            Text(preset)
+                .font(.system(size: 10.5, weight: .bold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .frame(maxWidth: .infinity)
+                .background(isSelected ? Color(red: 0.0, green: 0.65, blue: 0.85) : Color(white: 0.18))
+                .foregroundColor(isSelected ? .white : Color(white: 0.82))
+                .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 /// Popover for adding a Directional Cue at the playhead
 public struct AddDirectionalCuePopoverView: View {
     @ObservedObject var engine: MultitrackAudioEngine
+    @ObservedObject private var customSamples = CustomSampleLibraryManager.shared
     let targetTime: TimeInterval
     let onDismiss: () -> Void
     
@@ -12,6 +80,14 @@ public struct AddDirectionalCuePopoverView: View {
         self.engine = engine
         self.targetTime = targetTime
         self.onDismiss = onDismiss
+    }
+
+    private func commitAdd() {
+        let finalLabel = cueLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !finalLabel.isEmpty {
+            engine.addDirectionalCue(label: finalLabel, at: targetTime)
+        }
+        onDismiss()
     }
     
     public var body: some View {
@@ -47,45 +123,26 @@ public struct AddDirectionalCuePopoverView: View {
                     .padding(8)
                     .background(Color(white: 0.16))
                     .cornerRadius(5)
+                    .onSubmit {
+                        commitAdd()
+                    }
             }
             
-            // Quick Preset Chips
-            VStack(alignment: .leading, spacing: 6) {
-                Text(isRitaSelected ? "RITA DYNAMIC CUE PRESETS" : "COMMON PRESETS")
-                    .font(.system(size: 8.5, weight: .black))
-                    .foregroundColor(Color(white: 0.5))
-                
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 80))], spacing: 6) {
-                    ForEach(directionalPresets, id: \.self) { preset in
-                        let isSelected = (cueLabel.lowercased() == preset.lowercased())
-                        Button(action: {
-                            cueLabel = preset
-                        }) {
-                            Text(preset)
-                                .font(.system(size: 10, weight: .bold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 4)
-                                .frame(maxWidth: .infinity)
-                                .background(isSelected ? Color(red: 0.0, green: 0.65, blue: 0.85) : Color(white: 0.18))
-                                .foregroundColor(isSelected ? .white : Color(white: 0.80))
-                                .cornerRadius(4)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
+            // Quick Preset Chips (Custom Directional Cues + All Included Directional Cues)
+            DirectionalCuePresetPickerView(
+                selectedLabel: $cueLabel,
+                customOptions: customSamples.userCustomCueOptions(
+                    ofKind: .directional,
+                    preferredVoice: engine.currentSong.guideVoice
+                ),
+                includedOptions: CustomSampleLibraryManager.includedDirectionalMenuOptions
+            )
             
             Divider()
                 .background(Color(white: 0.20))
             
             // Add Button
-            Button(action: {
-                let finalLabel = cueLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !finalLabel.isEmpty {
-                    engine.addDirectionalCue(label: finalLabel, at: targetTime)
-                }
-                onDismiss()
-            }) {
+            Button(action: commitAdd) {
                 Text("Add Directional Cue")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(.white)
@@ -97,34 +154,16 @@ public struct AddDirectionalCuePopoverView: View {
             .buttonStyle(.plain)
         }
         .padding(14)
-        .frame(width: 320)
+        .frame(width: 340)
         .background(Color(red: 0.11, green: 0.12, blue: 0.14))
         .cornerRadius(10)
-    }
-    
-    private var isRitaSelected: Bool {
-        engine.currentSong.guideVoice == .rita || engine.currentSong.guideVoice.rawValue.lowercased() == "rita"
-    }
-    
-    private var directionalPresets: [String] {
-        if isRitaSelected {
-            return [
-                "Ad Lib", "All In", "Bass", "Big Ending", "Break", "Build",
-                "Drums In", "Drums", "Hits", "Hold", "Key Change Down", "Key Change Up",
-                "Keys", "Last Time", "Slowly Build", "Softly", "Swell", "Worship Freely"
-            ]
-        } else {
-            return [
-                "Build", "Breakdown", "Wash", "Drums In", "Softly",
-                "Big", "All In", "Band Out", "Hits", "Hold", "A Cappella"
-            ]
-        }
     }
 }
 
 /// Popover for editing or deleting an existing Directional Cue
 public struct EditDirectionalCuePopoverView: View {
     @ObservedObject var engine: MultitrackAudioEngine
+    @ObservedObject private var customSamples = CustomSampleLibraryManager.shared
     let cue: DirectionalCue
     let onDismiss: () -> Void
     
@@ -135,6 +174,14 @@ public struct EditDirectionalCuePopoverView: View {
         self.cue = cue
         self.onDismiss = onDismiss
         self._labelText = State(initialValue: cue.label)
+    }
+
+    private func commitUpdate() {
+        let finalLabel = labelText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !finalLabel.isEmpty {
+            engine.updateDirectionalCue(id: cue.id, label: finalLabel, time: cue.time)
+        }
+        onDismiss()
     }
     
     public var body: some View {
@@ -170,7 +217,20 @@ public struct EditDirectionalCuePopoverView: View {
                     .padding(8)
                     .background(Color(white: 0.16))
                     .cornerRadius(5)
+                    .onSubmit {
+                        commitUpdate()
+                    }
             }
+
+            // Quick Preset Chips (Custom Directional Cues + All Included Directional Cues)
+            DirectionalCuePresetPickerView(
+                selectedLabel: $labelText,
+                customOptions: customSamples.userCustomCueOptions(
+                    ofKind: .directional,
+                    preferredVoice: engine.currentSong.guideVoice
+                ),
+                includedOptions: CustomSampleLibraryManager.includedDirectionalMenuOptions
+            )
             
             HStack(spacing: 8) {
                 // Delete Button
@@ -191,13 +251,7 @@ public struct EditDirectionalCuePopoverView: View {
                 Spacer()
                 
                 // Save Button
-                Button(action: {
-                    let finalLabel = labelText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !finalLabel.isEmpty {
-                        engine.updateDirectionalCue(id: cue.id, label: finalLabel, time: cue.time)
-                    }
-                    onDismiss()
-                }) {
+                Button(action: commitUpdate) {
                     Text("Update")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(.white)
@@ -210,7 +264,7 @@ public struct EditDirectionalCuePopoverView: View {
             }
         }
         .padding(14)
-        .frame(width: 250)
+        .frame(width: 340)
         .background(Color(red: 0.11, green: 0.12, blue: 0.14))
         .cornerRadius(10)
     }

@@ -332,6 +332,8 @@ public struct CustomGuideSampleManagerSheet: View {
     @State private var editingPackName: String = ""
     @State private var cueSearchText: String = ""
     @State private var customPhraseText: String = ""
+    @State private var customPhraseCueKind: CustomGuideCueKind = .directional
+    @State private var didManuallyChooseCueKind: Bool = false
     
     public init(engine: MultitrackAudioEngine, initialPackId: String? = nil, onClose: @escaping () -> Void = {}) {
         self.engine = engine
@@ -347,13 +349,7 @@ public struct CustomGuideSampleManagerSheet: View {
     }
     
     private var standardNormalizedKeys: Set<String> {
-        var set: Set<String> = []
-        for cat in CustomSampleLibraryManager.standardGuideCueCategories {
-            for p in cat.phrases {
-                set.insert(AudioSampleBank.shared.normalizePhraseKey(p))
-            }
-        }
-        return set
+        CustomSampleLibraryManager.standardNormalizedKeys
     }
     
     public var body: some View {
@@ -537,42 +533,81 @@ public struct CustomGuideSampleManagerSheet: View {
                         
                         // Add custom phrase row
                         HStack(spacing: 6) {
-                            TextField("Add custom cue phrase (e.g. Bridge Tag)...", text: $customPhraseText)
+                            TextField("Add custom cue phrase (e.g. Horns In, Altar Call)...", text: $customPhraseText)
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(size: 11))
+                                .onChange(of: customPhraseText) { _, newValue in
+                                    let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    if trimmed.isEmpty {
+                                        didManuallyChooseCueKind = false
+                                        customPhraseCueKind = .directional
+                                    } else if !didManuallyChooseCueKind {
+                                        let norm = AudioSampleBank.shared.normalizePhraseKey(trimmed)
+                                        customPhraseCueKind = CustomSampleLibraryManager.inferDefaultCueKind(forNormalizedPhrase: norm)
+                                    }
+                                }
+
+                            let trimmedDraft = customPhraseText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmedDraft.isEmpty {
+                                if let autoCategory = CustomSampleLibraryManager.recognizedStandardCategoryTitle(forPhrase: trimmedDraft) {
+                                    Text("Auto: \(autoCategory)")
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundColor(Color(red: 0.35, green: 0.90, blue: 0.65))
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 4)
+                                        .background(Color(red: 0.35, green: 0.90, blue: 0.65).opacity(0.14))
+                                        .cornerRadius(4)
+                                } else {
+                                    cueKindSelectorPill(selectedKind: customPhraseCueKind) { chosen in
+                                        customPhraseCueKind = chosen
+                                        didManuallyChooseCueKind = true
+                                    }
+                                }
+                            }
+
                             Button("Upload Custom Cue...") {
-                                let phrase = customPhraseText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                guard !phrase.isEmpty else { return }
-                                library.promptAssignGuidePhrase(packId: pack.id, phrase: phrase) { ok in
+                                guard !trimmedDraft.isEmpty else { return }
+                                let chosenKind = customPhraseCueKind
+                                library.promptAssignGuidePhrase(packId: pack.id, phrase: trimmedDraft, cueKind: chosenKind) { ok in
                                     if ok {
                                         DispatchQueue.main.async {
                                             customPhraseText = ""
+                                            didManuallyChooseCueKind = false
                                             engine.refreshCurrentTracksAfterCustomSampleEdit(guidePackId: pack.id)
                                         }
                                     }
                                 }
                             }
                             .buttonStyle(.bordered)
-                            .disabled(customPhraseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .disabled(trimmedDraft.isEmpty)
                         }
                         
                         Divider().background(Color(white: 0.20))
                         
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 12) {
-                                // Any user-added custom phrases not in the standard list
+                                // Unrecognized user-uploaded cues (user chooses Directional vs. Song Section)
                                 let extraKeys = pack.phraseFiles.keys
                                     .filter { !standardNormalizedKeys.contains($0) }
                                     .sorted()
-                                    .filter { cueSearchText.isEmpty || $0.localizedCaseInsensitiveContains(cueSearchText) }
+                                    .filter {
+                                        cueSearchText.isEmpty ||
+                                        $0.localizedCaseInsensitiveContains(cueSearchText) ||
+                                        pack.displayLabel(forNormalizedPhrase: $0).localizedCaseInsensitiveContains(cueSearchText)
+                                    }
                                 
                                 if !extraKeys.isEmpty {
                                     VStack(alignment: .leading, spacing: 6) {
-                                        Text("CUSTOM PHRASES")
-                                            .font(.system(size: 10, weight: .bold))
-                                            .foregroundColor(Color(white: 0.55))
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("CUSTOM CUES")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .foregroundColor(Color(white: 0.55))
+                                            Text("Not automatically recognized — choose Directional Cue or Song Section:")
+                                                .font(.system(size: 10))
+                                                .foregroundColor(Color(white: 0.45))
+                                        }
                                         ForEach(extraKeys, id: \.self) { key in
-                                            guideCueRow(pack: pack, label: key.capitalized, phraseKey: key)
+                                            customGuideCueRow(pack: pack, phraseKey: key)
                                         }
                                     }
                                 }
@@ -618,7 +653,7 @@ public struct CustomGuideSampleManagerSheet: View {
                 .background(Color(red: 0.12, green: 0.13, blue: 0.16))
             }
         }
-        .frame(width: 640, height: 450)
+        .frame(width: 700, height: 470)
         .background(Color(red: 0.11, green: 0.12, blue: 0.14))
         .cornerRadius(12)
         .overlay(
@@ -631,6 +666,100 @@ public struct CustomGuideSampleManagerSheet: View {
         }
     }
     
+    @ViewBuilder
+    private func cueKindSelectorPill(
+        selectedKind: CustomGuideCueKind,
+        onSelect: @escaping (CustomGuideCueKind) -> Void
+    ) -> some View {
+        HStack(spacing: 2) {
+            ForEach(CustomGuideCueKind.allCases, id: \.self) { kind in
+                let isSelected = selectedKind == kind
+                let activeColor = (kind == .directional)
+                    ? Color(red: 0.0, green: 0.68, blue: 0.88)
+                    : Color(red: 0.36, green: 0.50, blue: 0.96)
+                Button(action: { onSelect(kind) }) {
+                    Text(kind == .directional ? "Directional" : "Song Section")
+                        .font(.system(size: 10, weight: isSelected ? .bold : .medium))
+                        .foregroundColor(isSelected ? .white : Color(white: 0.62))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3.5)
+                        .background(isSelected ? activeColor : Color.clear)
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(Color.white.opacity(0.06))
+        .cornerRadius(5)
+    }
+
+    @ViewBuilder
+    private func customGuideCueRow(pack: CustomGuidePack, phraseKey: String) -> some View {
+        let label = pack.displayLabel(forNormalizedPhrase: phraseKey)
+        let currentKind = pack.cueKind(forNormalizedPhrase: phraseKey)
+        let assignedFile = pack.phraseFiles[phraseKey]
+        let fileURL = pack.fileURL(forNormalizedPhrase: phraseKey)
+
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                if let file = assignedFile {
+                    Text(file)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color(red: 0.35, green: 0.90, blue: 0.65))
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            cueKindSelectorPill(selectedKind: currentKind) { newKind in
+                guard newKind != currentKind else { return }
+                library.setCustomGuideCueKind(packId: pack.id, phraseKey: phraseKey, kind: newKind)
+                engine.refreshCurrentTracksAfterCustomSampleEdit(guidePackId: pack.id)
+            }
+
+            if let url = fileURL {
+                Button(action: { library.previewAudioFile(at: url) }) {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 10))
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Button(assignedFile == nil ? "Upload..." : "Replace...") {
+                library.promptAssignGuidePhrase(packId: pack.id, phrase: label, cueKind: currentKind) { ok in
+                    if ok {
+                        DispatchQueue.main.async {
+                            engine.refreshCurrentTracksAfterCustomSampleEdit(guidePackId: pack.id)
+                        }
+                    }
+                }
+            }
+            .buttonStyle(.bordered)
+            .font(.system(size: 11))
+
+            if assignedFile != nil {
+                Button(action: {
+                    if library.setGuidePhraseFile(packId: pack.id, phrase: phraseKey, sourceURL: nil) {
+                        engine.refreshCurrentTracksAfterCustomSampleEdit(guidePackId: pack.id)
+                    }
+                }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10))
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.white.opacity(0.05))
+        .cornerRadius(6)
+    }
+
     @ViewBuilder
     private func guideCueRow(pack: CustomGuidePack, label: String, phraseKey: String) -> some View {
         let assignedFile = pack.phraseFiles[phraseKey]

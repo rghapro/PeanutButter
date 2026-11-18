@@ -3,6 +3,7 @@ import SwiftUI
 /// Popout menu for editing a song section, matching MultiTracks Playback's Edit Song Section UI
 public struct EditSongSectionPopoverView: View {
     @ObservedObject var engine: MultitrackAudioEngine
+    @ObservedObject private var customSamples = CustomSampleLibraryManager.shared
     let section: SongSection
     let onDismiss: () -> Void
     let onEnterTrimMode: () -> Void
@@ -428,7 +429,7 @@ public struct EditSongSectionPopoverView: View {
             // Preset Sections List
             ScrollView {
                 VStack(spacing: 2) {
-                    ForEach(standardSectionNames, id: \.0) { item in
+                    ForEach(allSectionTypeOptions, id: \.0) { item in
                         let name = item.0
                         let abbr = item.1
                         let isSelected = (sectionName.lowercased() == name.lowercased())
@@ -506,6 +507,19 @@ public struct EditSongSectionPopoverView: View {
         onDismiss()
     }
     
+    private var allSectionTypeOptions: [(String, String)] {
+        var combined = standardSectionNames
+        var seen = Set(standardSectionNames.map { $0.0.lowercased() })
+        for customName in customSamples.userCustomCueOptions(ofKind: .songSection, preferredVoice: engine.currentSong.guideVoice) {
+            let key = customName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !key.isEmpty && !seen.contains(key) {
+                combined.append((customName, SongSection.abbreviation(for: customName)))
+                seen.insert(key)
+            }
+        }
+        return combined
+    }
+
     private let standardSectionNames: [(String, String)] = [
         ("Count In", "Co"),
         ("Intro", "I"),
