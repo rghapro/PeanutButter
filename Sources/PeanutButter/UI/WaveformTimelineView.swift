@@ -3,25 +3,49 @@ import AppKit
 
 /// AppKit view that installs a local event monitor for reliable 2-finger horizontal trackpad scrolling
 struct TrackpadScrollWheelReceiver: NSViewRepresentable {
+    var isDisabled: Bool = false
     let onScrollDeltaX: (CGFloat) -> Void
     
     func makeNSView(context: Context) -> ScrollWheelNSView {
         let view = ScrollWheelNSView()
+        view.isDisabled = isDisabled
         view.onScrollDeltaX = onScrollDeltaX
         return view
     }
     
     func updateNSView(_ nsView: ScrollWheelNSView, context: Context) {
+        nsView.isDisabled = isDisabled
         nsView.onScrollDeltaX = onScrollDeltaX
     }
     
     final class ScrollWheelNSView: NSView {
+        var isDisabled: Bool = false
         var onScrollDeltaX: ((CGFloat) -> Void)?
         private var monitor: Any?
         
         override func hitTest(_ point: NSPoint) -> NSView? {
             // NEVER consume mouse clicks! Allow all clicks to pass directly through to SwiftUI buttons beneath.
             return nil
+        }
+
+        static func isWindowCoveredByOverlay(hostWindow: NSWindow, waveformScreenRect: NSRect) -> Bool {
+            if hostWindow.attachedSheet != nil || NSApp.modalWindow != nil {
+                return true
+            }
+            let insetWaveformRect = waveformScreenRect.insetBy(dx: 2, dy: 2)
+            for win in NSApp.windows where win !== hostWindow && win.isVisible && win.alphaValue > 0.01 {
+                let cls = NSStringFromClass(type(of: win))
+                if cls.contains("ToolTip") || cls.contains("Cursor") || cls.contains("StatusBar") {
+                    continue
+                }
+                let isAttachedPopover = (win.parent === hostWindow && cls.contains("Popover"))
+                let isChildOrMenuAbove = (win.parent === hostWindow || win.sheetParent === hostWindow || cls.contains("Popover") || cls.contains("Menu"))
+                    && win.level.rawValue >= hostWindow.level.rawValue
+                if isAttachedPopover || (isChildOrMenuAbove && win.frame.intersects(insetWaveformRect)) {
+                    return true
+                }
+            }
+            return false
         }
         
         override func viewDidMoveToWindow() {
@@ -32,7 +56,17 @@ struct TrackpadScrollWheelReceiver: NSViewRepresentable {
             }
             if window != nil {
                 monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                    guard let self = self, self.window != nil else { return event }
+                    guard let self = self,
+                          !self.isDisabled,
+                          let hostWindow = self.window,
+                          event.window === hostWindow else {
+                        return event
+                    }
+                    let waveformRectInWindow = self.convert(self.bounds, to: nil)
+                    let waveformScreenRect = hostWindow.convertToScreen(waveformRectInWindow)
+                    if Self.isWindowCoveredByOverlay(hostWindow: hostWindow, waveformScreenRect: waveformScreenRect) {
+                        return event
+                    }
                     let loc = self.convert(event.locationInWindow, from: nil)
                     if self.bounds.contains(loc) {
                         let dx = event.scrollingDeltaX
@@ -80,6 +114,7 @@ public struct WaveformTimelineView: View {
     let isLoopActive: Bool
     let loopedSection: SongSection?
     var isStationary: Bool = false
+    var isScrollBlocked: Bool = false
     
     let onSeek: (TimeInterval) -> Void
     let onToggleSectionLoop: (SongSection) -> Void
@@ -174,6 +209,7 @@ public struct WaveformTimelineView: View {
         isLoopActive: Bool,
         loopedSection: SongSection?,
         isStationary: Bool = false,
+        isScrollBlocked: Bool = false,
         onSeek: @escaping (TimeInterval) -> Void,
         onToggleSectionLoop: @escaping (SongSection) -> Void
     ) {
@@ -187,8 +223,28 @@ public struct WaveformTimelineView: View {
         self.isLoopActive = isLoopActive
         self.loopedSection = loopedSection
         self.isStationary = isStationary
+        self.isScrollBlocked = isScrollBlocked
         self.onSeek = onSeek
         self.onToggleSectionLoop = onToggleSectionLoop
+    }
+
+    private var isAnyTimelinePopoverOpen: Bool {
+        activeAddPopoverIndex != nil ||
+        activePopoverSection != nil ||
+        activeMIDICueSection != nil ||
+        isAddingMIDICueAtPlayhead ||
+        editingMIDICue != nil ||
+        isAddingDirectionalCueAtPlayhead ||
+        editingDirectionalCue != nil ||
+        isAddingAutomationAtPlayhead ||
+        editingAutomationPoint != nil ||
+        editingTimeSignatureChange != nil ||
+        isAddingSMPTECueAtPlayhead ||
+        editingSMPTECue != nil
+    }
+
+    private var isUserScrollBlocked: Bool {
+        isStationary || isScrollBlocked || isAnyTimelinePopoverOpen
     }
 
     private func computeClampedDisplayTime(rawTime: TimeInterval, effectiveDuration: TimeInterval) -> TimeInterval {
@@ -368,7 +424,7 @@ public struct WaveformTimelineView: View {
                         )
                     )
                     .simultaneousGesture(
-                        (engine.isEditingArrangement || isStationary || draggingCueId != nil || isDraggingSMPTECue) ? nil :
+                        (engine.isEditingArrangement || isUserScrollBlocked || draggingCueId != nil || isDraggingSMPTECue) ? nil :
                         DragGesture(minimumDistance: 3)
                             .onChanged { value in
                                 guard draggingCueId == nil && !isDraggingSMPTECue else { return }
@@ -432,7 +488,7 @@ public struct WaveformTimelineView: View {
             .simultaneousGesture(
                 MagnificationGesture()
                     .onChanged { value in
-                        guard !isStationary else { return }
+                        guard !isUserScrollBlocked else { return }
                         engine.waveformZoomScale = max(0.4, min(4.0, 1.0 * value))
                     }
             )
@@ -614,8 +670,8 @@ public struct WaveformTimelineView: View {
     }
     
     private func trackpadScrollLayer(pixelsPerSecond: CGFloat, effectiveDuration: TimeInterval, currentTimeProvider: @escaping () -> TimeInterval) -> some View {
-        TrackpadScrollWheelReceiver { deltaX in
-            guard !isStationary else { return }
+        TrackpadScrollWheelReceiver(isDisabled: isUserScrollBlocked) { deltaX in
+            guard !isUserScrollBlocked else { return }
             if engine.playbackState == .playing {
                 // Free waveform scrolling while song is playing without moving audio
                 if frozenScrollTime == nil {

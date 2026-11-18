@@ -19,6 +19,32 @@ public struct PadSoundPack: Identifiable, Hashable, Codable, Sendable {
     }
 }
 
+public enum PadRenameError: LocalizedError {
+    case emptyName
+    case unchanged
+    case reservedName
+    case duplicateName(String)
+    case notFound
+    case moveFailed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .emptyName:
+            return "Enter a pad pack name."
+        case .unchanged:
+            return nil
+        case .reservedName:
+            return "\"Simple\" and \"Soft\" are reserved for built-in pads."
+        case .duplicateName(let name):
+            return "A pad pack named \"\(name)\" already exists."
+        case .notFound:
+            return "Custom pad folder not found on disk."
+        case .moveFailed(let reason):
+            return "Could not rename folder: \(reason)"
+        }
+    }
+}
+
 /// Central manager for ambient pad audio packs (bundled Fundamental, imported, or user-uploaded)
 public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
     public static let shared = PadLibraryManager()
@@ -80,11 +106,16 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
             }
         }
         
-        DispatchQueue.main.async {
+        let applyPacks = {
             self.availablePacks = packs
             if !packs.contains(where: { $0.id == self.activePackId }) {
                 self.activePackId = "simple"
             }
+        }
+        if Thread.isMainThread {
+            applyPacks()
+        } else {
+            DispatchQueue.main.async(execute: applyPacks)
         }
     }
     
@@ -105,6 +136,82 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
             UserDefaults.standard.set("simple", forKey: "Playback_DefaultAmbientPadId")
         }
         reloadPacks()
+    }
+
+    /// Renames a custom (non-bundled) pad pack folder on disk and returns its new pack ID, or nil if invalid/failed.
+    @discardableResult
+    public func renamePack(id: String, newName: String) -> String? {
+        if case .success(let newId) = renamePackWithResult(id: id, newName: newName) {
+            return newId
+        }
+        return nil
+    }
+
+    /// Renames a custom (non-bundled) pad pack folder on disk and returns either its new pack ID or a structured error.
+    public func renamePackWithResult(id: String, newName: String) -> Result<String, PadRenameError> {
+        let trimmed = newName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        let sanitized = String(trimmed.drop(while: { $0 == "." }))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sanitized.isEmpty else { return .failure(.emptyName) }
+
+        let lowerSanitized = sanitized.lowercased()
+        if lowerSanitized == "simple" || lowerSanitized == "soft" {
+            return .failure(.reservedName)
+        }
+
+        guard let pack = availablePacks.first(where: { $0.id == id }),
+              !pack.isBundled,
+              let folderPath = pack.folderPath else {
+            return .failure(.notFound)
+        }
+
+        let oldURL = URL(fileURLWithPath: folderPath)
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: oldURL.path) else {
+            return .failure(.notFound)
+        }
+
+        if oldURL.lastPathComponent == sanitized {
+            return .failure(.unchanged)
+        }
+
+        let hasExistingPackConflict = availablePacks.contains { other in
+            other.id != id && !other.isBundled && other.name.lowercased() == lowerSanitized
+        }
+        if hasExistingPackConflict {
+            return .failure(.duplicateName(sanitized))
+        }
+
+        let newURL = oldURL.deletingLastPathComponent().appendingPathComponent(sanitized)
+        let isCaseOnlyRename = oldURL.lastPathComponent.lowercased() == lowerSanitized
+        if !isCaseOnlyRename && fm.fileExists(atPath: newURL.path) {
+            return .failure(.duplicateName(sanitized))
+        }
+
+        do {
+            if isCaseOnlyRename {
+                let tempURL = oldURL.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString)_\(sanitized)")
+                try fm.moveItem(at: oldURL, to: tempURL)
+                try fm.moveItem(at: tempURL, to: newURL)
+            } else {
+                try fm.moveItem(at: oldURL, to: newURL)
+            }
+        } catch {
+            return .failure(.moveFailed(error.localizedDescription))
+        }
+
+        let newId = newURL.path
+        if activePackId == id {
+            activePackId = newId
+        }
+        if UserDefaults.standard.string(forKey: "Playback_DefaultAmbientPadId") == id {
+            UserDefaults.standard.set(newId, forKey: "Playback_DefaultAmbientPadId")
+        }
+        reloadPacks()
+        return .success(newId)
     }
     
     public func promptUploadPadPack(completion: @escaping (Bool) -> Void) {

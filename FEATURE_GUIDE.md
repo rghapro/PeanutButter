@@ -196,7 +196,7 @@ Keep ambient drones running between songs or beneath prayers:
 - **Full-Screen Pad Grid (`PAD PLAYER`):** Displays all 12 chromatic keys (`Db, Eb, Gb, Ab, Bb, B` / `C, D, E, F, G, A`), dedicated **Pad VU meter**, Solo (`S`), and click-title **Mute** toggle.
 - **LINK ON:** Locks pad key and pack automatically to the active song (starts on playback if **Start Pad Player With Song** is enabled, and crossfades across key changes and transitions).
 - **LINK OFF:** Detaches the pad from the setlist so you can tap any key manually and let it sustain continuously even while loading or stopping songs. Tapping `LINK` back on crossfades into the active song's key.
-- **Custom Fade Times & Loudness Matching:** Adjust independent **Fade-In** (default `2.5s`) and **Fade-Out** (`3.0s`) times (`1s–10s`), right-click custom packs to delete them, and upload any 12-key pad folder (automatically RMS loudness-normalized).
+- **Custom Fade Times & Loudness Matching:** Adjust independent **Fade-In** (default `2.5s`) and **Fade-Out** (`3.0s`) times (`1s–10s`), right-click custom packs to rename or delete them, and upload any 12-key pad folder (automatically RMS loudness-normalized).
 
 ---
 

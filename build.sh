@@ -111,8 +111,19 @@ if [ "$DO_NOTARIZE" -eq 1 ]; then
     xcrun notarytool submit "$STAGE_DIR/PeanutButter-submit.zip" --keychain-profile "$NOTARY_PROFILE" --wait
 
     echo "Stapling notarization ticket..."
-    xcrun stapler staple "$STAGE_DIR/PeanutButter.app"
-    xcrun stapler validate "$STAGE_DIR/PeanutButter.app"
+    staple_ok=0
+    for attempt in 1 2 3 4 5 6; do
+        if xcrun stapler staple "$STAGE_DIR/PeanutButter.app" && xcrun stapler validate "$STAGE_DIR/PeanutButter.app"; then
+            staple_ok=1
+            break
+        fi
+        echo "  Stapler attempt $attempt/6 hit transient error; retrying in 5s..."
+        sleep 5
+    done
+    if [ "$staple_ok" -ne 1 ]; then
+        echo "ERROR: Failed to staple and validate notarization ticket after 6 attempts." >&2
+        exit 68
+    fi
     spctl --assess --type execute --verbose=4 "$STAGE_DIR/PeanutButter.app"
 
     echo "Packaging notarized PeanutButter.zip..."

@@ -385,6 +385,10 @@ public struct AmbientPadsPopoverView: View {
     
     @State private var hoveredPackId: String? = nil
     @State private var pendingDeletePack: PadSoundPack? = nil
+    @State private var renamingPackId: String? = nil
+    @State private var renamePackText: String = ""
+    @State private var renameErrorMessage: String? = nil
+    @FocusState private var focusedRenamePackId: String?
     
     public init(engine: MultitrackAudioEngine, padLibrary: PadLibraryManager, onDismiss: @escaping () -> Void) {
         self.engine = engine
@@ -445,83 +449,175 @@ public struct AmbientPadsPopoverView: View {
                     VStack(spacing: 2) {
                         ForEach(padLibrary.availablePacks) { pack in
                             let isSelected = (pack.id == activeDisplayedId)
-                            
-                            Button(action: {
-                                engine.selectManualPadPack(id: pack.id)
-                                if engine.isEditAutomationMode {
-                                    engine.recordAutomationPadPackId(pack.id)
-                                }
-                            }) {
-                                HStack(spacing: 10) {
-                                    // Pack artwork / icon
-                                    ZStack {
-                                        RoundedRectangle(cornerRadius: 4)
-                                            .fill(
-                                                LinearGradient(
-                                                    colors: [
-                                                        Color(red: 0.40, green: 0.30, blue: 0.60),
-                                                        Color(red: 0.20, green: 0.50, blue: 0.70)
-                                                    ],
-                                                    startPoint: .topLeading,
-                                                    endPoint: .bottomTrailing
+                            let isRenaming = (renamingPackId == pack.id)
+
+                            if isRenaming {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 8) {
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 4)
+                                                .fill(
+                                                    LinearGradient(
+                                                        colors: [
+                                                            Color(red: 0.40, green: 0.30, blue: 0.60),
+                                                            Color(red: 0.20, green: 0.50, blue: 0.70)
+                                                        ],
+                                                        startPoint: .topLeading,
+                                                        endPoint: .bottomTrailing
+                                                    )
                                                 )
-                                            )
-                                            .frame(width: 34, height: 34)
-                                        
-                                        Image(systemName: "waveform")
-                                            .font(.system(size: 14))
-                                            .foregroundColor(.white.opacity(0.85))
-                                    }
-                                    
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(pack.name)
+                                                .frame(width: 34, height: 34)
+
+                                            Image(systemName: "waveform")
+                                                .font(.system(size: 14))
+                                                .foregroundColor(.white.opacity(0.85))
+                                        }
+
+                                        TextField("Pad pack name", text: $renamePackText)
+                                            .textFieldStyle(.plain)
                                             .font(.system(size: 12, weight: .semibold))
                                             .foregroundColor(.white)
-                                        Text(pack.subtitle)
-                                            .font(.system(size: 9.5))
-                                            .foregroundColor(Color(white: 0.50))
-                                    }
-                                    
-                                    Spacer()
-                                    
-                                    if !pack.isBundled && hoveredPackId == pack.id {
+                                            .padding(.horizontal, 7)
+                                            .padding(.vertical, 5)
+                                            .background(Color(white: 0.08))
+                                            .cornerRadius(4)
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 4)
+                                                    .stroke(renameErrorMessage != nil ? Color(red: 0.96, green: 0.35, blue: 0.35) : Color(red: 0.25, green: 0.65, blue: 0.95), lineWidth: 1)
+                                            )
+                                            .focused($focusedRenamePackId, equals: pack.id)
+                                            .onSubmit {
+                                                commitRename(for: pack)
+                                            }
+                                            .onExitCommand {
+                                                cancelRename()
+                                            }
+
                                         Button(action: {
-                                            pendingDeletePack = pack
+                                            commitRename(for: pack)
                                         }) {
-                                            Image(systemName: "trash")
-                                                .font(.system(size: 11.5))
-                                                .foregroundColor(Color(red: 0.96, green: 0.35, blue: 0.35))
-                                                .padding(4)
-                                                .contentShape(Rectangle())
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .font(.system(size: 15))
+                                                .foregroundColor(Color(red: 0.25, green: 0.85, blue: 0.48))
                                         }
                                         .buttonStyle(.plain)
-                                        .help("Delete Pad Pack...")
+                                        .help("Save Name")
+
+                                        Button(action: {
+                                            cancelRename()
+                                        }) {
+                                            Image(systemName: "xmark.circle.fill")
+                                                .font(.system(size: 15))
+                                                .foregroundColor(Color(white: 0.55))
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Cancel Rename")
                                     }
-                                    
-                                    if isSelected {
-                                        Image(systemName: "checkmark")
-                                            .font(.system(size: 12, weight: .bold))
-                                            .foregroundColor(Color(red: 0.25, green: 0.65, blue: 0.95))
-                                            .padding(.trailing, 4)
+
+                                    if let err = renameErrorMessage {
+                                        Text(err)
+                                            .font(.system(size: 10))
+                                            .foregroundColor(Color(red: 0.98, green: 0.42, blue: 0.42))
+                                            .padding(.leading, 42)
                                     }
                                 }
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 8)
-                                .background(isSelected ? Color.white.opacity(0.06) : (hoveredPackId == pack.id ? Color.white.opacity(0.03) : Color.clear))
+                                .background(Color.white.opacity(0.08))
                                 .cornerRadius(6)
-                            }
-                            .buttonStyle(.plain)
-                            .onHover { hovering in
-                                if hovering {
-                                    hoveredPackId = pack.id
-                                } else if hoveredPackId == pack.id {
-                                    hoveredPackId = nil
+                            } else {
+                                Button(action: {
+                                    engine.selectManualPadPack(id: pack.id)
+                                    if engine.isEditAutomationMode {
+                                        engine.recordAutomationPadPackId(pack.id)
+                                    }
+                                }) {
+                                    HStack(spacing: 10) {
+                                        // Pack artwork / icon
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 4)
+                                                .fill(
+                                                    LinearGradient(
+                                                        colors: [
+                                                            Color(red: 0.40, green: 0.30, blue: 0.60),
+                                                            Color(red: 0.20, green: 0.50, blue: 0.70)
+                                                        ],
+                                                        startPoint: .topLeading,
+                                                        endPoint: .bottomTrailing
+                                                    )
+                                                )
+                                                .frame(width: 34, height: 34)
+
+                                            Image(systemName: "waveform")
+                                                .font(.system(size: 14))
+                                                .foregroundColor(.white.opacity(0.85))
+                                        }
+
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(pack.name)
+                                                .font(.system(size: 12, weight: .semibold))
+                                                .foregroundColor(.white)
+                                            Text(pack.subtitle)
+                                                .font(.system(size: 9.5))
+                                                .foregroundColor(Color(white: 0.50))
+                                        }
+
+                                        Spacer()
+
+                                        if !pack.isBundled && hoveredPackId == pack.id {
+                                            Button(action: {
+                                                beginRename(for: pack)
+                                            }) {
+                                                Image(systemName: "pencil")
+                                                    .font(.system(size: 11.5))
+                                                    .foregroundColor(Color(white: 0.72))
+                                                    .padding(4)
+                                                    .contentShape(Rectangle())
+                                            }
+                                            .buttonStyle(.plain)
+                                            .help("Rename Pad Pack...")
+
+                                            Button(action: {
+                                                pendingDeletePack = pack
+                                            }) {
+                                                Image(systemName: "trash")
+                                                    .font(.system(size: 11.5))
+                                                    .foregroundColor(Color(red: 0.96, green: 0.35, blue: 0.35))
+                                                    .padding(4)
+                                                    .contentShape(Rectangle())
+                                            }
+                                            .buttonStyle(.plain)
+                                            .help("Delete Pad Pack...")
+                                        }
+
+                                        if isSelected {
+                                            Image(systemName: "checkmark")
+                                                .font(.system(size: 12, weight: .bold))
+                                                .foregroundColor(Color(red: 0.25, green: 0.65, blue: 0.95))
+                                                .padding(.trailing, 4)
+                                        }
+                                    }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(isSelected ? Color.white.opacity(0.06) : (hoveredPackId == pack.id ? Color.white.opacity(0.03) : Color.clear))
+                                    .cornerRadius(6)
                                 }
-                            }
-                            .contextMenu {
-                                if !pack.isBundled {
-                                    Button("Delete Pad Pack...", role: .destructive) {
-                                        pendingDeletePack = pack
+                                .buttonStyle(.plain)
+                                .onHover { hovering in
+                                    if hovering {
+                                        hoveredPackId = pack.id
+                                    } else if hoveredPackId == pack.id {
+                                        hoveredPackId = nil
+                                    }
+                                }
+                                .contextMenu {
+                                    if !pack.isBundled {
+                                        Button("Rename Pad Pack...") {
+                                            beginRename(for: pack)
+                                        }
+                                        Button("Delete Pad Pack...", role: .destructive) {
+                                            pendingDeletePack = pack
+                                        }
                                     }
                                 }
                             }
@@ -606,14 +702,8 @@ public struct AmbientPadsPopoverView: View {
         )) {
             Button("Delete", role: .destructive) {
                 if let pack = pendingDeletePack {
-                    let wasActive = (engine.padPlayer.activePackId == pack.id) || (engine.currentSong.padPresetId == pack.id)
                     padLibrary.deletePack(id: pack.id)
-                    if wasActive {
-                        if engine.currentSongIndex >= 0 && engine.currentSongIndex < engine.currentSetlist.songs.count {
-                            engine.updateSongPadPreset(at: engine.currentSongIndex, presetId: "simple")
-                        }
-                        engine.padPlayer.reloadCurrentKey(packId: "simple")
-                    }
+                    engine.handleDeletedPadPack(id: pack.id)
                     pendingDeletePack = nil
                 }
             }
@@ -624,6 +714,34 @@ public struct AmbientPadsPopoverView: View {
             if let pack = pendingDeletePack {
                 Text("Are you sure you want to delete \"\(pack.name)\"? This removes the custom pad files from disk.")
             }
+        }
+    }
+
+    private func beginRename(for pack: PadSoundPack) {
+        renamingPackId = pack.id
+        renamePackText = pack.name
+        renameErrorMessage = nil
+        DispatchQueue.main.async {
+            focusedRenamePackId = pack.id
+        }
+    }
+
+    private func cancelRename() {
+        renamingPackId = nil
+        renamePackText = ""
+        renameErrorMessage = nil
+        focusedRenamePackId = nil
+    }
+
+    private func commitRename(for pack: PadSoundPack) {
+        switch padLibrary.renamePackWithResult(id: pack.id, newName: renamePackText) {
+        case .success(let newId):
+            engine.handleRenamedPadPack(oldId: pack.id, newId: newId)
+            cancelRename()
+        case .failure(.unchanged):
+            cancelRename()
+        case .failure(let error):
+            renameErrorMessage = error.localizedDescription
         }
     }
 }

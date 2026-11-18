@@ -4368,11 +4368,11 @@ public final class MultitrackAudioEngine: ObservableObject {
             let isNextGuide = Self.isGuideTrack(track)
             
             let effectiveBuf: AVAudioPCMBuffer
-            if isNextClick && nextSong.clickSource == .generated,
-               let genClick = generatedClickBuffers[nextSong.id], genClick.frameLength > 1 {
+            if isNextClick && nextSong.clickSource == .generated {
+                guard let genClick = generatedClickBuffers[nextSong.id], genClick.frameLength > 1 else { continue }
                 effectiveBuf = genClick
-            } else if isNextGuide && nextSong.guideSource == .generated,
-                      let genGuide = generatedGuideBuffers[nextSong.id], genGuide.frameLength > 1 {
+            } else if isNextGuide && nextSong.guideSource == .generated {
+                guard let genGuide = generatedGuideBuffers[nextSong.id], genGuide.frameLength > 1 else { continue }
                 effectiveBuf = genGuide
             } else if let shiftedBuf = cachedTransposedMap?[track.id] {
                 effectiveBuf = shiftedBuf
@@ -5148,6 +5148,66 @@ public final class MultitrackAudioEngine: ObservableObject {
         markSessionChanged()
         objectWillChange.send()
     }
+
+    @discardableResult
+    private func remapPadPackReferences(in song: inout Song, from oldId: String, to newId: String) -> Bool {
+        var changed = false
+        if song.padPresetId == oldId {
+            song.padPresetId = newId
+            changed = true
+        }
+        for i in song.automationPoints.indices where song.automationPoints[i].padPackId == oldId {
+            song.automationPoints[i].padPackId = newId
+            changed = true
+        }
+        for i in song.defaultAutomationPoints.indices where song.defaultAutomationPoints[i].padPackId == oldId {
+            song.defaultAutomationPoints[i].padPackId = newId
+            changed = true
+        }
+        for aIdx in song.savedArrangements.indices {
+            for i in song.savedArrangements[aIdx].automationPoints.indices where song.savedArrangements[aIdx].automationPoints[i].padPackId == oldId {
+                song.savedArrangements[aIdx].automationPoints[i].padPackId = newId
+                changed = true
+            }
+        }
+        return changed
+    }
+
+    public func handleRenamedPadPack(oldId: String, newId: String) {
+        padPlayer.updateActivePackIdAfterRename(from: oldId, to: newId)
+        if manualPadPackId == oldId {
+            manualPadPackId = newId
+        }
+        var didChangeSetlist = false
+        for idx in currentSetlist.songs.indices {
+            if remapPadPackReferences(in: &currentSetlist.songs[idx], from: oldId, to: newId) {
+                didChangeSetlist = true
+            }
+        }
+        if remapPadPackReferences(in: &currentSong, from: oldId, to: newId) || didChangeSetlist {
+            markSessionChanged()
+        }
+        objectWillChange.send()
+    }
+
+    public func handleDeletedPadPack(id: String) {
+        if manualPadPackId == id {
+            manualPadPackId = nil
+        }
+        var didChangeSetlist = false
+        for idx in currentSetlist.songs.indices {
+            if remapPadPackReferences(in: &currentSetlist.songs[idx], from: id, to: "simple") {
+                didChangeSetlist = true
+            }
+        }
+        if remapPadPackReferences(in: &currentSong, from: id, to: "simple") || didChangeSetlist {
+            markSessionChanged()
+        }
+        if padPlayer.activePackId == id {
+            padPlayer.reloadCurrentKey(packId: "simple")
+        }
+        objectWillChange.send()
+    }
     
     
     public func updateSongPadIntroOutroOnly(at index: Int, enabled: Bool) {
@@ -5307,15 +5367,26 @@ public final class MultitrackAudioEngine: ObservableObject {
         var maxDur: TimeInterval = 0.0
         
         let cachedTransposed = cachedTransformedBuffers(for: nextSong)
+        let canonicalFmt = getCanonicalProcessingFormat()
         
         for (track, buf) in cachedItems {
             let baseBuf: AVAudioPCMBuffer
-            if Self.isClickTrack(track) && nextSong.clickSource == .generated,
-               let genClick = generatedClickBuffers[nextSong.id], genClick.frameLength > 1 {
-                baseBuf = genClick
-            } else if Self.isGuideTrack(track) && nextSong.guideSource == .generated,
-                      let genGuide = generatedGuideBuffers[nextSong.id], genGuide.frameLength > 1 {
-                baseBuf = genGuide
+            if Self.isClickTrack(track) && nextSong.clickSource == .generated {
+                if let genClick = generatedClickBuffers[nextSong.id], genClick.frameLength > 1 {
+                    baseBuf = genClick
+                } else {
+                    let silent = AVAudioPCMBuffer(pcmFormat: canonicalFmt, frameCapacity: 1)!
+                    silent.frameLength = 1
+                    baseBuf = silent
+                }
+            } else if Self.isGuideTrack(track) && nextSong.guideSource == .generated {
+                if let genGuide = generatedGuideBuffers[nextSong.id], genGuide.frameLength > 1 {
+                    baseBuf = genGuide
+                } else {
+                    let silent = AVAudioPCMBuffer(pcmFormat: canonicalFmt, frameCapacity: 1)!
+                    silent.frameLength = 1
+                    baseBuf = silent
+                }
             } else {
                 baseBuf = buf
             }
@@ -6735,8 +6806,32 @@ public final class MultitrackAudioEngine: ObservableObject {
         objectWillChange.send()
     }
     
+    private func deduplicateUtilityTracks(inCurrentSong: Bool, check: (StemTrack) -> Bool) {
+        let matching = tracks.filter(check)
+        guard matching.count > 1 else { return }
+        let keeper = matching.first(where: { $0.fileURL != nil }) ?? matching[0]
+        let discardIds = Set(matching.filter { $0.id != keeper.id && $0.fileURL == nil }.map { $0.id })
+        guard !discardIds.isEmpty else { return }
+        tracks.removeAll { discardIds.contains($0.id) }
+        for id in discardIds {
+            channels.removeValue(forKey: id)
+            pristineMasterBuffers.removeValue(forKey: id)
+        }
+        if inCurrentSong, var cached = songBuffersCache[currentSong.id] {
+            cached.removeAll { discardIds.contains($0.track.id) }
+            songBuffersCache[currentSong.id] = cached
+        }
+    }
+
+    private func makeSilentStub(format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        guard let silent = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1) else { return nil }
+        silent.frameLength = 1
+        return silent
+    }
+
     public func applyClickBuffer() {
         if currentSong.excludesClickAndGuide { return }
+        deduplicateUtilityTracks(inCurrentSong: true, check: { Self.isClickTrack($0) })
         var clickTrack = tracks.first(where: { $0.role == .click || StemCategory.category(for: $0.name, role: $0.role) == .click })
         var trackWasAppended = false
         if clickTrack == nil {
@@ -6748,8 +6843,10 @@ public final class MultitrackAudioEngine: ObservableObject {
         guard let track = clickTrack else { return }
         
         var applied = false
+        var needsRegen = false
+        let canonicalFmt = getCanonicalProcessingFormat()
         if currentSong.clickSource == .generated {
-            if let genBuf = generatedClickBuffers[currentSong.id] {
+            if let genBuf = generatedClickBuffers[currentSong.id], genBuf.frameLength > 1 {
                 track.duration = Double(genBuf.frameLength) / genBuf.format.sampleRate
                 if let ch = channels[track.id] {
                     ch.buffer = genBuf
@@ -6758,8 +6855,24 @@ public final class MultitrackAudioEngine: ObservableObject {
                 }
                 pristineMasterBuffers[track.id] = genBuf
                 applied = true
+            } else if let silent = makeSilentStub(format: canonicalFmt) {
+                if let ch = channels[track.id] {
+                    ch.buffer = silent
+                } else {
+                    channels[track.id] = TrackChannel(track: track, buffer: silent)
+                }
+                pristineMasterBuffers[track.id] = silent
+                applied = true
+                needsRegen = true
             } else {
-                regenerateClickTrack()
+                needsRegen = true
+            }
+            // Silence any remaining secondary Click tracks so two click sources can never layer
+            for other in tracks where other.id != track.id && Self.isClickTrack(other) {
+                if let silent = makeSilentStub(format: canonicalFmt) {
+                    channels[other.id]?.buffer = silent
+                    pristineMasterBuffers[other.id] = silent
+                }
             }
         } else {
             if let upBuf = uploadedClickBuffers[currentSong.id] {
@@ -6785,6 +6898,9 @@ public final class MultitrackAudioEngine: ObservableObject {
                 mixState.setPlayhead(seconds: playbackOffsetSeconds)
             }
         }
+        if needsRegen {
+            regenerateClickTrack()
+        }
     }
     
     public func setGuideSource(_ source: GuideSource) {
@@ -6805,6 +6921,7 @@ public final class MultitrackAudioEngine: ObservableObject {
     
     public func applyGuideBuffer() {
         if currentSong.excludesClickAndGuide { return }
+        deduplicateUtilityTracks(inCurrentSong: true, check: { Self.isGuideTrack($0) })
         var guideTrack = tracks.first(where: { $0.role == .guide || StemCategory.category(for: $0.name, role: $0.role) == .guide })
         var trackWasAppended = false
         if guideTrack == nil {
@@ -6816,8 +6933,10 @@ public final class MultitrackAudioEngine: ObservableObject {
         guard let track = guideTrack else { return }
         
         var applied = false
+        var needsRegen = false
+        let canonicalFmt = getCanonicalProcessingFormat()
         if currentSong.guideSource == .generated {
-            if let genBuf = generatedGuideBuffers[currentSong.id] {
+            if let genBuf = generatedGuideBuffers[currentSong.id], genBuf.frameLength > 1 {
                 track.duration = Double(genBuf.frameLength) / genBuf.format.sampleRate
                 if let ch = channels[track.id] {
                     ch.buffer = genBuf
@@ -6826,6 +6945,24 @@ public final class MultitrackAudioEngine: ObservableObject {
                 }
                 pristineMasterBuffers[track.id] = genBuf
                 applied = true
+            } else if let silent = makeSilentStub(format: canonicalFmt) {
+                if let ch = channels[track.id] {
+                    ch.buffer = silent
+                } else {
+                    channels[track.id] = TrackChannel(track: track, buffer: silent)
+                }
+                pristineMasterBuffers[track.id] = silent
+                applied = true
+                needsRegen = true
+            } else {
+                needsRegen = true
+            }
+            // Silence any remaining secondary Guide tracks so uploaded and generated guides can never play together
+            for other in tracks where other.id != track.id && Self.isGuideTrack(other) {
+                if let silent = makeSilentStub(format: canonicalFmt) {
+                    channels[other.id]?.buffer = silent
+                    pristineMasterBuffers[other.id] = silent
+                }
             }
         } else {
             if let upBuf = uploadedGuideBuffers[currentSong.id] {
@@ -6862,6 +6999,9 @@ public final class MultitrackAudioEngine: ObservableObject {
             if playbackState != .playing {
                 mixState.setPlayhead(seconds: playbackOffsetSeconds)
             }
+        }
+        if needsRegen {
+            regenerateGuideTrack()
         }
     }
     
@@ -9304,6 +9444,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         var loadedItems: [(StemTrack, AVAudioPCMBuffer)] = []
         
         // Check if we have cached stems in memory for this song
+        let loadedFromCache = (songBuffersCache[song.id]?.isEmpty == false)
         if let cached = songBuffersCache[song.id], !cached.isEmpty {
             loadedItems.reserveCapacity(cached.count)
             for (track, buf) in cached {
@@ -9324,6 +9465,14 @@ public final class MultitrackAudioEngine: ObservableObject {
             }
         }
         
+        // Deduplicate synthesized utility tracks if an uploaded Click/Guide track already exists
+        if loadedItems.contains(where: { Self.isClickTrack($0.0) && $0.0.fileURL != nil }) {
+            loadedItems.removeAll { Self.isClickTrack($0.0) && $0.0.fileURL == nil }
+        }
+        if loadedItems.contains(where: { Self.isGuideTrack($0.0) && $0.0.fileURL != nil }) {
+            loadedItems.removeAll { Self.isGuideTrack($0.0) && $0.0.fileURL == nil }
+        }
+        
         // Auto-generation & source switching for Click and Guide tracks
         // Guarantees Click and Guide channel strips are ALWAYS included, defaulting to generated if not uploaded
         let isMetadataPlaceholder = loadedItems.contains { $0.0.fileURL != nil && $0.1.frameLength <= 1 }
@@ -9340,17 +9489,21 @@ public final class MultitrackAudioEngine: ObservableObject {
         // 1. Click Track handling
         let clickItemIndex = loadedItems.firstIndex { StemCategory.category(for: $0.0.name, role: $0.0.role) == .click }
         if let idx = clickItemIndex {
+            let clickTrack = loadedItems[idx].0
             let uploadedBuf = loadedItems[idx].1
-            if uploadedBuf.frameLength > 100 {
+            if uploadedBuf.frameLength > 100 && clickTrack.fileURL != nil && uploadedBuf !== generatedClickBuffers[song.id] && (!loadedFromCache || uploadedClickBuffers[song.id] == nil) {
                 uploadedClickBuffers[song.id] = uploadedBuf
-            } else {
+            } else if clickTrack.fileURL == nil {
                 uploadedClickBuffers[song.id] = nil
             }
-            if currentSong.clickSource != .uploaded || uploadedBuf.frameLength <= 100 {
-                if !isMetadataPlaceholder && uploadedBuf.frameLength < initialFrames,
-                   let silentBuf = AVAudioPCMBuffer(pcmFormat: canonicalFormat, frameCapacity: initialFrames) {
-                    silentBuf.frameLength = initialFrames
-                    loadedItems[idx].1 = silentBuf
+            if currentSong.clickSource != .uploaded || (uploadedClickBuffers[song.id]?.frameLength ?? 0) <= 100 {
+                let genClick = (currentSong.clickSource == .generated ? generatedClickBuffers[song.id] : nil)
+                for cIdx in loadedItems.indices where Self.isClickTrack(loadedItems[cIdx].0) {
+                    if cIdx == idx, let genClick = genClick, genClick.frameLength > 1 {
+                        loadedItems[cIdx].1 = genClick
+                    } else if let silentBuf = makeSilentStub(format: canonicalFormat) {
+                        loadedItems[cIdx].1 = silentBuf
+                    }
                 }
             }
         } else {
@@ -9372,17 +9525,24 @@ public final class MultitrackAudioEngine: ObservableObject {
         // 2. Guide Track handling
         let guideItemIndex = loadedItems.firstIndex { StemCategory.category(for: $0.0.name, role: $0.0.role) == .guide }
         if let idx = guideItemIndex {
+            let guideTrack = loadedItems[idx].0
             let uploadedBuf = loadedItems[idx].1
-            if uploadedBuf.frameLength > 100 {
+            if uploadedBuf.frameLength > 100 && guideTrack.fileURL != nil && uploadedBuf !== generatedGuideBuffers[song.id] && (!loadedFromCache || uploadedGuideBuffers[song.id] == nil) {
                 uploadedGuideBuffers[song.id] = uploadedBuf
-            } else {
+            } else if guideTrack.fileURL == nil {
                 uploadedGuideBuffers[song.id] = nil
             }
-            if currentSong.guideSource != .uploaded || uploadedBuf.frameLength <= 100 {
-                if !isMetadataPlaceholder && uploadedBuf.frameLength < initialFrames,
-                   let silentBuf = AVAudioPCMBuffer(pcmFormat: canonicalFormat, frameCapacity: initialFrames) {
-                    silentBuf.frameLength = initialFrames
-                    loadedItems[idx].1 = silentBuf
+            if currentSong.guideSource != .uploaded || (uploadedGuideBuffers[song.id]?.frameLength ?? 0) <= 100 {
+                let expectedGuideState = currentLiveGuideLoopState()
+                let genGuide = (currentSong.guideSource == .generated && generatedGuideLoopStates[song.id] == expectedGuideState)
+                    ? generatedGuideBuffers[song.id]
+                    : nil
+                for gIdx in loadedItems.indices where Self.isGuideTrack(loadedItems[gIdx].0) {
+                    if gIdx == idx, let genGuide = genGuide, genGuide.frameLength > 1 {
+                        loadedItems[gIdx].1 = genGuide
+                    } else if let silentBuf = makeSilentStub(format: canonicalFormat) {
+                        loadedItems[gIdx].1 = silentBuf
+                    }
                 }
             }
         } else {
@@ -10077,6 +10237,17 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
         var didModify = false
         var addedTrack = false
+
+        if cached.contains(where: { Self.isClickTrack($0.track) && $0.track.fileURL != nil }) {
+            let before = cached.count
+            cached.removeAll { Self.isClickTrack($0.track) && $0.track.fileURL == nil }
+            if cached.count != before { didModify = true }
+        }
+        if cached.contains(where: { Self.isGuideTrack($0.track) && $0.track.fileURL != nil }) {
+            let before = cached.count
+            cached.removeAll { Self.isGuideTrack($0.track) && $0.track.fileURL == nil }
+            if cached.count != before { didModify = true }
+        }
 
         if song.clickSource == .generated,
            let genClick = generatedClickBuffers[songId],
@@ -11385,19 +11556,37 @@ public final class MultitrackAudioEngine: ObservableObject {
                 track.sourceFileURL = decSourceURL
             }
             let cat = StemCategory.category(for: track.name, role: track.role)
+            var bufferForCache = norm
             if cat == .click {
                 track.role = .click
                 if norm.frameLength > 100 {
                     uploadedClickBuffers[songId] = norm
+                }
+                if song.clickSource == .generated {
+                    if let genClick = generatedClickBuffers[songId], genClick.frameLength > 1 {
+                        bufferForCache = genClick
+                    } else if let silent = makeSilentStub(format: canonicalFormat) {
+                        bufferForCache = silent
+                    }
                 }
             } else if cat == .guide {
                 track.role = .guide
                 if norm.frameLength > 100 {
                     uploadedGuideBuffers[songId] = norm
                 }
+                if song.guideSource == .generated {
+                    let expectedState = isActiveSong ? currentLiveGuideLoopState() : Self.defaultGuideLoopState(for: song)
+                    if let genGuide = generatedGuideBuffers[songId],
+                       genGuide.frameLength > 1,
+                       generatedGuideLoopStates[songId] == expectedState {
+                        bufferForCache = genGuide
+                    } else if let silent = makeSilentStub(format: canonicalFormat) {
+                        bufferForCache = silent
+                    }
+                }
             }
             
-            let activeBuf = decodedTransposed[track.id] ?? norm
+            let activeBuf = decodedTransposed[track.id] ?? bufferForCache
             if activeBuf.frameLength > 10 {
                 let dur = Double(activeBuf.frameLength) / activeBuf.format.sampleRate
                 track.duration = dur
@@ -11413,12 +11602,17 @@ public final class MultitrackAudioEngine: ObservableObject {
                 didUpdatePeaks = true
             }
             
-            hydratedItems.append((track, norm))
+            hydratedItems.append((track, bufferForCache))
             seenTrackIds.insert(track.id)
         }
         
-        // Preserve any synthesized Click / Guide track created during Stage 1 if not in decodedTracks
+        // Preserve synthesized Click / Guide tracks created during Stage 1 ONLY if decodedTracks lacked them
+        let hasHydratedClick = hydratedItems.contains { Self.isClickTrack($0.0) }
+        let hasHydratedGuide = hydratedItems.contains { Self.isGuideTrack($0.0) }
         for (id, existingTrack) in existingTracksById where !seenTrackIds.contains(id) {
+            guard existingTrack.fileURL == nil, Self.isClickOrGuideTrack(existingTrack) else { continue }
+            if Self.isClickTrack(existingTrack) && hasHydratedClick { continue }
+            if Self.isGuideTrack(existingTrack) && hasHydratedGuide { continue }
             let existingBuf = pristineMasterBuffers[id] ?? channels[id]?.buffer ?? AVAudioPCMBuffer(pcmFormat: canonicalFormat, frameCapacity: 1)!
             hydratedItems.append((existingTrack, existingBuf))
         }
@@ -11446,6 +11640,14 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         if isActiveSong {
             let cachedTrans = cachedTransformedBuffers(for: currentSong)
+            let validTrackIds = Set(hydratedItems.map { $0.0.id })
+            for staleId in Array(channels.keys) where !validTrackIds.contains(staleId) {
+                channels.removeValue(forKey: staleId)
+            }
+            for staleId in Array(pristineMasterBuffers.keys) where !validTrackIds.contains(staleId) {
+                pristineMasterBuffers.removeValue(forKey: staleId)
+            }
+            tracks = hydratedItems.map { $0.0 }
             
             for (track, buf) in hydratedItems {
                 pristineMasterBuffers[track.id] = buf

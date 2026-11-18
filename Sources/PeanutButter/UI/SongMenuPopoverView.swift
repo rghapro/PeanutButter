@@ -42,6 +42,11 @@ public struct SongMenuPopoverView: View {
     @State private var savedToLocalConfirmation: Bool = false
     @State private var savedToCloudConfirmation: Bool = false
     @State private var savedChangesConfirmation: Bool = false
+    @State private var hoveredPadPackId: String? = nil
+    @State private var renamingPadPackId: String? = nil
+    @State private var renamePadPackText: String = ""
+    @State private var renamePadPackError: String? = nil
+    @FocusState private var focusedRenamePadPackId: String?
     
     public init(
         engine: MultitrackAudioEngine,
@@ -1875,37 +1880,118 @@ public struct SongMenuPopoverView: View {
             VStack(spacing: 0) {
                 ForEach(Array(padManager.availablePacks.enumerated()), id: \.element.id) { idx, pack in
                     let isSelected = (targetSong.padPresetId ?? padManager.activePackId) == pack.id
-                    
-                    Button(action: {
-                        if isPreAddMode {
-                            stagedSong?.padPresetId = pack.id
-                        } else {
-                            engine.updateSongPadPreset(at: effectiveSongIndex, presetId: pack.id)
-                        }
-                    }) {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(pack.name)
-                                    .font(.system(size: 13, weight: isSelected ? .bold : .regular))
+                    let isRenaming = (renamingPadPackId == pack.id)
+
+                    if isRenaming {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                TextField("Pad pack name", text: $renamePadPackText)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 13, weight: .semibold))
                                     .foregroundColor(.white)
-                                Text(pack.subtitle)
-                                    .font(.system(size: 10))
-                                    .foregroundColor(Color(white: 0.50))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(Color(white: 0.08))
+                                    .cornerRadius(5)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 5)
+                                            .stroke(renamePadPackError != nil ? Color(red: 0.96, green: 0.35, blue: 0.35) : Color(red: 0.25, green: 0.65, blue: 1.0), lineWidth: 1)
+                                    )
+                                    .focused($focusedRenamePadPackId, equals: pack.id)
+                                    .onSubmit {
+                                        commitPadPackRename(for: pack)
+                                    }
+                                    .onExitCommand {
+                                        cancelPadPackRename()
+                                    }
+
+                                Button(action: {
+                                    commitPadPackRename(for: pack)
+                                }) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 15))
+                                        .foregroundColor(Color(red: 0.25, green: 0.85, blue: 0.48))
+                                }
+                                .buttonStyle(.plain)
+
+                                Button(action: {
+                                    cancelPadPackRename()
+                                }) {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 15))
+                                        .foregroundColor(Color(white: 0.55))
+                                }
+                                .buttonStyle(.plain)
                             }
-                            
-                            Spacer()
-                            
-                            if isSelected {
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 12, weight: .bold))
-                                    .foregroundColor(Color(red: 0.25, green: 0.65, blue: 1.0))
+
+                            if let err = renamePadPackError {
+                                Text(err)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Color(red: 0.98, green: 0.42, blue: 0.42))
                             }
                         }
                         .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .contentShape(Rectangle())
+                        .padding(.vertical, 8)
+                    } else {
+                        Button(action: {
+                            if isPreAddMode {
+                                stagedSong?.padPresetId = pack.id
+                            } else {
+                                engine.updateSongPadPreset(at: effectiveSongIndex, presetId: pack.id)
+                            }
+                        }) {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(pack.name)
+                                        .font(.system(size: 13, weight: isSelected ? .bold : .regular))
+                                        .foregroundColor(.white)
+                                    Text(pack.subtitle)
+                                        .font(.system(size: 10))
+                                        .foregroundColor(Color(white: 0.50))
+                                }
+
+                                Spacer()
+
+                                if !pack.isBundled && hoveredPadPackId == pack.id {
+                                    Button(action: {
+                                        beginPadPackRename(for: pack)
+                                    }) {
+                                        Image(systemName: "pencil")
+                                            .font(.system(size: 11.5))
+                                            .foregroundColor(Color(white: 0.72))
+                                            .padding(4)
+                                            .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Rename Pad Pack...")
+                                }
+
+                                if isSelected {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 12, weight: .bold))
+                                        .foregroundColor(Color(red: 0.25, green: 0.65, blue: 1.0))
+                                }
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { hovering in
+                            if hovering {
+                                hoveredPadPackId = pack.id
+                            } else if hoveredPadPackId == pack.id {
+                                hoveredPadPackId = nil
+                            }
+                        }
+                        .contextMenu {
+                            if !pack.isBundled {
+                                Button("Rename Pad Pack...") {
+                                    beginPadPackRename(for: pack)
+                                }
+                            }
+                        }
                     }
-                    .buttonStyle(.plain)
                     
                     if idx < padManager.availablePacks.count - 1 {
                         rowDivider
@@ -2026,6 +2112,37 @@ public struct SongMenuPopoverView: View {
             } catch {
                 print("Export error: \(error.localizedDescription)")
             }
+        }
+    }
+
+    private func beginPadPackRename(for pack: PadSoundPack) {
+        renamingPadPackId = pack.id
+        renamePadPackText = pack.name
+        renamePadPackError = nil
+        DispatchQueue.main.async {
+            focusedRenamePadPackId = pack.id
+        }
+    }
+
+    private func cancelPadPackRename() {
+        renamingPadPackId = nil
+        renamePadPackText = ""
+        renamePadPackError = nil
+        focusedRenamePadPackId = nil
+    }
+
+    private func commitPadPackRename(for pack: PadSoundPack) {
+        switch padManager.renamePackWithResult(id: pack.id, newName: renamePadPackText) {
+        case .success(let newId):
+            if stagedSong?.padPresetId == pack.id {
+                stagedSong?.padPresetId = newId
+            }
+            engine.handleRenamedPadPack(oldId: pack.id, newId: newId)
+            cancelPadPackRename()
+        case .failure(.unchanged):
+            cancelPadPackRename()
+        case .failure(let error):
+            renamePadPackError = error.localizedDescription
         }
     }
 }

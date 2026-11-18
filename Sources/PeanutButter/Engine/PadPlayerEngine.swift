@@ -292,6 +292,27 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         keyCrossfadeProgress = 0.0
         os_unfair_lock_unlock(&lock)
     }
+
+    /// Updates `activePackId` after a custom pad pack is renamed on disk without interrupting playback.
+    public func updateActivePackIdAfterRename(from oldId: String, to newId: String) {
+        os_unfair_lock_lock(&lock)
+        let matches = (activePackId == oldId)
+        os_unfair_lock_unlock(&lock)
+        guard matches else { return }
+
+        let apply = {
+            os_unfair_lock_lock(&self.lock)
+            if self.activePackId == oldId {
+                self.activePackId = newId
+            }
+            os_unfair_lock_unlock(&self.lock)
+        }
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.async(execute: apply)
+        }
+    }
     
     public func stop() {
         os_unfair_lock_lock(&lock)

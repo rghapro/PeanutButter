@@ -59,7 +59,19 @@ public struct MainView: View {
         isBussesDrawerPresented ||
         isFileImporterPresented ||
         activeTransitionSongIndex != nil ||
+        isTopLeftMIDICuesMenuOpen ||
+        isTopLeftDirectionalCuesMenuOpen ||
+        isTopLeftAutomationMenuOpen ||
+        isTopLeftSMPTEMenuOpen ||
+        engine.isShowingCustomClickSampleManager ||
+        engine.isShowingCustomGuideSampleManager ||
         updateManager.isUpdateSheetPresented
+    }
+
+    private var isWaveformCovered: Bool {
+        isNonEditMenuOpen ||
+        engine.isEditMIDIMappingMode ||
+        engine.isEditKeyboardMappingMode
     }
     
     public var body: some View {
@@ -77,7 +89,8 @@ public struct MainView: View {
                     LiveWaveformTimelineContainer(
                         engine: engine,
                         clock: engine.transportClock,
-                        isStationary: false
+                        isStationary: false,
+                        isScrollBlocked: isWaveformCovered
                     )
                     .frame(height: 255)
                     .overlay(
@@ -3113,6 +3126,7 @@ private struct LiveWaveformTimelineContainer: View {
     @ObservedObject var engine: MultitrackAudioEngine
     let clock: TransportClockModel
     var isStationary: Bool = false
+    var isScrollBlocked: Bool = false
     
     var body: some View {
         WaveformTimelineView(
@@ -3126,6 +3140,7 @@ private struct LiveWaveformTimelineContainer: View {
             isLoopActive: engine.isLoopActive,
             loopedSection: engine.loopedSection,
             isStationary: isStationary,
+            isScrollBlocked: isScrollBlocked,
             onSeek: { targetTime in
                 engine.seek(to: targetTime)
             },
