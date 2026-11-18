@@ -43,9 +43,19 @@ ditto "$APP_PATH" "$DMG_STAGE/PeanutButter.app"
 ln -s /Applications "$DMG_STAGE/Applications"
 
 HAS_BG=0
+BG_FILENAME=""
 if [ -f "$BG_IMAGE" ]; then
     mkdir -p "$DMG_STAGE/.background"
-    cp "$BG_IMAGE" "$DMG_STAGE/.background/background.png"
+    if command -v sips >/dev/null 2>&1 && command -v tiffutil >/dev/null 2>&1; then
+        sips -z 400 600 -s dpiWidth 72 -s dpiHeight 72 "$BG_IMAGE" --out "$TMP_WORK/bg_1x.png" >/dev/null
+        cp "$BG_IMAGE" "$TMP_WORK/bg_2x.png"
+        sips -s dpiWidth 144 -s dpiHeight 144 "$TMP_WORK/bg_2x.png" >/dev/null
+        tiffutil -cathidpicheck "$TMP_WORK/bg_1x.png" "$TMP_WORK/bg_2x.png" -out "$DMG_STAGE/.background/background.tiff" >/dev/null
+        BG_FILENAME="background.tiff"
+    else
+        cp "$BG_IMAGE" "$DMG_STAGE/.background/background.png"
+        BG_FILENAME="background.png"
+    fi
     HAS_BG=1
 fi
 
@@ -90,10 +100,11 @@ if command -v SetFile >/dev/null 2>&1; then
 fi
 
 echo "Applying Finder icon layout and drag-and-drop background..."
-if ! osascript - "$MOUNT_VOL_NAME" "$HAS_BG" <<'APPLESCRIPT'
+if ! osascript - "$MOUNT_VOL_NAME" "$HAS_BG" "$BG_FILENAME" <<'APPLESCRIPT'
 on run argv
     set volName to item 1 of argv
     set hasBg to (item 2 of argv) as integer
+    set bgFilename to item 3 of argv
     tell application "Finder"
         tell disk volName
             open
@@ -101,12 +112,15 @@ on run argv
             set current view of container window to icon view
             set toolbar visible of container window to false
             set statusbar visible of container window to false
+            set pathbar visible of container window to false
+            set sidebar width of container window to 0
             set the bounds of container window to {200, 120, 800, 548}
             set viewOptions to the icon view options of container window
             set arrangement of viewOptions to not arranged
             set icon size of viewOptions to 108
+            set text size of viewOptions to 12
             if hasBg = 1 then
-                set background picture of viewOptions to file ".background:background.png"
+                set background picture of viewOptions to file (".background:" & bgFilename)
             end if
             set position of item "PeanutButter.app" of container window to {165, 205}
             set position of item "Applications" of container window to {435, 205}
@@ -126,6 +140,158 @@ fi
 chmod -Rf go-w "$MOUNT_DIR" >/dev/null 2>&1 || true
 sync
 sleep 1
+
+if command -v python3 >/dev/null 2>&1 && [ -f "$MOUNT_DIR/.DS_Store" ]; then
+    python3 - "$MOUNT_DIR/.DS_Store" <<'PYTHON'
+import plistlib
+import struct
+import sys
+
+ds_path = sys.argv[1]
+raw = bytearray(open(ds_path, "rb").read())
+
+if len(raw) < 36 or raw[0:8] != b"\x00\x00\x00\x01Bud1":
+    print(f"WARNING: Unexpected .DS_Store header in {ds_path}; leaving untouched.")
+    sys.exit(0)
+
+root_off, root_size, root_off2 = struct.unpack(">III", raw[8:20])
+if root_off != root_off2:
+    print("WARNING: .DS_Store root offsets mismatch; leaving untouched.")
+    sys.exit(0)
+
+root = bytes(raw[4 + root_off : 4 + root_off + root_size])
+num_blocks = struct.unpack(">I", root[0:4])[0]
+padded = ((num_blocks + 255) // 256) * 256
+block_addrs = struct.unpack(f">{num_blocks}I", root[8 : 8 + 4 * num_blocks])
+
+pos = 8 + 4 * padded
+toc_count = struct.unpack(">I", root[pos : pos + 4])[0]
+pos += 4
+toc = {}
+for _ in range(toc_count):
+    nlen = root[pos]
+    pos += 1
+    tname = root[pos : pos + nlen].decode("ascii")
+    pos += nlen
+    bid = struct.unpack(">I", root[pos : pos + 4])[0]
+    pos += 4
+    toc[tname] = bid
+
+if "DSDB" not in toc:
+    print("WARNING: DSDB directory missing from .DS_Store; leaving untouched.")
+    sys.exit(0)
+
+def get_block(bid):
+    addr = block_addrs[bid]
+    bsize = 1 << (addr & 0x1F)
+    boff = 4 + (addr & ~0x1F)
+    return boff, bsize
+
+dsdb_off, _ = get_block(toc["DSDB"])
+root_node, levels, rec_count, node_count, page_size = struct.unpack(
+    ">IIIII", raw[dsdb_off : dsdb_off + 20]
+)
+if levels != 0:
+    print(f"WARNING: .DS_Store B-tree has levels={levels} (expected 0); leaving untouched.")
+    sys.exit(0)
+
+leaf_off, leaf_size = get_block(root_node)
+p, count = struct.unpack(">II", raw[leaf_off : leaf_off + 8])
+if p != 0:
+    print(f"WARNING: .DS_Store root node has P={p} (expected leaf P=0); leaving untouched.")
+    sys.exit(0)
+
+records = []
+rpos = leaf_off + 8
+for _ in range(count):
+    namelen = struct.unpack(">I", raw[rpos : rpos + 4])[0]
+    rpos += 4
+    name_bytes = bytes(raw[rpos : rpos + namelen * 2])
+    name = name_bytes.decode("utf-16-be")
+    rpos += namelen * 2
+    rec_type = bytes(raw[rpos : rpos + 4]).decode("ascii")
+    data_type = bytes(raw[rpos + 4 : rpos + 8]).decode("ascii")
+    rpos += 8
+
+    if data_type == "blob":
+        blen = struct.unpack(">I", raw[rpos : rpos + 4])[0]
+        rpos += 4
+        payload = bytes(raw[rpos : rpos + blen])
+        rpos += blen
+    elif data_type in ("long", "shor", "type"):
+        payload = bytes(raw[rpos : rpos + 4])
+        rpos += 4
+    elif data_type == "bool":
+        payload = bytes(raw[rpos : rpos + 1])
+        rpos += 1
+    elif data_type in ("comp", "dutc"):
+        payload = bytes(raw[rpos : rpos + 8])
+        rpos += 8
+    elif data_type == "ustr":
+        ulen = struct.unpack(">I", raw[rpos : rpos + 4])[0]
+        rpos += 4
+        payload = bytes(raw[rpos : rpos + ulen * 2])
+        rpos += ulen * 2
+    else:
+        print(f"WARNING: Unsupported .DS_Store record type '{data_type}'; leaving untouched.")
+        sys.exit(0)
+
+    records.append([namelen, name_bytes, name, rec_type, data_type, payload])
+
+updated_bwsp = False
+updated_icvp = False
+for rec in records:
+    _, _, name, rec_type, data_type, payload = rec
+    if name == "." and rec_type == "bwsp" and data_type == "blob":
+        rec[5] = plistlib.dumps(
+            {
+                "ContainerShowSidebar": False,
+                "ShowPathbar": False,
+                "ShowSidebar": False,
+                "ShowStatusBar": False,
+                "ShowTabView": False,
+                "ShowToolbar": False,
+                "WindowBounds": "{{200, 220}, {600, 428}}",
+            },
+            fmt=plistlib.FMT_BINARY,
+        )
+        updated_bwsp = True
+    elif name == "." and rec_type == "icvp" and data_type == "blob":
+        icvp = plistlib.loads(payload)
+        icvp["backgroundColorRed"] = 0.945
+        icvp["backgroundColorGreen"] = 0.949
+        icvp["backgroundColorBlue"] = 0.961
+        rec[5] = plistlib.dumps(icvp, fmt=plistlib.FMT_BINARY)
+        updated_icvp = True
+
+out_leaf = bytearray(struct.pack(">II", 0, count))
+for namelen, name_bytes, _, rec_type, data_type, payload in records:
+    out_leaf.extend(struct.pack(">I", namelen))
+    out_leaf.extend(name_bytes)
+    out_leaf.extend(rec_type.encode("ascii"))
+    out_leaf.extend(data_type.encode("ascii"))
+    if data_type == "blob":
+        out_leaf.extend(struct.pack(">I", len(payload)))
+        out_leaf.extend(payload)
+    elif data_type == "ustr":
+        out_leaf.extend(struct.pack(">I", len(payload) // 2))
+        out_leaf.extend(payload)
+    else:
+        out_leaf.extend(payload)
+
+if len(out_leaf) > leaf_size:
+    print(f"WARNING: Normalized leaf ({len(out_leaf)} B) exceeds page size ({leaf_size} B); leaving untouched.")
+    sys.exit(0)
+
+out_leaf.extend(b"\x00" * (leaf_size - len(out_leaf)))
+raw[leaf_off : leaf_off + leaf_size] = out_leaf
+with open(ds_path, "wb") as f:
+    f.write(raw)
+print(f"Normalized .DS_Store (bwsp={updated_bwsp}, icvp={updated_icvp}).")
+PYTHON
+    sync
+    sleep 1
+fi
 
 DETACHED=0
 for attempt in 1 2 3 4 5; do
