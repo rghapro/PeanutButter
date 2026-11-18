@@ -2,31 +2,65 @@
 set -euo pipefail
 
 DO_NOTARIZE=0
+NATIVE_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --notarize)
             DO_NOTARIZE=1
             ;;
+        --native-only)
+            NATIVE_ONLY=1
+            ;;
         *)
             echo "Unknown argument: $arg" >&2
-            echo "Usage: ./build.sh [--notarize]" >&2
+            echo "Usage: ./build.sh [--notarize] [--native-only]" >&2
             exit 1
             ;;
     esac
 done
 
 NOTARY_PROFILE="${NOTARY_PROFILE:-PeanutButter-Notary}"
+if [ "$NATIVE_ONLY" -eq 1 ]; then
+    echo "Building PeanutButter (native architecture only)..."
+    swift build -c release
+    NATIVE_BIN_DIR=$(swift build -c release --show-bin-path)
+else
+    echo "Building PeanutButter (Universal: arm64 + x86_64)..."
+    echo "  -> Building arm64 slice..."
+    swift build -c release --arch arm64
+    ARM64_BIN_DIR=$(swift build -c release --arch arm64 --show-bin-path)
 
-echo "Building PeanutButter..."
-swift build -c release
+    echo "  -> Building x86_64 slice..."
+    swift build -c release --arch x86_64
+    X86_64_BIN_DIR=$(swift build -c release --arch x86_64 --show-bin-path)
+fi
 
 echo "Packaging PeanutButter.app..."
 rm -rf "PeanutButter.app"
 mkdir -p "PeanutButter.app/Contents/MacOS"
 mkdir -p "PeanutButter.app/Contents/Resources"
 cp "Sources/PeanutButter/Resources/Info.plist" "PeanutButter.app/Contents/Info.plist"
-cp ".build/release/PeanutButter" "PeanutButter.app/Contents/MacOS/PeanutButter"
+if [ "$NATIVE_ONLY" -eq 1 ]; then
+    cp "$NATIVE_BIN_DIR/PeanutButter" "PeanutButter.app/Contents/MacOS/PeanutButter"
+else
+    /usr/bin/lipo -create -output "PeanutButter.app/Contents/MacOS/PeanutButter" \
+        "$ARM64_BIN_DIR/PeanutButter" \
+        "$X86_64_BIN_DIR/PeanutButter"
+fi
 chmod +x "PeanutButter.app/Contents/MacOS/PeanutButter"
+
+BUILT_ARCHS=$(lipo -archs "PeanutButter.app/Contents/MacOS/PeanutButter")
+echo "Built binary architectures: $BUILT_ARCHS"
+if [ "$NATIVE_ONLY" -eq 0 ]; then
+    case " $BUILT_ARCHS " in
+        *" arm64 "*) ;;
+        *) echo "ERROR: Missing arm64 slice in universal binary" >&2; exit 1 ;;
+    esac
+    case " $BUILT_ARCHS " in
+        *" x86_64 "*) ;;
+        *) echo "ERROR: Missing x86_64 slice in universal binary" >&2; exit 1 ;;
+    esac
+fi
 cp -R Sources/PeanutButter/Resources/* "PeanutButter.app/Contents/Resources/" 2>/dev/null || true
 rm -f "PeanutButter.app/Contents/Resources/Info.plist"
 /usr/bin/xattr -cr "PeanutButter.app"
