@@ -1,0 +1,23 @@
+.DS_Store
+/.build
+/Packages
+/PeanutButter.app
+/PeanutButter.zip
+/.agents
+/main
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+
+# Copyrighted MultiTracks audio assets (kept locally; not bundled in open-source repo)
+Sources/PeanutButter/Resources/Audio/Click/
+Sources/PeanutButter/Resources/Audio/Dynamic Cues/
+Sources/PeanutButter/Resources/Audio/Song Sections/
+
+# User-uploaded pads live in ~/Library/Application Support/PeanutButter/Pads/ (outside repo),
+# and any non-bundled pads placed under Resources/Audio/Pads/ are ignored here:
+Sources/PeanutButter/Resources/Audio/Pads/*
+!Sources/PeanutButter/Resources/Audio/Pads/Simple/
+!Sources/PeanutButter/Resources/Audio/Pads/Soft/

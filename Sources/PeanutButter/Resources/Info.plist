@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>PeanutButter</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.peanutbutter.app</string>
+    <key>CFBundleName</key>
+    <string>PeanutButter</string>
+    <key>CFBundleDisplayName</key>
+    <string>PeanutButter</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>PeanutButter uses speech recognition to analyze the Guide track and automatically label song sections.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>PeanutButter uses the local network to host PeanutButter Remote for wireless stage control.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_peanutbutter._tcp</string>
+    </array>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>PeanutButter Session Package</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>pbsession</string>
+            </array>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.peanutbutter.session</string>
+            </array>
+            <key>LSTypeIsPackage</key>
+            <true/>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>PeanutButter Song Package</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>pbsong</string>
+                <string>multitrack</string>
+            </array>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.peanutbutter.song</string>
+                <string>com.peanutbutter.multitrack</string>
+            </array>
+            <key>LSTypeIsPackage</key>
+            <true/>
+        </dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.peanutbutter.session</string>
+            <key>UTTypeDescription</key>
+            <string>PeanutButter Session Package</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>com.apple.package</string>
+                <string>public.composite-content</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>pbsession</string>
+                </array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.peanutbutter.song</string>
+            <key>UTTypeDescription</key>
+            <string>PeanutButter Song Package</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>com.apple.package</string>
+                <string>public.composite-content</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>pbsong</string>
+                    <string>multitrack</string>
+                </array>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>

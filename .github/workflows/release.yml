@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if release asset already exists
+        id: check_asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "PeanutButter.zip"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and package PeanutButter.app
+        if: steps.check_asset.outputs.exists != 'true'
+        run: |
+          chmod +x ./build.sh
+          ./build.sh
+          codesign --verify --deep --strict PeanutButter.app
+          ditto -c -k --sequesterRsrc --keepParent PeanutButter.app PeanutButter.zip
+
+      - name: Create or update GitHub Release
+        if: steps.check_asset.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" PeanutButter.zip --clobber
+          else
+            gh release create "$TAG" PeanutButter.zip --title "PeanutButter $TAG" --generate-notes
+          fi
