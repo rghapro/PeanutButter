@@ -451,7 +451,7 @@ public final class AppUpdateManager: ObservableObject {
                 }
 
                 // Strip any quarantine attributes so relaunch does not nag Gatekeeper.
-                _ = Self.runProcess("/usr/bin/xattr", arguments: ["-cr", stagedApp.path])
+                _ = Self.runProcess("/usr/bin/xattr", arguments: ["-dr", "com.apple.quarantine", stagedApp.path])
 
                 // Verify bundle identifier and strict code signature before arming install.
                 let plistURL = stagedApp.appendingPathComponent("Contents/Info.plist")
@@ -537,7 +537,7 @@ public final class AppUpdateManager: ObservableObject {
                 fi
                 return 1
             fi
-            /usr/bin/xattr -cr "$TARGET_APP" 2>/dev/null || true
+            /usr/bin/xattr -dr com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
             rm -rf "$BACKUP_APP" 2>/dev/null || true
             return 0
         }
@@ -551,7 +551,7 @@ public final class AppUpdateManager: ObservableObject {
             ESC_TARGET=$(printf '%s' "$TARGET_APP" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
             ESC_STAGED=$(printf '%s' "$STAGED_APP" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
             ESC_BACKUP=$(printf '%s' "$BACKUP_APP" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
-            ADMIN_CMD="rm -rf \\"${ESC_BACKUP}\\" && mv \\"${ESC_TARGET}\\" \\"${ESC_BACKUP}\\" && (/usr/bin/ditto \\"${ESC_STAGED}\\" \\"${ESC_TARGET}\\" || (rm -rf \\"${ESC_TARGET}\\"; mv \\"${ESC_BACKUP}\\" \\"${ESC_TARGET}\\"; exit 1)) && /usr/bin/xattr -cr \\"${ESC_TARGET}\\" 2>/dev/null; rm -rf \\"${ESC_BACKUP}\\""
+            ADMIN_CMD="rm -rf \\"${ESC_BACKUP}\\" && mv \\"${ESC_TARGET}\\" \\"${ESC_BACKUP}\\" && (/usr/bin/ditto \\"${ESC_STAGED}\\" \\"${ESC_TARGET}\\" || (rm -rf \\"${ESC_TARGET}\\"; mv \\"${ESC_BACKUP}\\" \\"${ESC_TARGET}\\"; exit 1)) && /usr/bin/xattr -dr com.apple.quarantine \\"${ESC_TARGET}\\" 2>/dev/null; rm -rf \\"${ESC_BACKUP}\\""
             ESC_ADMIN=$(printf '%s' "$ADMIN_CMD" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
             if ! /usr/bin/osascript -e "do shell script \\"${ESC_ADMIN}\\" with administrator privileges" >/dev/null 2>&1; then
                 rm -f "$0"
