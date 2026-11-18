@@ -13,9 +13,11 @@
 
 No account login walls at soundcheck. No per-seat cloud fees. No "Pro" tier paywalls.
 
-![PeanutButter Home Screen — no login, ready to build or load a setlist.](assets/peanutbutter-console.png)
-
-*PeanutButter Home Screen — no login, ready to build or load a setlist.*
+<p align="center">
+  <img src="assets/peanutbutter-console.png" alt="PeanutButter Home Screen — no login, ready to build or load a setlist." width="100%" />
+  <br />
+  <em>PeanutButter Home Screen — no login, ready to build or load a setlist.</em>
+</p>
 
 ---
 
