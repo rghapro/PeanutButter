@@ -1,9 +1,12 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release git tag to publish (e.g. v1.0.6)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,52 +15,86 @@ jobs:
   release:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check if release assets already exist
-        id: check_assets
+      - name: Verify required Apple signing and notarization secrets
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_DEVELOPER_ID_CERT_P12: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          ASSETS=$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true)
-          if printf '%s\n' "$ASSETS" | grep -qx "PeanutButter.zip"; then
-            echo "zip_exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "zip_exists=false" >> "$GITHUB_OUTPUT"
-          fi
-          if printf '%s\n' "$ASSETS" | grep -qx "PeanutButter.dmg"; then
-            echo "dmg_exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "dmg_exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          for var in APPLE_DEVELOPER_ID_CERT_P12 APPLE_DEVELOPER_ID_CERT_PASSWORD APPLE_TEAM_ID APPLE_ID APPLE_APP_SPECIFIC_PASSWORD; do
+            if [ -z "${!var}" ]; then
+              echo "ERROR: Missing required secret $var. Ad-hoc/unsigned releases are disabled." >&2
+              exit 1
+            fi
+          done
 
-      - name: Build and package PeanutButter.app, ZIP, and DMG
-        if: steps.check_assets.outputs.zip_exists != 'true' || steps.check_assets.outputs.dmg_exists != 'true'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Import Developer ID certificate and configure Notary profile
+        env:
+          APPLE_DEVELOPER_ID_CERT_P12: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/pb-signing.keychain-db"
+          KEYCHAIN_PASS="pb-ci-temp-$(date +%s)"
+          CERT_PATH="$RUNNER_TEMP/developer_id.p12"
+
+          printf '%s' "$APPLE_DEVELOPER_ID_CERT_P12" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$(security default-keychain -d user | tr -d ' "')"
+
+          xcrun notarytool store-credentials "PeanutButter-Notary" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD"
+
+      - name: Build, Developer ID sign, notarize, and verify ZIP and DMG
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           chmod +x ./build.sh ./scripts/make_dmg.sh
-          ./build.sh --dmg
-          codesign --verify --deep --strict PeanutButter.app
-          ditto -c -k --sequesterRsrc --keepParent PeanutButter.app PeanutButter.zip
+          ./build.sh --notarize
+
+          REQ="identifier \"com.peanutbutter.app\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = ${APPLE_TEAM_ID}"
+          VERIFY_DIR=$(mktemp -d "$RUNNER_TEMP/pb_verify.XXXXXX")
+          trap 'rm -rf "$VERIFY_DIR"' EXIT
+
+          ditto -xk PeanutButter.zip "$VERIFY_DIR"
+          /usr/bin/codesign --verify --deep --strict -R="$REQ" "$VERIFY_DIR/PeanutButter.app"
+          /usr/sbin/spctl --assess --type execute --verbose=4 "$VERIFY_DIR/PeanutButter.app"
+
+          /usr/bin/codesign --verify --verbose=2 PeanutButter.dmg
+          xcrun stapler validate PeanutButter.dmg
+          /usr/sbin/spctl -a -t open --context context:primary-signature -vv PeanutButter.dmg
 
       - name: Create or update GitHub Release
-        if: steps.check_assets.outputs.zip_exists != 'true' || steps.check_assets.outputs.dmg_exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          ASSETS=$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true)
-          TO_UPLOAD=()
-          if ! printf '%s\n' "$ASSETS" | grep -qx "PeanutButter.zip"; then
-            TO_UPLOAD+=("PeanutButter.zip")
-          fi
-          if ! printf '%s\n' "$ASSETS" | grep -qx "PeanutButter.dmg"; then
-            TO_UPLOAD+=("PeanutButter.dmg")
-          fi
-          if [ "${#TO_UPLOAD[@]}" -eq 0 ]; then
-            echo "All release assets already attached to $TAG; skipping upload."
-          elif gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${TO_UPLOAD[@]}"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" PeanutButter.zip PeanutButter.dmg --clobber
           else
-            gh release create "$TAG" "${TO_UPLOAD[@]}" --title "PeanutButter $TAG" --generate-notes
+            gh release create "$RELEASE_TAG" PeanutButter.zip PeanutButter.dmg \
+              --title "PeanutButter $RELEASE_TAG" \
+              --generate-notes
+          fi
+
+      - name: Clean up temporary Keychain and certificate
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/developer_id.p12"
+          if [ -f "$RUNNER_TEMP/pb-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/pb-signing.keychain-db" || true
           fi

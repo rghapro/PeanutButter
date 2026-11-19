@@ -43,6 +43,19 @@ public struct SongTransitionPopoverView: View {
             }
         )
     }
+
+    private var continueClickBinding: Binding<Bool> {
+        Binding(
+            get: {
+                if !isContinuePadAvailable { return false }
+                return currentSong?.continueClick ?? false
+            },
+            set: { newValue in
+                guard isContinuePadAvailable else { return }
+                engine.updateSongContinueClick(at: songIndex, continueClick: newValue)
+            }
+        )
+    }
     
     public var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -73,6 +86,7 @@ public struct SongTransitionPopoverView: View {
                     .padding(.vertical, 4)
                 
                 continuePadRow
+                continueClickRow
             } else {
                 // Inter-Song Transition Menu (Screenshot #2)
                 transitionOptionRow(
@@ -100,6 +114,7 @@ public struct SongTransitionPopoverView: View {
                     .padding(.vertical, 4)
                 
                 continuePadRow
+                continueClickRow
                 
                 Divider()
                     .background(Color.white.opacity(0.12))
@@ -113,6 +128,7 @@ public struct SongTransitionPopoverView: View {
                 ) {
                     engine.updateSongTransition(at: songIndex, type: .autoLink)
                     engine.updateSongContinuePad(at: songIndex, continuePad: false)
+                    engine.updateSongContinueClick(at: songIndex, continueClick: false)
                     onDismiss()
                 }
                 
@@ -124,6 +140,7 @@ public struct SongTransitionPopoverView: View {
                 ) {
                     engine.updateSongTransition(at: songIndex, type: .overlap)
                     engine.updateSongContinuePad(at: songIndex, continuePad: false)
+                    engine.updateSongContinueClick(at: songIndex, continueClick: false)
                     onDismiss()
                 }
                 
@@ -135,6 +152,7 @@ public struct SongTransitionPopoverView: View {
                 ) {
                     engine.updateSongTransition(at: songIndex, type: .crossfade)
                     engine.updateSongContinuePad(at: songIndex, continuePad: false)
+                    engine.updateSongContinueClick(at: songIndex, continueClick: false)
                     onDismiss()
                 }
             }
@@ -204,6 +222,30 @@ public struct SongTransitionPopoverView: View {
             Spacer()
             
             Toggle("", isOn: continuePadBinding)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .scaleEffect(0.75)
+                .disabled(!isContinuePadAvailable)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .opacity(isContinuePadAvailable ? 1.0 : 0.45)
+    }
+
+    private var continueClickRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "metronome")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(isContinuePadAvailable ? Color(red: 0.25, green: 0.75, blue: 0.95) : Color.white.opacity(0.25))
+                .frame(width: 18, alignment: .center)
+
+            Text("Continue Click")
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundColor(isContinuePadAvailable ? .white : .white.opacity(0.35))
+
+            Spacer()
+
+            Toggle("", isOn: continueClickBinding)
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .scaleEffect(0.75)

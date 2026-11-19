@@ -10,7 +10,6 @@ public final class GuideAudioGenerator: @unchecked Sendable {
     // In-memory cache of synthesized speech audio buffers keyed by "[voice]_[phrase]"
     private var speechCache: [String: SpokenPhraseData] = [:]
     private let cacheLock = NSLock()
-    private let speechSynthesizer = AVSpeechSynthesizer()
     
     private let cacheDirectory: URL
     
@@ -217,31 +216,63 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         return list
     }
     
-    /// Synthesizes speech using AVSpeechSynthesizer to access high-quality Siri neural voices
-    private func synthesizeWithAVSpeech(phrase: String, voice: GuideVoice) -> AVAudioPCMBuffer? {
-        // AVSpeechSynthesizer requires the Main RunLoop; background worker tasks skip directly to fast `say` CLI synthesis
-        guard Thread.isMainThread else { return nil }
-        guard let avVoice = resolveSystemVoice(for: voice) else { return nil }
-        let utterance = AVSpeechUtterance(string: phrase)
-        utterance.voice = avVoice
-        utterance.rate = 0.46 // Musical, articulate, unhurried tempo
-        
-        var chunks: [AVAudioPCMBuffer] = []
-        speechSynthesizer.write(utterance) { buffer in
-            if let pcm = buffer as? AVAudioPCMBuffer {
-                chunks.append(pcm)
+    private final class UtteranceCompletionBox: NSObject, AVSpeechSynthesizerDelegate, @unchecked Sendable {
+        private let lock = NSLock()
+        private var chunks: [AVAudioPCMBuffer] = []
+        private var finished = false
+        private let onComplete: ([AVAudioPCMBuffer]) -> Void
+
+        init(onComplete: @escaping ([AVAudioPCMBuffer]) -> Void) {
+            self.onComplete = onComplete
+            super.init()
+        }
+
+        func appendBuffer(_ buffer: AVAudioBuffer) {
+            guard let pcm = buffer as? AVAudioPCMBuffer else { return }
+            if pcm.frameLength == 0 {
+                finish()
+                return
             }
+            guard let copy = AVAudioPCMBuffer(pcmFormat: pcm.format, frameCapacity: pcm.frameLength) else {
+                return
+            }
+            copy.frameLength = pcm.frameLength
+            for c in 0..<Int(pcm.format.channelCount) {
+                if let src = pcm.floatChannelData?[c], let dst = copy.floatChannelData?[c] {
+                    memcpy(dst, src, Int(pcm.frameLength) * MemoryLayout<Float>.size)
+                }
+            }
+            lock.lock()
+            let ignore = finished
+            if !ignore {
+                chunks.append(copy)
+            }
+            lock.unlock()
         }
-        
-        let start = Date()
-        while chunks.isEmpty && Date().timeIntervalSince(start) < 0.20 {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+
+        func finish() {
+            lock.lock()
+            guard !finished else {
+                lock.unlock()
+                return
+            }
+            finished = true
+            let collected = chunks
+            chunks.removeAll(keepingCapacity: false)
+            lock.unlock()
+            onComplete(collected)
         }
-        let end = Date().addingTimeInterval(0.05)
-        while Date() < end {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+
+        func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+            finish()
         }
-        
+
+        func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+            finish()
+        }
+    }
+
+    private static func combineSpeechChunks(_ chunks: [AVAudioPCMBuffer]) -> AVAudioPCMBuffer? {
         guard !chunks.isEmpty else { return nil }
         let format = chunks[0].format
         let totalFrames = chunks.reduce(0) { $0 + $1.frameLength }
@@ -249,7 +280,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             return nil
         }
         combined.frameLength = totalFrames
-        
+
         var offset: AVAudioFrameCount = 0
         for chunk in chunks {
             for c in 0..<Int(format.channelCount) {
@@ -260,6 +291,78 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             offset += chunk.frameLength
         }
         return combined
+    }
+
+    /// Async neural speech synthesis using `AVSpeechSynthesizerDelegate` + `withCheckedContinuation`
+    /// without blocking or recursively spinning `RunLoop.current`.
+    public func synthesizeWithAVSpeechAsync(phrase: String, voice: GuideVoice) async -> AVAudioPCMBuffer? {
+        guard let avVoice = resolveSystemVoice(for: voice) else { return nil }
+        let collectedChunks: [AVAudioPCMBuffer] = await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                let synthesizer = AVSpeechSynthesizer()
+                let utterance = AVSpeechUtterance(string: phrase)
+                utterance.voice = avVoice
+                utterance.rate = 0.46
+
+                var boxRef: UtteranceCompletionBox?
+                let box = UtteranceCompletionBox { chunks in
+                    synthesizer.delegate = nil
+                    boxRef = nil
+                    _ = synthesizer
+                    continuation.resume(returning: chunks)
+                }
+                boxRef = box
+                synthesizer.delegate = box
+
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 4.0) { [weak box] in
+                    box?.finish()
+                }
+
+                synthesizer.write(utterance) { buffer in
+                    boxRef?.appendBuffer(buffer)
+                }
+            }
+        }
+        return Self.combineSpeechChunks(collectedChunks)
+    }
+
+    /// Synthesizes speech using AVSpeechSynthesizer without spinning `RunLoop.current`.
+    private func synthesizeWithAVSpeech(phrase: String, voice: GuideVoice) -> AVAudioPCMBuffer? {
+        // Never spin Main RunLoop recursively; main-thread callers use pre-cached WAVs or fast `say` fallback
+        guard !Thread.isMainThread else { return nil }
+        guard let avVoice = resolveSystemVoice(for: voice) else { return nil }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var collectedChunks: [AVAudioPCMBuffer] = []
+
+        DispatchQueue.main.async {
+            let synthesizer = AVSpeechSynthesizer()
+            let utterance = AVSpeechUtterance(string: phrase)
+            utterance.voice = avVoice
+            utterance.rate = 0.46
+
+            var boxRef: UtteranceCompletionBox?
+            let box = UtteranceCompletionBox { chunks in
+                collectedChunks = chunks
+                synthesizer.delegate = nil
+                boxRef = nil
+                _ = synthesizer
+                semaphore.signal()
+            }
+            boxRef = box
+            synthesizer.delegate = box
+
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 4.0) { [weak box] in
+                box?.finish()
+            }
+
+            synthesizer.write(utterance) { buffer in
+                boxRef?.appendBuffer(buffer)
+            }
+        }
+
+        _ = semaphore.wait(timeout: .now() + 4.2)
+        return Self.combineSpeechChunks(collectedChunks)
     }
     
     private func resolveFallbackPhrase(

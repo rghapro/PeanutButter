@@ -56,7 +56,28 @@ public final class StemTrack: Identifiable, ObservableObject, @unchecked Sendabl
     // 0.0 = -inf dB
     // 0.80 = 0.0 dB (Unity Gain)
     // 1.0 = +6.0 dB
-    @Published public var volume: Float = 0.80
+    public let faderDisplay: FaderDisplayModel
+    private var _volumeStorage: Float = 0.80
+    public var volume: Float {
+        get { _volumeStorage }
+        set {
+            guard _volumeStorage != newValue else { return }
+            if Thread.isMainThread {
+                objectWillChange.send()
+            }
+            _volumeStorage = newValue
+            faderDisplay.update(newValue, force: true)
+        }
+    }
+
+    /// Updates `volume` storage and isolated `faderDisplay` without firing `StemTrack.objectWillChange`,
+    /// keeping `ChannelStripView.body` untouched during live drags and 60/120 Hz fades.
+    public func setLiveVolume(_ newValue: Float, forceDisplay: Bool = false) {
+        let clamped = max(0.0, min(1.0, newValue))
+        _volumeStorage = clamped
+        faderDisplay.update(clamped, force: forceDisplay)
+    }
+
     @Published public var pan: Float = 0.0 // -1.0 (Left) to 1.0 (Right)
     @Published public var isMuted: Bool = false
     @Published public var isSoloed: Bool = false
@@ -107,7 +128,8 @@ public final class StemTrack: Identifiable, ObservableObject, @unchecked Sendabl
         
         self.fileURL = fileURL
         self.sourceFileURL = sourceFileURL ?? fileURL
-        self.volume = volume
+        self._volumeStorage = volume
+        self.faderDisplay = FaderDisplayModel(initial: volume)
         self.pan = pan
         self.isMuted = isMuted
         self.isSoloed = isSoloed

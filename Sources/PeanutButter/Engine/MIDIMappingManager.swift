@@ -2,6 +2,61 @@ import Foundation
 import CoreMIDI
 import Combine
 import SwiftUI
+import os
+
+private final class RealtimeMIDIInputFilter: @unchecked Sendable {
+    private var lock = os_unfair_lock()
+    private var isLearning = false
+    // 64 x 64-bit words = 4,096 bits: words 0..<32 cover Notes (16ch x 128), words 32..<64 cover CCs (16ch x 128).
+    private let bits: UnsafeMutablePointer<UInt64>
+
+    init() {
+        bits = UnsafeMutablePointer<UInt64>.allocate(capacity: 64)
+        bits.initialize(repeating: 0, count: 64)
+    }
+
+    deinit {
+        bits.deinitialize(count: 64)
+        bits.deallocate()
+    }
+
+    func setLearning(_ active: Bool) {
+        os_unfair_lock_lock(&lock)
+        isLearning = active
+        os_unfair_lock_unlock(&lock)
+    }
+
+    func rebuild<S: Sequence>(mappings: S) where S.Element == MIDIMappingItem {
+        var nextWords = [UInt64](repeating: 0, count: 64)
+        for item in mappings {
+            guard item.channel >= 1 && item.channel <= 16 && item.noteOrCC >= 0 && item.noteOrCC <= 127 else {
+                continue
+            }
+            let flatIdx = ((item.channel - 1) << 7) | item.noteOrCC
+            let wordIdx = (item.isNote ? 0 : 32) + (flatIdx >> 6)
+            nextWords[wordIdx] |= (UInt64(1) << UInt64(flatIdx & 63))
+        }
+        os_unfair_lock_lock(&lock)
+        for i in 0..<64 {
+            bits[i] = nextWords[i]
+        }
+        os_unfair_lock_unlock(&lock)
+    }
+
+    func shouldForward(channel: Int, number: Int, isNote: Bool) -> Bool {
+        guard channel >= 1 && channel <= 16 && number >= 0 && number <= 127 else {
+            return false
+        }
+        let flatIdx = ((channel - 1) << 7) | number
+        let wordIdx = (isNote ? 0 : 32) + (flatIdx >> 6)
+        let bitMask = UInt64(1) << UInt64(flatIdx & 63)
+
+        os_unfair_lock_lock(&lock)
+        let matched = isLearning || ((bits[wordIdx] & bitMask) != 0)
+        os_unfair_lock_unlock(&lock)
+        return matched
+    }
+}
 
 /// Represents a single mapped MIDI trigger
 public struct MIDIMappingItem: Identifiable, Codable, Equatable, Sendable {
@@ -44,7 +99,14 @@ public final class MIDIMappingManager: ObservableObject {
     private let userDefaultsKey = "PeanutButter_MIDIMappings_v1"
     
     /// TargetId -> MIDIMappingItem
-    @Published public private(set) var mappings: [String: MIDIMappingItem] = [:]
+    @Published public private(set) var mappings: [String: MIDIMappingItem] = [:] {
+        didSet {
+            Self.inputFilter.rebuild(mappings: mappings.values)
+        }
+    }
+
+    var suppressPersistenceForTesting: Bool = false
+    private nonisolated static let inputFilter = RealtimeMIDIInputFilter()
     
     /// Target currently highlighted in white awaiting MIDI learning
     @Published public var selectedTargetId: String? = nil
@@ -62,11 +124,7 @@ public final class MIDIMappingManager: ObservableObject {
     public weak var engine: MultitrackAudioEngine?
     
     private var midiClient: MIDIClientRef = 0
-    private var inputPort: MIDIPortRef = 0
     private var protocolPort: MIDIPortRef = 0
-    
-    private var lastHandledKey: String = ""
-    private var lastHandledTime: TimeInterval = 0
     
     private init() {
         loadMappings()
@@ -76,9 +134,6 @@ public final class MIDIMappingManager: ObservableObject {
     deinit {
         if protocolPort != 0 {
             MIDIPortDispose(protocolPort)
-        }
-        if inputPort != 0 {
-            MIDIPortDispose(inputPort)
         }
         if midiClient != 0 {
             MIDIClientDispose(midiClient)
@@ -98,15 +153,8 @@ public final class MIDIMappingManager: ObservableObject {
         }
         guard clientStatus == noErr else { return }
         
-        let portStatus = MIDIInputPortCreateWithBlock(midiClient, "PeanutButter Input Port" as CFString, &inputPort) { pktList, _ in
-            Self.processIncomingPacketList(pktList)
-        }
-        _ = portStatus
-        
-        if #available(macOS 11.0, *) {
-            _ = MIDIInputPortCreateWithProtocol(midiClient, "PeanutButter Protocol Port" as CFString, ._1_0, &protocolPort) { eventListPtr, _ in
-                Self.processIncomingEventList(eventListPtr)
-            }
+        _ = MIDIInputPortCreateWithProtocol(midiClient, "PeanutButter Protocol Port" as CFString, ._1_0, &protocolPort) { eventListPtr, _ in
+            Self.processIncomingEventList(eventListPtr)
         }
         
         reconnectAllSources()
@@ -116,89 +164,52 @@ public final class MIDIMappingManager: ObservableObject {
         let sourceCount = MIDIGetNumberOfSources()
         for i in 0..<sourceCount {
             let src = MIDIGetSource(i)
-            if inputPort != 0 {
-                MIDIPortConnectSource(inputPort, src, nil)
-            }
             if protocolPort != 0 {
                 MIDIPortConnectSource(protocolPort, src, nil)
             }
         }
     }
     
-    nonisolated private static func processIncomingPacketList(_ pktList: UnsafePointer<MIDIPacketList>) {
-        let numPackets = Int(pktList.pointee.numPackets)
-        guard numPackets > 0 else { return }
-        
-        var packetPtr = UnsafeRawPointer(pktList).advanced(by: MemoryLayout<UInt32>.size).assumingMemoryBound(to: MIDIPacket.self)
-        let dataOffset = MemoryLayout<MIDITimeStamp>.size + MemoryLayout<UInt16>.size
-        
-        for _ in 0..<numPackets {
-            let len = Int(packetPtr.pointee.length)
-            if len >= 2 {
-                let dataPtr = UnsafeRawPointer(packetPtr).advanced(by: dataOffset).assumingMemoryBound(to: UInt8.self)
-                let status = dataPtr[0]
-                let data1 = dataPtr[1]
-                let data2 = len >= 3 ? dataPtr[2] : 0
-                
-                let messageType = status & 0xF0
-                let channel = Int(status & 0x0F) + 1
-                
-                if messageType == 0x90 { // Note On
-                    let note = Int(data1)
-                    let velocity = Int(data2)
-                    if velocity > 0 {
-                        DispatchQueue.main.async {
-                            MIDIMappingManager.shared.handleIncomingMIDI(channel: channel, number: note, isNote: true, value: velocity)
-                        }
-                    }
-                } else if messageType == 0xB0 { // Control Change
-                    let cc = Int(data1)
-                    let val = Int(data2)
-                    DispatchQueue.main.async {
-                        MIDIMappingManager.shared.handleIncomingMIDI(channel: channel, number: cc, isNote: false, value: val)
-                    }
-                }
-            }
-            packetPtr = UnsafePointer(MIDIPacketNext(packetPtr))
-        }
-    }
-    
-    @available(macOS 11.0, *)
     nonisolated private static func processIncomingEventList(_ eventListPtr: UnsafePointer<MIDIEventList>) {
         let numPackets = Int(eventListPtr.pointee.numPackets)
         guard numPackets > 0 else { return }
         
-        let headerOffset = MemoryLayout<MIDIProtocolID>.size + MemoryLayout<UInt32>.size
+        let headerOffset = MemoryLayout<MIDIEventList>.offset(of: \.packet)
+            ?? (MemoryLayout<MIDIProtocolID>.size + MemoryLayout<UInt32>.size)
         var packetPtr = UnsafeRawPointer(eventListPtr).advanced(by: headerOffset).assumingMemoryBound(to: MIDIEventPacket.self)
         
         for _ in 0..<numPackets {
-            let wordCount = Int(packetPtr.pointee.wordCount)
-            let words = withUnsafePointer(to: packetPtr.pointee.words) {
-                $0.withMemoryRebound(to: UInt32.self, capacity: wordCount) { Array(UnsafeBufferPointer(start: $0, count: wordCount)) }
-            }
-            for word in words {
-                let messageType = (word >> 28) & 0x0F
-                if messageType == 0x2 { // MIDI 1.0 Voice Message in UMP
-                    let statusByte = UInt8((word >> 16) & 0xFF)
-                    let data1 = UInt8((word >> 8) & 0xFF)
-                    let data2 = UInt8(word & 0xFF)
-                    
-                    let cmd = statusByte & 0xF0
-                    let channel = Int(statusByte & 0x0F) + 1
-                    
-                    if cmd == 0x90 { // Note On
-                        let note = Int(data1)
-                        let velocity = Int(data2)
-                        if velocity > 0 {
-                            DispatchQueue.main.async {
-                                MIDIMappingManager.shared.handleIncomingMIDI(channel: channel, number: note, isNote: true, value: velocity)
+            let wordCount = min(Int(packetPtr.pointee.wordCount), 64)
+            withUnsafePointer(to: packetPtr.pointee.words) { wordsTuplePtr in
+                wordsTuplePtr.withMemoryRebound(to: UInt32.self, capacity: max(1, wordCount)) { wordsPtr in
+                    for wIdx in 0..<wordCount {
+                        let word = wordsPtr[wIdx]
+                        let messageType = (word >> 28) & 0x0F
+                        if messageType == 0x2 { // MIDI 1.0 Voice Message in UMP
+                            let statusByte = UInt8((word >> 16) & 0xFF)
+                            let data1 = UInt8((word >> 8) & 0xFF)
+                            let data2 = UInt8(word & 0xFF)
+                            
+                            let cmd = statusByte & 0xF0
+                            let channel = Int(statusByte & 0x0F) + 1
+                            
+                            if cmd == 0x90 { // Note On
+                                let note = Int(data1)
+                                let velocity = Int(data2)
+                                if velocity > 0 && Self.inputFilter.shouldForward(channel: channel, number: note, isNote: true) {
+                                    DispatchQueue.main.async {
+                                        MIDIMappingManager.shared.handleIncomingMIDI(channel: channel, number: note, isNote: true, value: velocity)
+                                    }
+                                }
+                            } else if cmd == 0xB0 { // CC
+                                let cc = Int(data1)
+                                let val = Int(data2)
+                                if Self.inputFilter.shouldForward(channel: channel, number: cc, isNote: false) {
+                                    DispatchQueue.main.async {
+                                        MIDIMappingManager.shared.handleIncomingMIDI(channel: channel, number: cc, isNote: false, value: val)
+                                    }
+                                }
                             }
-                        }
-                    } else if cmd == 0xB0 { // CC
-                        let cc = Int(data1)
-                        let val = Int(data2)
-                        DispatchQueue.main.async {
-                            MIDIMappingManager.shared.handleIncomingMIDI(channel: channel, number: cc, isNote: false, value: val)
                         }
                     }
                 }
@@ -210,14 +221,6 @@ public final class MIDIMappingManager: ObservableObject {
     // MARK: - MIDI Message Handling & Learning
     
     public func handleIncomingMIDI(channel: Int, number: Int, isNote: Bool, value: Int) {
-        let now = Date().timeIntervalSince1970
-        let key = "\(channel)_\(number)_\(isNote)_\(value)"
-        if key == lastHandledKey && (now - lastHandledTime) < 0.05 {
-            return
-        }
-        lastHandledKey = key
-        lastHandledTime = now
-        
         guard let eng = engine else { return }
         
         if eng.isEditMIDIMappingMode {
@@ -296,7 +299,7 @@ public final class MIDIMappingManager: ObservableObject {
         case "fade_out":
             eng.toggleFade()
         case "restart_song":
-            eng.seek(to: 0.0)
+            eng.returnToZero()
         case "prev_song":
             if eng.currentSongIndex > 0 {
                 eng.selectSongInSetlist(at: eng.currentSongIndex - 1)
@@ -332,7 +335,7 @@ public final class MIDIMappingManager: ObservableObject {
         case "pad_player_button":
             eng.mixerMode = (eng.mixerMode == .padPlayer ? .tracks : .padPlayer)
         case "master_fader":
-            eng.masterVolume = Float(value) / 127.0
+            eng.setMasterVolumeContinuous(Float(value) / 127.0)
         default:
             if targetId.hasPrefix("song_card_") {
                 let indexStr = targetId.replacingOccurrences(of: "song_card_", with: "")
@@ -370,7 +373,22 @@ public final class MIDIMappingManager: ObservableObject {
         return dir.appendingPathComponent("MIDIMappings.json")
     }
     
+    public func setLearningModeActive(_ active: Bool) {
+        Self.inputFilter.setLearning(active)
+    }
+
+    nonisolated static func shouldForwardForTesting(channel: Int, number: Int, isNote: Bool) -> Bool {
+        inputFilter.shouldForward(channel: channel, number: number, isNote: isNote)
+    }
+
+    func setMappingsInMemoryForTesting(_ newMappings: [String: MIDIMappingItem]) {
+        suppressPersistenceForTesting = true
+        defer { suppressPersistenceForTesting = false }
+        mappings = newMappings
+    }
+
     private func saveMappings() {
+        guard !suppressPersistenceForTesting else { return }
         if let data = try? JSONEncoder().encode(Array(mappings.values)) {
             UserDefaults.standard.set(data, forKey: userDefaultsKey)
             UserDefaults.standard.synchronize()

@@ -199,16 +199,24 @@ public final class LibraryBrowserManager: ObservableObject {
 
     public var isCloudConnected: Bool { cloudRootURL != nil }
 
-    public nonisolated var songsDirectory: URL {
+    public nonisolated static var localSongsDirectoryURL: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         return appSupport.appendingPathComponent("PeanutButter/Songs", isDirectory: true)
     }
 
-    public nonisolated var setlistsDirectory: URL {
+    public nonisolated static var localSetlistsDirectoryURL: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         return appSupport.appendingPathComponent("PeanutButter/Setlists", isDirectory: true)
+    }
+
+    public nonisolated var songsDirectory: URL {
+        Self.localSongsDirectoryURL
+    }
+
+    public nonisolated var setlistsDirectory: URL {
+        Self.localSetlistsDirectoryURL
     }
 
     public nonisolated static var cloudRootDirectoryURL: URL? {
@@ -1124,15 +1132,13 @@ public final class LibraryBrowserManager: ObservableObject {
         } else if downloaded {
             let tempDir = fm.temporaryDirectory.appendingPathComponent("pb_scan_song_\(UUID().uuidString)")
             defer { try? fm.removeItem(at: tempDir) }
-            try? fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
 
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-            process.arguments = ["-q", "-o", url.path, "song.json", "artwork.png", "-d", tempDir.path]
-            process.standardOutput = Pipe()
-            process.standardError = Pipe()
-            try? process.run()
-            process.waitUntilExit()
+            try? PlaybackFileManager.shared.unzipSelectedEntries(
+                archiveURL: url,
+                entryPatterns: ["song.json", "artwork.png"],
+                toFolderURL: tempDir,
+                requiredRelativeFile: "song.json"
+            )
 
             let jsonURL = tempDir.appendingPathComponent("song.json")
             jsonData = try? Data(contentsOf: jsonURL)
@@ -1210,47 +1216,44 @@ public final class LibraryBrowserManager: ObservableObject {
 
         var jsonData: Data?
         var artworks: [NSImage] = []
+        var pkgRoot: URL? = nil
+        var cleanupTempDir: URL? = nil
+        defer {
+            if let dir = cleanupTempDir {
+                try? fm.removeItem(at: dir)
+            }
+        }
 
         if isDir {
             let jsonURL = url.appendingPathComponent("session.json")
             jsonData = try? Data(contentsOf: jsonURL)
-            let songsDir = url.appendingPathComponent("songs")
-            if let songDirs = try? fm.contentsOfDirectory(at: songsDir, includingPropertiesForKeys: nil) {
-                for sDir in songDirs.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).prefix(4) {
-                    let artURL = sDir.appendingPathComponent("artwork.png")
-                    if let img = NSImage(contentsOf: artURL) {
-                        artworks.append(img)
-                    }
-                }
-            }
+            pkgRoot = url
         } else if downloaded {
             let tempDir = fm.temporaryDirectory.appendingPathComponent("pb_scan_sess_\(UUID().uuidString)")
-            defer { try? fm.removeItem(at: tempDir) }
-            try? fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            cleanupTempDir = tempDir
 
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-            process.arguments = ["-q", "-o", url.path, "session.json", "songs/*/artwork.png", "-d", tempDir.path]
-            process.standardOutput = Pipe()
-            process.standardError = Pipe()
-            try? process.run()
-            process.waitUntilExit()
+            try? PlaybackFileManager.shared.unzipSelectedEntries(
+                archiveURL: url,
+                entryPatterns: ["session.json", "songs/*/artwork.png"],
+                toFolderURL: tempDir,
+                requiredRelativeFile: "session.json"
+            )
 
             let jsonURL = tempDir.appendingPathComponent("session.json")
             jsonData = try? Data(contentsOf: jsonURL)
-            let songsDir = tempDir.appendingPathComponent("songs")
-            if let songDirs = try? fm.contentsOfDirectory(at: songsDir, includingPropertiesForKeys: nil) {
-                for sDir in songDirs.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).prefix(4) {
-                    let artURL = sDir.appendingPathComponent("artwork.png")
-                    if let img = NSImage(contentsOf: artURL) {
-                        artworks.append(img)
-                    }
-                }
-            }
+            pkgRoot = tempDir
         }
 
         if let data = jsonData,
            let meta = try? JSONDecoder().decode(SessionPackageMetadata.self, from: data) {
+            if let root = pkgRoot {
+                for (idx, song) in meta.songEntries.enumerated() where artworks.count < 4 {
+                    let songDir = PlaybackFileManager.resolveSessionSongDirectory(rootFolder: root, songId: song.id, fallbackIndex: idx)
+                    if let img = NSImage(contentsOf: songDir.appendingPathComponent("artwork.png")) {
+                        artworks.append(img)
+                    }
+                }
+            }
             let name = meta.name.isEmpty ? url.deletingPathExtension().lastPathComponent : meta.name
             let songCount = meta.songEntries.count
             let totalDuration = meta.songEntries.reduce(0.0) { acc, song in
@@ -1334,46 +1337,30 @@ public final class LibraryBrowserManager: ObservableObject {
         let downloaded = checkIsDownloaded(at: url)
 
         var jsonData: Data?
-        var artworkByIndex: [Int: NSImage] = [:]
+        var pkgRoot: URL? = nil
+        var cleanupTempDir: URL? = nil
+        defer {
+            if let dir = cleanupTempDir {
+                try? fm.removeItem(at: dir)
+            }
+        }
 
         if isDir {
             jsonData = try? Data(contentsOf: url.appendingPathComponent("session.json"))
-            let songsDir = url.appendingPathComponent("songs")
-            if let songDirs = try? fm.contentsOfDirectory(at: songsDir, includingPropertiesForKeys: nil) {
-                for sDir in songDirs {
-                    let name = sDir.lastPathComponent
-                    if name.hasPrefix("song_"), let idx = Int(name.dropFirst(5)) {
-                        if let img = NSImage(contentsOf: sDir.appendingPathComponent("artwork.png")) {
-                            artworkByIndex[idx] = img
-                        }
-                    }
-                }
-            }
+            pkgRoot = url
         } else if downloaded {
             let tempDir = fm.temporaryDirectory.appendingPathComponent("pb_preview_sess_\(UUID().uuidString)")
-            defer { try? fm.removeItem(at: tempDir) }
-            try? fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            cleanupTempDir = tempDir
 
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-            process.arguments = ["-q", "-o", url.path, "session.json", "songs/*/artwork.png", "-d", tempDir.path]
-            process.standardOutput = Pipe()
-            process.standardError = Pipe()
-            try? process.run()
-            process.waitUntilExit()
+            try? PlaybackFileManager.shared.unzipSelectedEntries(
+                archiveURL: url,
+                entryPatterns: ["session.json", "songs/*/artwork.png"],
+                toFolderURL: tempDir,
+                requiredRelativeFile: "session.json"
+            )
 
             jsonData = try? Data(contentsOf: tempDir.appendingPathComponent("session.json"))
-            let songsDir = tempDir.appendingPathComponent("songs")
-            if let songDirs = try? fm.contentsOfDirectory(at: songsDir, includingPropertiesForKeys: nil) {
-                for sDir in songDirs {
-                    let name = sDir.lastPathComponent
-                    if name.hasPrefix("song_"), let idx = Int(name.dropFirst(5)) {
-                        if let img = NSImage(contentsOf: sDir.appendingPathComponent("artwork.png")) {
-                            artworkByIndex[idx] = img
-                        }
-                    }
-                }
-            }
+            pkgRoot = tempDir
         }
 
         guard let data = jsonData,
@@ -1389,6 +1376,11 @@ public final class LibraryBrowserManager: ObservableObject {
             let songDownloaded = (item.source == .local)
                 ? true
                 : (downloaded && areSongStemsDownloaded(meta: song, rootFolder: url))
+            var resolvedArtwork: NSImage? = song.artworkData.flatMap { NSImage(data: $0) }
+            if resolvedArtwork == nil, let root = pkgRoot {
+                let songDir = PlaybackFileManager.resolveSessionSongDirectory(rootFolder: root, songId: song.id, fallbackIndex: idx)
+                resolvedArtwork = NSImage(contentsOf: songDir.appendingPathComponent("artwork.png"))
+            }
             return SetlistSongPreview(
                 id: song.id,
                 title: song.title.isEmpty ? "Untitled Song" : song.title,
@@ -1397,7 +1389,7 @@ public final class LibraryBrowserManager: ObservableObject {
                 musicalKey: song.musicalKey.isEmpty ? "C" : song.musicalKey,
                 timeSignature: sig,
                 duration: dur,
-                artwork: artworkByIndex[idx],
+                artwork: resolvedArtwork,
                 isDownloaded: songDownloaded
             )
         }
@@ -1503,14 +1495,12 @@ public final class LibraryBrowserManager: ObservableObject {
         guard checkIsDownloaded(at: url) else { return nil }
         let tempDir = fm.temporaryDirectory.appendingPathComponent("pb_meta_read_\(UUID().uuidString)")
         defer { try? fm.removeItem(at: tempDir) }
-        try? fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        process.arguments = ["-q", "-o", url.path, "session.json", "-d", tempDir.path]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        try? process.run()
-        process.waitUntilExit()
+        try? PlaybackFileManager.shared.unzipSelectedEntries(
+            archiveURL: url,
+            entryPatterns: ["session.json"],
+            toFolderURL: tempDir,
+            requiredRelativeFile: "session.json"
+        )
         guard let data = try? Data(contentsOf: tempDir.appendingPathComponent("session.json")) else { return nil }
         return try? JSONDecoder().decode(SessionPackageMetadata.self, from: data)
     }

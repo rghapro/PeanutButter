@@ -2100,7 +2100,7 @@ public struct SongMenuPopoverView: View {
             panel.allowedContentTypes = [songType]
         }
         let songTitle = targetSong.title.isEmpty ? "Untitled Song" : targetSong.title
-        panel.nameFieldStringValue = "\(songTitle).pbsong"
+        panel.nameFieldStringValue = LibraryBrowserManager.sanitizedPackageFilename(songTitle, ext: "pbsong")
         panel.message = "Export Song Package (.pbsong)"
         panel.prompt = "Export"
         

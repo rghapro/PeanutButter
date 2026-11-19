@@ -1577,7 +1577,7 @@ public struct SetlistMenuPopoverView: View {
             panel.allowedContentTypes = [sessionType]
         }
         let defaultName = engine.currentSetlist.name.isEmpty ? "Untitled Session" : engine.currentSetlist.name
-        panel.nameFieldStringValue = "\(defaultName).pbsession"
+        panel.nameFieldStringValue = LibraryBrowserManager.sanitizedPackageFilename(defaultName, ext: "pbsession")
         panel.message = "Save Playback Session File (.pbsession)"
         panel.prompt = "Save Session"
         

@@ -125,6 +125,34 @@ public final class StereoMeterModel: ObservableObject, @unchecked Sendable {
     }
 }
 
+/// Isolated ObservableObject for Channel Fader Cap Position so live fader drags and
+/// 60/120 Hz Fade Out / Fade In animations never invalidate the parent `ChannelStripView` body.
+public final class FaderDisplayModel: ObservableObject, @unchecked Sendable {
+    public private(set) var normalizedPosition: Float
+
+    public init(initial: Float = 0.80) {
+        self.normalizedPosition = max(0.0, min(1.0, initial))
+    }
+
+    public func update(_ newValue: Float, force: Bool = false) {
+        let clamped = max(0.0, min(1.0, newValue))
+        let changed = force
+            || abs(clamped - normalizedPosition) >= 0.0015
+            || (clamped == 0.0 && normalizedPosition != 0.0)
+            || (clamped == 1.0 && normalizedPosition != 1.0)
+        guard changed else { return }
+        if Thread.isMainThread {
+            objectWillChange.send()
+            normalizedPosition = clamped
+        } else {
+            normalizedPosition = clamped
+            DispatchQueue.main.async { [weak self] in
+                self?.objectWillChange.send()
+            }
+        }
+    }
+}
+
 /// Isolated ObservableObject for the smooth Transport Playhead Clock so playhead ticks
 /// only update the WaveformTimelineView scroll offset, never the 26+ Mixer Channel Strips!
 public final class TransportClockModel: ObservableObject, @unchecked Sendable {

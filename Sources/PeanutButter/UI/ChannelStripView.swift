@@ -102,6 +102,55 @@ public struct VUMeterBar: View {
     }
 }
 
+private struct TrackFaderCapView: View {
+    @ObservedObject var faderDisplay: FaderDisplayModel
+    let travel: CGFloat
+    let slotWidth: CGFloat
+    let capWidth: CGFloat
+    let capHeight: CGFloat
+    let isClick: Bool
+    let isEffectivelyDimmed: Bool
+    let isMapping: Bool
+    let onDoubleTapReset: () -> Void
+
+    var body: some View {
+        let currentY = (1.0 - CGFloat(faderDisplay.normalizedPosition)) * travel + (capHeight / 2)
+        ZStack {
+            RoundedRectangle(cornerRadius: 3)
+                .fill(
+                    LinearGradient(
+                        gradient: Gradient(colors: [
+                            Color(white: 0.32),
+                            Color(white: 0.20),
+                            Color(white: 0.14)
+                        ]),
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .frame(width: capWidth, height: capHeight)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 3)
+                        .stroke(Color(white: 0.38), lineWidth: 0.7)
+                )
+                .shadow(color: Color.black.opacity(0.7), radius: 3, x: 0, y: 2)
+
+            // Center Alignment Line (MultiTracks cyan line on Click fader, white on others; dims when muted)
+            Rectangle()
+                .fill(isClick ? Color(red: 0.25, green: 0.75, blue: 0.95) : Color.white)
+                .opacity(isEffectivelyDimmed ? 0.35 : 1.0)
+                .frame(width: capWidth - 6, height: 2)
+        }
+        .drawingGroup() // Cache fader cap gradient + shadow as a Metal GPU texture
+        .position(x: slotWidth / 2, y: currentY)
+        .onTapGesture(count: 2) {
+            if !isMapping {
+                onDoubleTapReset()
+            }
+        }
+    }
+}
+
 /// Authentic MultiTracks Playback channel strip matching the exact layout and sleek styling of Playback
 public struct ChannelStripView: View {
     @ObservedObject var track: StemTrack
@@ -245,7 +294,6 @@ public struct ChannelStripView: View {
             GeometryReader { faderGeo in
                 let slotHeight = faderGeo.size.height
                 let travel = max(10, slotHeight - capHeight)
-                let currentY = (1.0 - CGFloat(track.volume)) * travel + (capHeight / 2)
                 let slotWidth = capWidth + 18
                 
                 ZStack(alignment: .topTrailing) {
@@ -269,42 +317,22 @@ public struct ChannelStripView: View {
                         StereoVUMeterPairView(meter: track.meter, isMuted: track.isMuted || isBusMuted)
                             .frame(width: capWidth + 8, height: slotHeight)
                         
-                        // Tactile Fader Cap Positioned via Normalization
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 3)
-                                .fill(
-                                    LinearGradient(
-                                        gradient: Gradient(colors: [
-                                            Color(white: 0.32),
-                                            Color(white: 0.20),
-                                            Color(white: 0.14)
-                                        ]),
-                                        startPoint: .top,
-                                        endPoint: .bottom
-                                    )
-                                )
-                                .frame(width: capWidth, height: capHeight)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 3)
-                                        .stroke(Color(white: 0.38), lineWidth: 0.7)
-                                )
-                                .shadow(color: Color.black.opacity(0.7), radius: 3, x: 0, y: 2)
-                            
-                            // Center Alignment Line (MultiTracks cyan line on Click fader, white on others; dims when muted)
-                            Rectangle()
-                                .fill(isClick ? Color(red: 0.25, green: 0.75, blue: 0.95) : Color.white)
-                                .opacity(isEffectivelyDimmed ? 0.35 : 1.0)
-                                .frame(width: capWidth - 6, height: 2)
-                        }
-                        .drawingGroup() // Cache fader cap gradient + shadow as a Metal GPU texture
-                        .position(x: slotWidth / 2, y: currentY)
-                        .onTapGesture(count: 2) {
-                            if !isMapping {
+                        // Tactile Fader Cap Positioned via Isolated FaderDisplayModel
+                        TrackFaderCapView(
+                            faderDisplay: track.faderDisplay,
+                            travel: travel,
+                            slotWidth: slotWidth,
+                            capWidth: capWidth,
+                            capHeight: capHeight,
+                            isClick: isClick,
+                            isEffectivelyDimmed: isEffectivelyDimmed,
+                            isMapping: isMapping,
+                            onDoubleTapReset: {
                                 // Double-click resets to default level (100% or 0 dB)
                                 track.volume = engine.defaultChannelFaderLevel
                                 onParametersChanged()
                             }
-                        }
+                        )
                     }
                     .frame(width: slotWidth, height: slotHeight)
                     .position(x: faderGeo.size.width / 2, y: slotHeight / 2)
@@ -341,7 +369,7 @@ public struct ChannelStripView: View {
                                 } else {
                                     let clampedY = max(capHeight / 2, min(slotHeight - capHeight / 2, value.location.y))
                                     let norm = 1.0 - Float((clampedY - capHeight / 2) / travel)
-                                    track.volume = max(0.0, min(1.0, norm))
+                                    track.setLiveVolume(max(0.0, min(1.0, norm)), forceDisplay: true)
                                     engine.updateSingleTrackGain(track)
                                 }
                             }

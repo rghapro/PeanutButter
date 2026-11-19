@@ -369,6 +369,8 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     public var transitionType: SongTransitionType = .cueNextSong
     /// Whether ambient Pad playback should continue through this transition
     public var continuePad: Bool = false
+    /// Whether click and MIDI clock should continue running after this song ends
+    public var continueClick: Bool = false
     /// Whether the song should automatically fade out non-click/guide tracks over the final 5 seconds
     public var endFadeOutEnabled: Bool = false
     /// Whether the ambient Pad should automatically start when song playback begins
@@ -914,6 +916,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         proPresenterPlaylistItem: Int? = nil,
         transitionType: SongTransitionType = .cueNextSong,
         continuePad: Bool = false,
+        continueClick: Bool = false,
         endFadeOutEnabled: Bool = false,
         startPadWithSong: Bool = false,
         padPresetId: String? = nil,
@@ -968,6 +971,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.proPresenterPlaylistItem = proPresenterPlaylistItem
         self.transitionType = transitionType
         self.continuePad = continuePad
+        self.continueClick = continueClick
         self.endFadeOutEnabled = endFadeOutEnabled
         self.startPadWithSong = startPadWithSong
         self.padPresetId = padPresetId
@@ -999,7 +1003,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     }
     
     enum CodingKeys: String, CodingKey {
-        case id, title, artist, bpm, originalBPM, timeSignatureNumerator, timeSignatureDenominator, timeSignatureChanges, musicalKey, transposeSemitones, preserveVocalFormants, sections, defaultSections, savedArrangements, activeArrangementId, defaultMidiCues, defaultDirectionalCues, defaultAutomationPoints, defaultSmpteCue, stemURLs, beatGrid, midiCues, directionalCues, automationPoints, smpteCue, proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, endFadeOutEnabled, startPadWithSong, padPresetId, padIntroOutroOnly
+        case id, title, artist, bpm, originalBPM, timeSignatureNumerator, timeSignatureDenominator, timeSignatureChanges, musicalKey, transposeSemitones, preserveVocalFormants, sections, defaultSections, savedArrangements, activeArrangementId, defaultMidiCues, defaultDirectionalCues, defaultAutomationPoints, defaultSmpteCue, stemURLs, beatGrid, midiCues, directionalCues, automationPoints, smpteCue, proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, endFadeOutEnabled, startPadWithSong, padPresetId, padIntroOutroOnly
         case clickSource, guideSource, guideVoice, guideFallbackVoice, clickSound, usesDefaultClickSound, usesDefaultGuideVoice, clickAccentEnabled, clickQuarterEnabled, clickEighthEnabled, clickSixteenthEnabled, clickAccentVolume, clickQuarterVolume, clickEighthVolume, clickSixteenthVolume, guideCountInEnabled, speakDirectionalCuesOnUploadedGuide, autoInfiniteLoop, excludesClickAndGuide
     }
     
@@ -1035,6 +1039,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.proPresenterPlaylistItem = try container.decodeIfPresent(Int.self, forKey: .proPresenterPlaylistItem)
         self.transitionType = try container.decodeIfPresent(SongTransitionType.self, forKey: .transitionType) ?? .cueNextSong
         self.continuePad = try container.decodeIfPresent(Bool.self, forKey: .continuePad) ?? false
+        self.continueClick = try container.decodeIfPresent(Bool.self, forKey: .continueClick) ?? false
         self.endFadeOutEnabled = try container.decodeIfPresent(Bool.self, forKey: .endFadeOutEnabled) ?? false
         self.startPadWithSong = try container.decodeIfPresent(Bool.self, forKey: .startPadWithSong) ?? false
         self.padPresetId = try container.decodeIfPresent(String.self, forKey: .padPresetId)
@@ -1115,6 +1120,17 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     public var formattedDuration: String {
         let sec = Int(totalDuration)
         return String(format: "%d:%02d", sec / 60, sec % 60)
+    }
+
+    public func isContinueClickEffective(isLastSongInSetlist: Bool) -> Bool {
+        guard continueClick && !excludesClickAndGuide else { return false }
+        if isLastSongInSetlist { return true }
+        switch transitionType {
+        case .cueNextSong, .cueFirstSong, .stayInSong:
+            return true
+        case .autoLink, .overlap, .crossfade:
+            return false
+        }
     }
 }
 

@@ -333,7 +333,7 @@ public final class MIDICueEngine: ObservableObject, @unchecked Sendable {
         guard !bytes.isEmpty else { return }
         var packetList = MIDIPacketList()
         let packet = MIDIPacketListInit(&packetList)
-        _ = MIDIPacketListAdd(&packetList, 1024, packet, 0, bytes.count, bytes)
+        _ = MIDIPacketListAdd(&packetList, MemoryLayout<MIDIPacketList>.size, packet, 0, bytes.count, bytes)
         
         let sendToVirtual = (targetDestID == Self.allOutputsID || targetDestID == Self.virtualOnlyID)
         if sendToVirtual {
@@ -348,15 +348,8 @@ public final class MIDICueEngine: ObservableObject, @unchecked Sendable {
         guard outputPort != 0 else { return }
         
         if targetDestID == Self.allOutputsID {
-            let destCount = MIDIGetNumberOfDestinations()
-            for i in 0..<destCount {
-                let dest = MIDIGetDestination(i)
-                if dest != 0 {
-                    let destName = Self.endpointDisplayName(dest)
-                    if !destName.hasPrefix("PeanutButter") {
-                        MIDISend(outputPort, dest, &packetList)
-                    }
-                }
+            for dest in snapshotDestinations where !dest.isVirtual && dest.endpointRef != 0 {
+                MIDISend(outputPort, dest.endpointRef, &packetList)
             }
         } else if targetDestID != Self.virtualOnlyID {
             if let matched = snapshotDestinations.first(where: { $0.id == targetDestID }), matched.endpointRef != 0 {
@@ -431,6 +424,10 @@ public final class MIDICueEngine: ObservableObject, @unchecked Sendable {
             self?.clockBPM = clampedBPM
         }
     }
+
+    public func currentMIDIClockStatusForTesting() -> (isRunning: Bool, bpm: Double) {
+        clockQueue.sync { (isClockRunning, clockBPM) }
+    }
     
     /// Stops MIDI Clock transmission and sends `0xFC` (Stop) if currently running.
     public func stopMIDIClock() {
@@ -499,7 +496,7 @@ public final class MIDICueEngine: ObservableObject, @unchecked Sendable {
         guard !bytes.isEmpty, !clockTargetIDs.isEmpty else { return }
         var packetList = MIDIPacketList()
         let packet = MIDIPacketListInit(&packetList)
-        _ = MIDIPacketListAdd(&packetList, 1024, packet, timestamp, bytes.count, bytes)
+        _ = MIDIPacketListAdd(&packetList, MemoryLayout<MIDIPacketList>.size, packet, timestamp, bytes.count, bytes)
         
         if clockTargetIDs.contains(Self.virtualOnlyID), masterVirtualSource != 0 {
             MIDIReceived(masterVirtualSource, &packetList)

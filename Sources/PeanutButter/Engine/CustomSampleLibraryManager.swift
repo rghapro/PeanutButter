@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import Accelerate
 import AppKit
+import CryptoKit
 
 /// Metadata representing a user-uploaded custom click sample pack
 public struct CustomClickPack: Identifiable, Codable, Hashable, Sendable {
@@ -52,8 +53,10 @@ public struct CustomClickPack: Identifiable, Codable, Hashable, Sendable {
         case .sixteenth:
             candidate = sixteenthFile ?? eighthFile ?? quarterFile ?? accentFile
         }
-        guard let filename = candidate, !filename.isEmpty else { return nil }
-        let url = folderURL.appendingPathComponent(filename)
+        guard let filename = candidate, !filename.isEmpty,
+              let url = PlaybackFileManager.containedFileURL(baseDirectory: folderURL, relativePath: filename) else {
+            return nil
+        }
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 }
@@ -125,8 +128,10 @@ public struct CustomGuidePack: Identifiable, Codable, Hashable, Sendable {
     }
     
     public func fileURL(forNormalizedPhrase key: String) -> URL? {
-        guard let filename = phraseFiles[key], !filename.isEmpty else { return nil }
-        let url = folderURL.appendingPathComponent(filename)
+        guard let filename = phraseFiles[key], !filename.isEmpty,
+              let url = PlaybackFileManager.containedFileURL(baseDirectory: folderURL, relativePath: filename) else {
+            return nil
+        }
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
@@ -345,6 +350,22 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
     
     public let localClickSamplesDirectory: URL
     public let localGuideSamplesDirectory: URL
+    private let isIsolatedForTesting: Bool
+
+    internal init(isolatedRootDirectory: URL) {
+        self.localClickSamplesDirectory = isolatedRootDirectory.appendingPathComponent("ClickSamples", isDirectory: true)
+        self.localGuideSamplesDirectory = isolatedRootDirectory.appendingPathComponent("GuideSamples", isDirectory: true)
+        self.isIsolatedForTesting = true
+
+        try? FileManager.default.createDirectory(at: localClickSamplesDirectory, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: localGuideSamplesDirectory, withIntermediateDirectories: true)
+
+        self.defaultClickSoundRaw = ""
+        self.defaultGuideVoiceRaw = ""
+        self.defaultGuideFallbackVoiceRaw = GuideVoice.zoe.rawValue
+
+        refreshPacks()
+    }
     
     private init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -352,6 +373,7 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         let rootDir = appSupport.appendingPathComponent("PeanutButter", isDirectory: true)
         self.localClickSamplesDirectory = rootDir.appendingPathComponent("ClickSamples", isDirectory: true)
         self.localGuideSamplesDirectory = rootDir.appendingPathComponent("GuideSamples", isDirectory: true)
+        self.isIsolatedForTesting = false
         
         try? FileManager.default.createDirectory(at: localClickSamplesDirectory, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: localGuideSamplesDirectory, withIntermediateDirectories: true)
@@ -466,7 +488,7 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         var loadedGuides: [CustomGuidePack] = []
         
         loadedClicks.append(contentsOf: scanClickDirectory(localClickSamplesDirectory, isCloud: false))
-        if let cloudClicks = LibraryBrowserManager.cloudClicksDirectoryURL {
+        if !isIsolatedForTesting, let cloudClicks = LibraryBrowserManager.cloudClicksDirectoryURL {
             let existingIds = Set(loadedClicks.map { $0.id })
             for pack in scanClickDirectory(cloudClicks, isCloud: true) where !existingIds.contains(pack.id) {
                 loadedClicks.append(pack)
@@ -476,10 +498,12 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         
         loadedGuides.append(contentsOf: scanGuideDirectory(localGuideSamplesDirectory, isCloud: false, isBundled: false))
         var bundledDirs: [URL] = []
-        if let resURL = Bundle.main.resourceURL {
-            bundledDirs.append(resURL.appendingPathComponent("Audio/Guides", isDirectory: true))
+        if !isIsolatedForTesting {
+            if let resURL = Bundle.main.resourceURL {
+                bundledDirs.append(resURL.appendingPathComponent("Audio/Guides", isDirectory: true))
+            }
+            bundledDirs.append(URL(fileURLWithPath: "Sources/PeanutButter/Resources/Audio/Guides", isDirectory: true))
         }
-        bundledDirs.append(URL(fileURLWithPath: "Sources/PeanutButter/Resources/Audio/Guides", isDirectory: true))
         var bundledPackIds: Set<String> = []
         for bDir in bundledDirs {
             let bundledPacks = scanGuideDirectory(bDir, isCloud: false, isBundled: true)
@@ -494,7 +518,7 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         for i in 0..<loadedGuides.count where bundledPackIds.contains(loadedGuides[i].id) {
             loadedGuides[i].isBundled = true
         }
-        if let cloudGuides = LibraryBrowserManager.cloudGuidesDirectoryURL {
+        if !isIsolatedForTesting, let cloudGuides = LibraryBrowserManager.cloudGuidesDirectoryURL {
             let existingIds = Set(loadedGuides.map { $0.id })
             for pack in scanGuideDirectory(cloudGuides, isCloud: true, isBundled: false) where !existingIds.contains(pack.id) {
                 loadedGuides.append(pack)
@@ -503,8 +527,8 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         loadedGuides.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         
         lock.withLock {
-            clickPackIndex = Dictionary(uniqueKeysWithValues: loadedClicks.map { ($0.id, $0) })
-            guidePackIndex = Dictionary(uniqueKeysWithValues: loadedGuides.map { ($0.id, $0) })
+            clickPackIndex = Dictionary(loadedClicks.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            guidePackIndex = Dictionary(loadedGuides.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         }
         
         if Thread.isMainThread {
@@ -535,9 +559,13 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         ) else {
             return []
         }
-        
-        var packs: [CustomClickPack] = []
-        for dir in subdirs {
+
+        let sortedDirs = subdirs.sorted {
+            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        }
+
+        var candidates: [(pack: CustomClickPack, hasExplicitManifest: Bool)] = []
+        for dir in sortedDirs {
             let isDir = (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             guard isDir else { continue }
             
@@ -554,7 +582,7 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
                     sixteenthFile: manifest.sixteenthFile,
                     isCloud: isCloud
                 )
-                packs.append(pack)
+                candidates.append((pack, true))
             } else {
                 // Auto-detect files inside unmanaged directory (e.g. dropped directly into Cloud ClickSamples folder)
                 let files = audioFiles(in: dir)
@@ -571,10 +599,39 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
                     sixteenthFile: mapped[.sixteenth]?.lastPathComponent,
                     isCloud: isCloud
                 )
-                packs.append(pack)
+                candidates.append((pack, false))
             }
         }
-        return packs
+
+        var idCounts: [String: Int] = [:]
+        for item in candidates {
+            idCounts[item.pack.id, default: 0] += 1
+        }
+        var seenIds: Set<String> = []
+        return candidates.map { item in
+            let p = item.pack
+            var finalId = p.id
+            if idCounts[p.id, default: 0] > 1 {
+                if !item.hasExplicitManifest {
+                    finalId = "\(p.id)-\(Self.shortDeterministicHash(p.folderURL.lastPathComponent))"
+                }
+                if seenIds.contains(finalId) {
+                    finalId = "\(finalId)-\(Self.shortDeterministicHash(p.folderPath))"
+                }
+            }
+            seenIds.insert(finalId)
+            guard finalId != p.id else { return p }
+            return CustomClickPack(
+                id: finalId,
+                name: p.name,
+                folderPath: p.folderPath,
+                accentFile: p.accentFile,
+                quarterFile: p.quarterFile,
+                eighthFile: p.eighthFile,
+                sixteenthFile: p.sixteenthFile,
+                isCloud: p.isCloud
+            )
+        }
     }
     
     private func scanGuideDirectory(_ root: URL, isCloud: Bool, isBundled: Bool = false) -> [CustomGuidePack] {
@@ -586,9 +643,13 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         ) else {
             return []
         }
-        
-        var packs: [CustomGuidePack] = []
-        for dir in subdirs {
+
+        let sortedDirs = subdirs.sorted {
+            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        }
+
+        var candidates: [(pack: CustomGuidePack, hasExplicitManifest: Bool)] = []
+        for dir in sortedDirs {
             let isDir = (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             guard isDir else { continue }
             
@@ -605,7 +666,7 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
                     customCueKinds: manifest.customCueKinds ?? [:],
                     customCueLabels: manifest.customCueLabels ?? [:]
                 )
-                packs.append(pack)
+                candidates.append((pack, true))
             } else {
                 let files = audioFiles(in: dir)
                 guard !files.isEmpty else { continue }
@@ -633,10 +694,39 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
                     customCueKinds: customKinds,
                     customCueLabels: customLabels
                 )
-                packs.append(pack)
+                candidates.append((pack, false))
             }
         }
-        return packs
+
+        var idCounts: [String: Int] = [:]
+        for item in candidates {
+            idCounts[item.pack.id, default: 0] += 1
+        }
+        var seenIds: Set<String> = []
+        return candidates.map { item in
+            let p = item.pack
+            var finalId = p.id
+            if idCounts[p.id, default: 0] > 1 {
+                if !item.hasExplicitManifest {
+                    finalId = "\(p.id)-\(Self.shortDeterministicHash(p.folderURL.lastPathComponent))"
+                }
+                if seenIds.contains(finalId) {
+                    finalId = "\(finalId)-\(Self.shortDeterministicHash(p.folderPath))"
+                }
+            }
+            seenIds.insert(finalId)
+            guard finalId != p.id else { return p }
+            return CustomGuidePack(
+                id: finalId,
+                name: p.name,
+                folderPath: p.folderPath,
+                phraseFiles: p.phraseFiles,
+                isCloud: p.isCloud,
+                isBundled: p.isBundled,
+                customCueKinds: p.customCueKinds,
+                customCueLabels: p.customCueLabels
+            )
+        }
     }
     
     // MARK: - Click Pack CRUD & Import
@@ -723,8 +813,8 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         let fm = FileManager.default
         try? fm.createDirectory(at: pack.folderURL, withIntermediateDirectories: true)
         
-        if let oldFile = pack.assignedFile(for: subdivision) {
-            let oldURL = pack.folderURL.appendingPathComponent(oldFile)
+        if let oldFile = pack.assignedFile(for: subdivision),
+           let oldURL = PlaybackFileManager.containedFileURL(baseDirectory: pack.folderURL, relativePath: oldFile) {
             AudioSampleBank.shared.invalidateCachedBuffers(matchingPathPrefix: oldURL.path)
             try? fm.removeItem(at: oldURL)
         }
@@ -830,8 +920,8 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
             let key = detectGuidePhraseKey(fromFilename: srcURL.lastPathComponent)
             guard !key.isEmpty else { continue }
             
-            if let existing = pack.phraseFiles[key] {
-                let oldURL = pack.folderURL.appendingPathComponent(existing)
+            if let existing = pack.phraseFiles[key],
+               let oldURL = PlaybackFileManager.containedFileURL(baseDirectory: pack.folderURL, relativePath: existing) {
                 AudioSampleBank.shared.invalidateCachedBuffers(matchingPathPrefix: oldURL.path)
                 try? fm.removeItem(at: oldURL)
             }
@@ -876,8 +966,8 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         let fm = FileManager.default
         try? fm.createDirectory(at: pack.folderURL, withIntermediateDirectories: true)
         
-        if let existing = pack.phraseFiles[key] {
-            let oldURL = pack.folderURL.appendingPathComponent(existing)
+        if let existing = pack.phraseFiles[key],
+           let oldURL = PlaybackFileManager.containedFileURL(baseDirectory: pack.folderURL, relativePath: existing) {
             AudioSampleBank.shared.invalidateCachedBuffers(matchingPathPrefix: oldURL.path)
             try? fm.removeItem(at: oldURL)
         }
@@ -1294,6 +1384,11 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         }
     }
     
+    private static func shortDeterministicHash(_ raw: String) -> String {
+        let digest = SHA256.hash(data: Data(raw.utf8))
+        return digest.prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
+
     private func sanitizePackId(_ raw: String) -> String {
         let lowered = raw.lowercased()
         let allowed = CharacterSet.alphanumerics

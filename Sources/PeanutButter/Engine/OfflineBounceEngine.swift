@@ -350,7 +350,9 @@ public final class OfflineBounceEngine {
         let secPerBeat = (60.0 / max(20.0, song.bpm)) * (4.0 / Double(max(1, song.timeSignatureDenominator)))
         let blockSize = 64
 
-        for (track, buffer) in trackBuffers {
+        let bounceStereoFormat = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
+
+        for (track, rawBuffer) in trackBuffers {
             let baseGain = gainProvider(track)
             let isUtility = (track.role == .click || track.role == .guide)
             let isTimelineAligned = (track.role == .click && song.clickSource == .generated)
@@ -359,6 +361,13 @@ public final class OfflineBounceEngine {
                 $0.trackFaders[track.id] != nil || $0.trackPans[track.id] != nil || $0.trackMutes[track.id] != nil
             }
             if !hasTrackAutomation && baseGain <= 0.0001 { continue }
+
+            let buffer: AVAudioPCMBuffer
+            if abs(rawBuffer.format.sampleRate - sampleRate) > 0.5 {
+                buffer = PlaybackFileManager.normalizeBuffer(rawBuffer, to: bounceStereoFormat)
+            } else {
+                buffer = rawBuffer
+            }
             guard let channelData = buffer.floatChannelData else { continue }
 
             let bufRate = buffer.format.sampleRate
@@ -676,18 +685,34 @@ public final class OfflineBounceEngine {
         return lastActiveState
     }
 
-    private static func softLimitStereo(left: inout [Float], right: inout [Float]) {
-        var maxPeak: Float = 0
-        vDSP_maxmgv(left, 1, &maxPeak, vDSP_Length(left.count))
-        var maxRight: Float = 0
-        vDSP_maxmgv(right, 1, &maxRight, vDSP_Length(right.count))
-        maxPeak = max(maxPeak, maxRight)
+    internal static func softLimitStereo(left: inout [Float], right: inout [Float]) {
+        let softKnee: Float = 0.8912509 // -1.0 dBFS
+        let softHeadroom: Float = 1.0 - softKnee
 
-        if maxPeak > 0.98 {
-            var scale = 0.96 / maxPeak
-            vDSP_vsmul(left, 1, &scale, &left, 1, vDSP_Length(left.count))
-            vDSP_vsmul(right, 1, &scale, &right, 1, vDSP_Length(right.count))
+        func scrubAndLimitChannel(_ samples: inout [Float]) {
+            guard !samples.isEmpty else { return }
+            let n = samples.count
+            var sumCheck: Float = 0
+            var peakCheck: Float = 0
+            vDSP_sve(samples, 1, &sumCheck, vDSP_Length(n))
+            vDSP_maxmgv(samples, 1, &peakCheck, vDSP_Length(n))
+            if sumCheck.isFinite && peakCheck.isFinite && peakCheck <= softKnee {
+                return
+            }
+            for i in 0..<n {
+                let x = samples[i]
+                if !x.isFinite {
+                    samples[i] = 0.0
+                } else if x > softKnee {
+                    samples[i] = min(1.0, softKnee + softHeadroom * tanhf((x - softKnee) / softHeadroom))
+                } else if x < -softKnee {
+                    samples[i] = max(-1.0, -(softKnee + softHeadroom * tanhf((-x - softKnee) / softHeadroom)))
+                }
+            }
         }
+
+        scrubAndLimitChannel(&left)
+        scrubAndLimitChannel(&right)
     }
 
     private static func writeAudioFile(
@@ -766,15 +791,17 @@ public final class OfflineBounceEngine {
         let ffmpegPaths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
 
         let process = Process()
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        let errPipe = Pipe()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errPipe
 
         if let lamePath = lamePaths.first(where: { fm.isExecutableFile(atPath: $0) }) {
             process.executableURL = URL(fileURLWithPath: lamePath)
             process.arguments = ["-b", "256", "--quiet", wavURL.path, mp3URL.path]
         } else if let ffmpegPath = ffmpegPaths.first(where: { fm.isExecutableFile(atPath: $0) }) {
             process.executableURL = URL(fileURLWithPath: ffmpegPath)
-            process.arguments = ["-y", "-i", wavURL.path, "-codec:a", "libmp3lame", "-b:a", "256k", mp3URL.path]
+            process.arguments = ["-nostdin", "-nostats", "-loglevel", "error", "-y", "-i", wavURL.path, "-codec:a", "libmp3lame", "-b:a", "256k", mp3URL.path]
         } else {
             throw NSError(
                 domain: "OfflineBounceEngine",
@@ -783,15 +810,35 @@ public final class OfflineBounceEngine {
             )
         }
 
+        let errHolder = LockedDataBox()
+        let readGroup = DispatchGroup()
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+            errHolder.set(data)
+            readGroup.leave()
+        }
+
         try process.run()
         process.waitUntilExit()
+        readGroup.wait()
+
         if process.terminationStatus != 0 {
+            let errText = String(data: errHolder.get(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let detail = errText.isEmpty ? "" : " (\(errText))"
             throw NSError(
                 domain: "OfflineBounceEngine",
                 code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "MP3 encoder exited with status \(process.terminationStatus)."]
+                userInfo: [NSLocalizedDescriptionKey: "MP3 encoder exited with status \(process.terminationStatus)\(detail)."]
             )
         }
+    }
+
+    private final class LockedDataBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        func set(_ d: Data) { lock.lock(); data = d; lock.unlock() }
+        func get() -> Data { lock.lock(); defer { lock.unlock() }; return data }
     }
 
     private static func sanitizeFileComponent(_ name: String) -> String {

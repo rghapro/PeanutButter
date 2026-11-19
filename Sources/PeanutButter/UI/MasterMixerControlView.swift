@@ -8,6 +8,8 @@ public struct MasterMixerControlView: View {
     let onOpenBussesSheet: () -> Void
     let onTogglePadPlayer: () -> Void
     
+    @State private var dragMasterVolume: Float? = nil
+    
     private let capHeight: CGFloat = 34
     private let capWidth: CGFloat = 42
     
@@ -155,7 +157,8 @@ public struct MasterMixerControlView: View {
                 GeometryReader { faderGeo in
                     let slotHeight = faderGeo.size.height
                     let travel = max(10, slotHeight - capHeight)
-                    let currentY = (1.0 - CGFloat(engine.masterVolume)) * travel + (capHeight / 2)
+                    let displayedMasterVolume = dragMasterVolume ?? engine.masterVolume
+                    let currentY = (1.0 - CGFloat(displayedMasterVolume)) * travel + (capHeight / 2)
                     let slotWidth = capWidth + 18
                     let isMIDIMasterMapping = engine.isEditMIDIMappingMode
                     let isKeyboardMasterMapping = engine.isEditKeyboardMappingMode
@@ -180,6 +183,7 @@ public struct MasterMixerControlView: View {
                             
                             // Master dB Tick Marks (0 dB at 0.80)
                             masterTickMarksView(slotHeight: slotHeight)
+                                .drawingGroup()
                             
                             // Real Live Master Stereo VU Meters (isolated from MasterMixerControlView re-renders)
                             StereoVUMeterPairView(meter: engine.masterMeter)
@@ -210,9 +214,11 @@ public struct MasterMixerControlView: View {
                                     .fill(Color.white)
                                     .frame(width: capWidth - 6, height: 2)
                             }
+                            .drawingGroup()
                             .position(x: slotWidth / 2, y: currentY)
                             .onTapGesture(count: 2) {
                                 if !isMasterMapping {
+                                    dragMasterVolume = nil
                                     engine.masterVolume = 0.80 // 0 dB unity
                                 }
                             }
@@ -248,8 +254,17 @@ public struct MasterMixerControlView: View {
                                         }
                                     } else {
                                         let clampedY = max(capHeight / 2, min(slotHeight - capHeight / 2, value.location.y))
-                                        let norm = 1.0 - Float((clampedY - capHeight / 2) / travel)
-                                        engine.masterVolume = max(0.0, min(1.0, norm))
+                                        let norm = max(0.0, min(1.0, 1.0 - Float((clampedY - capHeight / 2) / travel)))
+                                        dragMasterVolume = norm
+                                        engine.applyInteractiveMasterVolume(norm)
+                                    }
+                                }
+                                .onEnded { _ in
+                                    if !isMasterMapping, let finalVol = dragMasterVolume {
+                                        dragMasterVolume = nil
+                                        engine.commitInteractiveMasterVolume(finalVol)
+                                    } else {
+                                        dragMasterVolume = nil
                                     }
                                 }
                         )

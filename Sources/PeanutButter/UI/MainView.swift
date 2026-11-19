@@ -740,37 +740,43 @@ public struct MainView: View {
                     .frame(maxWidth: .infinity, alignment: .center)
                 } else {
                     HStack(spacing: 9) {
-                        // RTZ (Return to Zero) - 130x67 box with outline |◁ icon
+                        // RTZ (Return to Zero) - 130x67 box with outline |◁ icon (or Stop square when Continue Click is active)
+                        let isStoppingPostClick = engine.isPostSongClickActive && engine.playbackState != .playing
+                        let rtzStroke = isStoppingPostClick ? Color(red: 0.25, green: 0.75, blue: 0.95) : Color(white: 0.55)
                         Button(action: {
                             engine.returnToZero()
                         }) {
                             Canvas { context, size in
-                                let strokeColor = Color(white: 0.55)
                                 let midY = size.height / 2
                                 let midX = size.width / 2
-                                
-                                // Left vertical bar
-                                let barRect = CGRect(x: midX - 9.3, y: midY - 9.3, width: 2.5, height: 18.7)
-                                context.stroke(Path(barRect), with: .color(strokeColor), lineWidth: 1.2)
-                                
-                                // Right left-pointing triangle
-                                var tri = Path()
-                                tri.move(to: CGPoint(x: midX - 3.3, y: midY))
-                                tri.addLine(to: CGPoint(x: midX + 9.3, y: midY - 9.3))
-                                tri.addLine(to: CGPoint(x: midX + 9.3, y: midY + 9.3))
-                                tri.closeSubpath()
-                                context.stroke(tri, with: .color(strokeColor), lineWidth: 1.3)
+                                if isStoppingPostClick {
+                                    let stopRect = CGRect(x: midX - 8.5, y: midY - 8.5, width: 17.0, height: 17.0)
+                                    let stopPath = Path(roundedRect: stopRect, cornerRadius: 2.0)
+                                    context.stroke(stopPath, with: .color(rtzStroke), lineWidth: 1.6)
+                                } else {
+                                    // Left vertical bar
+                                    let barRect = CGRect(x: midX - 9.3, y: midY - 9.3, width: 2.5, height: 18.7)
+                                    context.stroke(Path(barRect), with: .color(rtzStroke), lineWidth: 1.2)
+                                    
+                                    // Right left-pointing triangle
+                                    var tri = Path()
+                                    tri.move(to: CGPoint(x: midX - 3.3, y: midY))
+                                    tri.addLine(to: CGPoint(x: midX + 9.3, y: midY - 9.3))
+                                    tri.addLine(to: CGPoint(x: midX + 9.3, y: midY + 9.3))
+                                    tri.closeSubpath()
+                                    context.stroke(tri, with: .color(rtzStroke), lineWidth: 1.3)
+                                }
                             }
                             .frame(width: 130, height: 67)
                             .background(boxBackground)
                             .cornerRadius(4)
                             .overlay(
                                 RoundedRectangle(cornerRadius: 4)
-                                    .stroke(boxBorder, lineWidth: 1)
+                                    .stroke(isStoppingPostClick ? Color(red: 0.25, green: 0.75, blue: 0.95).opacity(0.65) : boxBorder, lineWidth: 1)
                             )
                         }
                         .buttonStyle(.plain)
-                        .help("Return to Zero (R)")
+                        .help(isStoppingPostClick ? "Stop Click (R)" : "Return to Zero (R)")
                         
                         // PLAY / PAUSE Button - 194x67 box with green outline triangle
                         Button(action: {
@@ -2159,21 +2165,61 @@ public struct MainView: View {
                                 .frame(width: max(0, leadingSpacer), height: badgeSize)
                             
                             let isContinuePad = song.continuePad
+                            let isContinueClick = song.continueClick
                             let greenColor = Color(red: 0.25, green: 0.88, blue: 0.45)
-                            
+                            let clickBlueColor = Color(red: 0.25, green: 0.75, blue: 0.95)
+                            let neutralFill = Color(red: 0.12, green: 0.13, blue: 0.15)
+                            let padFill = Color(red: 0.08, green: 0.20, blue: 0.12)
+                            let clickFill = Color(red: 0.08, green: 0.17, blue: 0.23)
+
                             Button(action: {
                                 activeTransitionSongIndex = index
                             }) {
                                 ZStack {
-                                    Circle()
-                                        .fill(isContinuePad ? Color(red: 0.08, green: 0.20, blue: 0.12) : Color(red: 0.12, green: 0.13, blue: 0.15))
-                                        .frame(width: badgeSize, height: badgeSize)
-                                    Circle()
-                                        .stroke(isContinuePad ? greenColor : Color.white.opacity(0.35), lineWidth: isContinuePad ? 1.8 : 1.0)
-                                        .frame(width: badgeSize, height: badgeSize)
-                                    Image(systemName: transitionIconName)
-                                        .font(.system(size: 13.5, weight: .bold))
-                                        .foregroundColor(isContinuePad ? greenColor : .white.opacity(0.95))
+                                    if isContinuePad && isContinueClick {
+                                        Circle()
+                                            .fill(
+                                                LinearGradient(
+                                                    colors: [padFill, clickFill],
+                                                    startPoint: .topLeading,
+                                                    endPoint: .bottomTrailing
+                                                )
+                                            )
+                                            .frame(width: badgeSize, height: badgeSize)
+                                        Circle()
+                                            .stroke(
+                                                LinearGradient(
+                                                    colors: [greenColor, clickBlueColor],
+                                                    startPoint: .topLeading,
+                                                    endPoint: .bottomTrailing
+                                                ),
+                                                lineWidth: 1.8
+                                            )
+                                            .frame(width: badgeSize, height: badgeSize)
+                                        Image(systemName: transitionIconName)
+                                            .font(.system(size: 13.5, weight: .bold))
+                                            .foregroundStyle(
+                                                LinearGradient(
+                                                    colors: [greenColor, clickBlueColor],
+                                                    startPoint: .topLeading,
+                                                    endPoint: .bottomTrailing
+                                                )
+                                            )
+                                    } else {
+                                        let badgeFill = isContinuePad ? padFill : (isContinueClick ? clickFill : neutralFill)
+                                        let badgeAccent = isContinuePad ? greenColor : (isContinueClick ? clickBlueColor : Color.white.opacity(0.35))
+                                        let iconTint = isContinuePad ? greenColor : (isContinueClick ? clickBlueColor : Color.white.opacity(0.95))
+                                        let isHighlighted = isContinuePad || isContinueClick
+                                        Circle()
+                                            .fill(badgeFill)
+                                            .frame(width: badgeSize, height: badgeSize)
+                                        Circle()
+                                            .stroke(badgeAccent, lineWidth: isHighlighted ? 1.8 : 1.0)
+                                            .frame(width: badgeSize, height: badgeSize)
+                                        Image(systemName: transitionIconName)
+                                            .font(.system(size: 13.5, weight: .bold))
+                                            .foregroundColor(iconTint)
+                                    }
                                 }
                                 .frame(width: badgeSize, height: badgeSize)
                                 .contentShape(Rectangle())
@@ -2686,7 +2732,7 @@ public struct MainView: View {
             panel.allowedContentTypes = [sessionType]
         }
         let defaultName = engine.currentSetlist.name.isEmpty ? "Untitled Session" : engine.currentSetlist.name
-        panel.nameFieldStringValue = "\(defaultName).pbsession"
+        panel.nameFieldStringValue = LibraryBrowserManager.sanitizedPackageFilename(defaultName, ext: "pbsession")
         panel.message = "Save Playback Session File (.pbsession)"
         panel.prompt = "Save Session"
         
@@ -2715,7 +2761,7 @@ public struct MainView: View {
         if let songType = UTType(filenameExtension: "pbsong") {
             panel.allowedContentTypes = [songType]
         }
-        panel.nameFieldStringValue = "\(engine.currentSong.title).pbsong"
+        panel.nameFieldStringValue = LibraryBrowserManager.sanitizedPackageFilename(engine.currentSong.title, ext: "pbsong")
         panel.message = "Export Song Package (.pbsong)"
         panel.prompt = "Export Song"
         

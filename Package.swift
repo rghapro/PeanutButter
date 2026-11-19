@@ -38,6 +38,11 @@ let package = Package(
             resources: [
                 .copy("Resources")
             ]
+        ),
+        .testTarget(
+            name: "PeanutButterTests",
+            dependencies: ["PeanutButter"],
+            path: "Tests/PeanutButterTests"
         )
     ],
     cxxLanguageStandard: .cxx17

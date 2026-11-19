@@ -3,6 +3,7 @@ import AVFoundation
 import Accelerate
 import AppKit
 import Darwin
+import zlib
 
 /// Serialized track metadata inside a .pbsong or .pbsession package
 public struct TrackFileMetadata: Codable, Sendable {
@@ -109,7 +110,7 @@ public struct TrackFileMetadata: Codable, Sendable {
 
 /// Metadata specification for a standalone song package (.pbsong or .multitrack)
 public struct SongPackageMetadata: Codable, Sendable {
-    public var version: Int = 2
+    public var version: Int = 3
     public var id: UUID
     public var title: String
     public var artist: String
@@ -139,6 +140,7 @@ public struct SongPackageMetadata: Codable, Sendable {
     public var proPresenterPlaylistItem: Int? = nil
     public var transitionType: SongTransitionType = .cueNextSong
     public var continuePad: Bool = false
+    public var continueClick: Bool = false
     public var endFadeOutEnabled: Bool = false
     public var startPadWithSong: Bool = false
     public var padPresetId: String? = nil
@@ -167,7 +169,7 @@ public struct SongPackageMetadata: Codable, Sendable {
     public var excludesClickAndGuide: Bool? = nil
     
     public init(
-        version: Int = 2,
+        version: Int = 3,
         id: UUID = UUID(),
         title: String,
         artist: String,
@@ -197,6 +199,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         proPresenterPlaylistItem: Int? = nil,
         transitionType: SongTransitionType = .cueNextSong,
         continuePad: Bool = false,
+        continueClick: Bool = false,
         endFadeOutEnabled: Bool = false,
         startPadWithSong: Bool = false,
         padPresetId: String? = nil,
@@ -252,6 +255,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.proPresenterPlaylistItem = proPresenterPlaylistItem
         self.transitionType = transitionType
         self.continuePad = continuePad
+        self.continueClick = continueClick
         self.endFadeOutEnabled = endFadeOutEnabled
         self.startPadWithSong = startPadWithSong
         self.padPresetId = padPresetId
@@ -283,7 +287,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         case musicalKey, transposeSemitones, preserveVocalFormants, sections, defaultSections, savedArrangements, activeArrangementId, tracks
         case beatGrid, timeSignatureChanges, midiCues, directionalCues, automationPoints, smpteCue
         case defaultMidiCues, defaultDirectionalCues, defaultAutomationPoints, defaultSmpteCue
-        case proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, endFadeOutEnabled, startPadWithSong, padPresetId, padIntroOutroOnly, artworkData
+        case proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, endFadeOutEnabled, startPadWithSong, padPresetId, padIntroOutroOnly, artworkData
         case clickSource, guideSource, guideVoice, guideFallbackVoice, clickSound, usesDefaultClickSound, usesDefaultGuideVoice
         case clickAccentEnabled, clickQuarterEnabled, clickEighthEnabled, clickSixteenthEnabled
         case clickAccentVolume, clickQuarterVolume, clickEighthVolume, clickSixteenthVolume
@@ -324,6 +328,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.proPresenterPlaylistItem = try container.decodeIfPresent(Int.self, forKey: .proPresenterPlaylistItem)
         self.transitionType = try container.decodeIfPresent(SongTransitionType.self, forKey: .transitionType) ?? .cueNextSong
         self.continuePad = try container.decodeIfPresent(Bool.self, forKey: .continuePad) ?? false
+        self.continueClick = try container.decodeIfPresent(Bool.self, forKey: .continueClick) ?? false
         self.endFadeOutEnabled = try container.decodeIfPresent(Bool.self, forKey: .endFadeOutEnabled) ?? false
         self.startPadWithSong = try container.decodeIfPresent(Bool.self, forKey: .startPadWithSong) ?? false
         self.padPresetId = try container.decodeIfPresent(String.self, forKey: .padPresetId)
@@ -353,7 +358,7 @@ public struct SongPackageMetadata: Codable, Sendable {
 
 /// Metadata specification for a complete session package (.pbsession) containing ordered songs
 public struct SessionPackageMetadata: Codable, Sendable {
-    public var version: Int = 2
+    public var version: Int = 3
     public var id: UUID
     public var name: String
     public var date: Date
@@ -368,7 +373,7 @@ public struct SessionPackageMetadata: Codable, Sendable {
     public var songEntries: [SongPackageMetadata]
     
     public init(
-        version: Int = 2,
+        version: Int = 3,
         id: UUID = UUID(),
         name: String = "Sunday Morning Set",
         date: Date = Date(),
@@ -395,6 +400,33 @@ public struct SessionPackageMetadata: Codable, Sendable {
         self.lastSavedRevisionId = lastSavedRevisionId
         self.lastSavedByDeviceId = lastSavedByDeviceId
         self.songEntries = songEntries
+    }
+}
+
+/// Security & validation errors raised while inspecting archives or package paths.
+public enum ArchiveSecurityError: LocalizedError, Equatable {
+    case invalidArchive
+    case unsafeEntryPath(String)
+    case symlinkEntry(String)
+    case tooManyEntries(Int)
+    case uncompressedSizeExceeded(UInt64)
+    case pathTraversal(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidArchive:
+            return "The archive is corrupted or not a valid zip package."
+        case .unsafeEntryPath(let path):
+            return "Rejected archive containing unsafe entry path: \(path)"
+        case .symlinkEntry(let path):
+            return "Rejected archive containing symbolic link entry: \(path)"
+        case .tooManyEntries(let count):
+            return "Rejected archive exceeding maximum entry limit (\(count))."
+        case .uncompressedSizeExceeded(let bytes):
+            return "Rejected archive exceeding maximum uncompressed size limit (\(bytes) bytes)."
+        case .pathTraversal(let path):
+            return "Rejected path escaping package directory: \(path)"
+        }
     }
 }
 
@@ -430,6 +462,85 @@ public final class PlaybackFileManager: @unchecked Sendable {
     private let cacheQueue = DispatchQueue(label: "com.peanutbutter.stemcache", qos: .utility, attributes: .concurrent)
     private let cacheLock = NSLock()
     private var inFlightCacheIds: Set<UUID> = []
+
+    private static let losslessAudioExtensions: Set<String> = ["wav", "wave", "aif", "aiff", "flac", "caf"]
+    private let localStemSourcesLock = NSLock()
+    private var localStemSourcesCache: [String: String]?
+    public var localStemSourcesFileURLOverride: URL?
+
+    private var activeLocalStemSourcesURL: URL {
+        if let override = localStemSourcesFileURLOverride {
+            return override
+        }
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("PeanutButter", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("local_stem_sources.json")
+    }
+
+    private func loadLocalStemSourcesMapLocked() -> [String: String] {
+        if let cached = localStemSourcesCache {
+            return cached
+        }
+        let url = activeLocalStemSourcesURL
+        if let data = try? Data(contentsOf: url),
+           let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
+            localStemSourcesCache = decoded
+            return decoded
+        }
+        localStemSourcesCache = [:]
+        return [:]
+    }
+
+    public func reloadLocalStemSourcesForTesting() {
+        localStemSourcesLock.lock()
+        localStemSourcesCache = nil
+        _ = loadLocalStemSourcesMapLocked()
+        localStemSourcesLock.unlock()
+    }
+
+    public func recordLocalLosslessSources(_ entries: [(UUID, URL?)]) {
+        guard !entries.isEmpty else { return }
+        let fm = FileManager.default
+        localStemSourcesLock.lock()
+        var map = loadLocalStemSourcesMapLocked()
+        var changed = false
+        for (trackId, candidateURL) in entries {
+            guard let url = candidateURL,
+                  url.isFileURL,
+                  Self.losslessAudioExtensions.contains(url.pathExtension.lowercased()),
+                  fm.fileExists(atPath: url.path) else {
+                continue
+            }
+            let path = url.standardizedFileURL.path
+            let key = trackId.uuidString
+            if map[key] != path {
+                map[key] = path
+                changed = true
+            }
+        }
+        if changed {
+            localStemSourcesCache = map
+            let dest = activeLocalStemSourcesURL
+            if let data = try? JSONEncoder().encode(map) {
+                try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? data.write(to: dest, options: .atomic)
+            }
+        }
+        localStemSourcesLock.unlock()
+    }
+
+    public func lookupLocalLosslessSourceURL(for trackId: UUID) -> URL? {
+        localStemSourcesLock.lock()
+        let map = loadLocalStemSourcesMapLocked()
+        let path = map[trackId.uuidString]
+        localStemSourcesLock.unlock()
+        guard let path, !path.isEmpty,
+              FileManager.default.fileExists(atPath: path) else {
+            return nil
+        }
+        return URL(fileURLWithPath: path)
+    }
     
     public var stemCacheDirectory: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -475,10 +586,306 @@ public final class PlaybackFileManager: @unchecked Sendable {
         return true
     }
     
-    /// Zero-copy APFS hardlink for purely local files, or data-only copy (with no hardlink or xattr carryover)
-    /// whenever either endpoint touches Cloud Storage (Google Drive, iCloud Drive, OneDrive, Dropbox).
-    /// macOS `fileproviderd` bounces multi-linked inodes (`st_nlink > 1`) to `<name> 2.m4a` and Google Drive
-    /// rejects files copied with stale `com.google.drivefs.item-id#S` extended attributes.
+    private static func allocateReplacementStagingDirectory(appropriateFor destinationDir: URL) throws -> URL {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: destinationDir.path) {
+            try fm.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+        }
+        if let replacementDir = try? fm.url(
+            for: .itemReplacementDirectory,
+            in: .userDomainMask,
+            appropriateFor: destinationDir,
+            create: true
+        ) {
+            return replacementDir
+        }
+        let fallbackDir = fm.temporaryDirectory.appendingPathComponent("pb_stage_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: fallbackDir, withIntermediateDirectories: true)
+        return fallbackDir
+    }
+
+    /// Commits a staged local file into `destinationURL` atomically using `FileManager.replaceItemAt`,
+    /// wrapping Cloud Storage destinations in `NSFileCoordinator(.forReplacing)` so cloud sync daemons
+    /// never observe partially written `.pb_tmp_*` files or split writes.
+    public func coordinatedReplaceFile(stagedFileURL: URL, destinationURL: URL) throws {
+        let fm = FileManager.default
+        let parentDir = destinationURL.deletingLastPathComponent()
+        if !fm.fileExists(atPath: parentDir.path) {
+            try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
+        }
+
+        func performReplace(at targetURL: URL) throws {
+            if fm.fileExists(atPath: targetURL.path) {
+                do {
+                    _ = try fm.replaceItemAt(
+                        targetURL,
+                        withItemAt: stagedFileURL,
+                        backupItemName: nil,
+                        options: [.usingNewMetadataOnly]
+                    )
+                    Self.stripCloudExtendedAttributes(at: targetURL)
+                    return
+                } catch {
+                    let nsErr = error as NSError
+                    let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError
+                    let isCrossDevice = (nsErr.domain == NSPOSIXErrorDomain && nsErr.code == Int(EXDEV))
+                        || (underlying?.domain == NSPOSIXErrorDomain && underlying?.code == Int(EXDEV))
+                    guard isCrossDevice else {
+                        throw error
+                    }
+                    try fm.removeItem(at: targetURL)
+                }
+            }
+
+            do {
+                try fm.moveItem(at: stagedFileURL, to: targetURL)
+                Self.stripCloudExtendedAttributes(at: targetURL)
+            } catch {
+                let rc = Darwin.copyfile(stagedFileURL.path, targetURL.path, nil, copyfile_flags_t(COPYFILE_DATA))
+                if rc != 0 {
+                    try fm.copyItem(at: stagedFileURL, to: targetURL)
+                }
+                Self.stripCloudExtendedAttributes(at: targetURL)
+                try? fm.removeItem(at: stagedFileURL)
+            }
+        }
+
+        if LibraryBrowserManager.isCloudStorageURL(destinationURL) {
+            var coordError: NSError?
+            var innerError: Error?
+            let coordinator = NSFileCoordinator(filePresenter: nil)
+            coordinator.coordinate(writingItemAt: destinationURL, options: .forReplacing, error: &coordError) { coordinatedURL in
+                do {
+                    try performReplace(at: coordinatedURL)
+                } catch {
+                    innerError = error
+                }
+            }
+            if let coordErr = coordError {
+                throw coordErr
+            }
+            if let inner = innerError {
+                throw inner
+            }
+        } else {
+            try performReplace(at: destinationURL)
+        }
+    }
+
+    /// Commits a staged package directory atomically into `destinationURL` via `replaceItemAt`,
+    /// preserving the prior package if replacement fails or runs inside a Cloud Storage folder.
+    public func coordinatedReplaceDirectory(stagedDirectoryURL: URL, destinationURL: URL) throws {
+        let fm = FileManager.default
+        let parentDir = destinationURL.deletingLastPathComponent()
+        if !fm.fileExists(atPath: parentDir.path) {
+            try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
+        }
+
+        func performReplace(at targetURL: URL) throws {
+            if fm.fileExists(atPath: targetURL.path) {
+                do {
+                    _ = try fm.replaceItemAt(
+                        targetURL,
+                        withItemAt: stagedDirectoryURL,
+                        backupItemName: nil,
+                        options: [.usingNewMetadataOnly]
+                    )
+                    return
+                } catch {
+                    let nsErr = error as NSError
+                    let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError
+                    let isCrossDevice = (nsErr.domain == NSPOSIXErrorDomain && nsErr.code == Int(EXDEV))
+                        || (underlying?.domain == NSPOSIXErrorDomain && underlying?.code == Int(EXDEV))
+                    guard isCrossDevice else {
+                        throw error
+                    }
+                    let backupURL = parentDir.appendingPathComponent(".pb_bak_\(UUID().uuidString)")
+                    try fm.moveItem(at: targetURL, to: backupURL)
+                    do {
+                        try fm.moveItem(at: stagedDirectoryURL, to: targetURL)
+                        try? fm.removeItem(at: backupURL)
+                    } catch {
+                        try? fm.moveItem(at: backupURL, to: targetURL)
+                        throw error
+                    }
+                    return
+                }
+            }
+            try fm.moveItem(at: stagedDirectoryURL, to: targetURL)
+        }
+
+        if LibraryBrowserManager.isCloudStorageURL(destinationURL) {
+            var coordError: NSError?
+            var innerError: Error?
+            let coordinator = NSFileCoordinator(filePresenter: nil)
+            coordinator.coordinate(writingItemAt: destinationURL, options: .forReplacing, error: &coordError) { coordinatedURL in
+                do {
+                    try performReplace(at: coordinatedURL)
+                } catch {
+                    innerError = error
+                }
+            }
+            if let coordErr = coordError { throw coordErr }
+            if let inner = innerError { throw inner }
+        } else {
+            try performReplace(at: destinationURL)
+        }
+    }
+
+    /// Writes `data` to an out-of-folder `itemReplacementDirectory` staging file and commits it
+    /// into `destinationURL` using `coordinatedReplaceFile`.
+    public func coordinatedWriteData(_ data: Data, to destinationURL: URL) throws {
+        let fm = FileManager.default
+        let stagingDir = try Self.allocateReplacementStagingDirectory(appropriateFor: destinationURL.deletingLastPathComponent())
+        defer { try? fm.removeItem(at: stagingDir) }
+
+        let stagedURL = stagingDir.appendingPathComponent(destinationURL.lastPathComponent)
+        try data.write(to: stagedURL, options: .atomic)
+        Self.stripCloudExtendedAttributes(at: stagedURL)
+        try coordinatedReplaceFile(stagedFileURL: stagedURL, destinationURL: destinationURL)
+    }
+
+    public static func encodeSongPeaksSidecar(_ peaksByTrackId: [UUID: [Float]]) -> Data {
+        let nonEmpty = peaksByTrackId
+            .filter { !$0.value.isEmpty }
+            .sorted { $0.key.uuidString < $1.key.uuidString }
+
+        var data = Data()
+        data.append(contentsOf: [0x50, 0x42, 0x50, 0x4B]) // "PBPK"
+
+        func appendUInt32LE(_ val: UInt32) {
+            var le = val.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+
+        appendUInt32LE(1) // sidecar format version 1
+        appendUInt32LE(UInt32(nonEmpty.count))
+
+        for (trackId, peaks) in nonEmpty {
+            var uuidBytes = trackId.uuid
+            withUnsafeBytes(of: &uuidBytes) { data.append(contentsOf: $0) }
+            appendUInt32LE(UInt32(peaks.count))
+            for sample in peaks {
+                appendUInt32LE(sample.bitPattern)
+            }
+        }
+        return data
+    }
+
+    public static func decodeSongPeaksSidecar(_ data: Data) -> [UUID: [Float]] {
+        guard data.count >= 12 else { return [:] }
+        let base = data.startIndex
+        guard data[base] == 0x50,
+              data[base + 1] == 0x42,
+              data[base + 2] == 0x50,
+              data[base + 3] == 0x4B else {
+            return [:]
+        }
+
+        let version = readUInt32LE(data, at: 4)
+        guard version == 1 else { return [:] }
+        let entryCount = Int(min(readUInt32LE(data, at: 8), 10_000))
+
+        var result: [UUID: [Float]] = [:]
+        result.reserveCapacity(entryCount)
+        var cursor = 12
+
+        for _ in 0..<entryCount {
+            guard cursor + 20 <= data.count else { break }
+            var rawUUID: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            _ = withUnsafeMutableBytes(of: &rawUUID) { dst in
+                data.copyBytes(to: dst, from: (base + cursor)..<(base + cursor + 16))
+            }
+            let trackId = UUID(uuid: rawUUID)
+            let floatCount = Int(readUInt32LE(data, at: cursor + 16))
+            cursor += 20
+
+            guard floatCount >= 0, floatCount <= 1_000_000 else { break }
+            let byteCount = floatCount * MemoryLayout<UInt32>.size
+            guard cursor + byteCount <= data.count else { break }
+
+            var peaks = [Float]()
+            peaks.reserveCapacity(floatCount)
+            for i in 0..<floatCount {
+                let bits = readUInt32LE(data, at: cursor + i * 4)
+                peaks.append(Float(bitPattern: bits))
+            }
+            cursor += byteCount
+            if !peaks.isEmpty {
+                result[trackId] = peaks
+            }
+        }
+        return result
+    }
+
+    public static func sessionSongFolderName(for songId: UUID, usedNames: inout Set<String>, fallbackIndex: Int) -> String {
+        let primary = songId.uuidString
+        if !usedNames.contains(primary) {
+            usedNames.insert(primary)
+            return primary
+        }
+        let disambiguated = "\(primary)_\(fallbackIndex)"
+        usedNames.insert(disambiguated)
+        return disambiguated
+    }
+
+    public static func resolveSessionSongDirectory(rootFolder: URL, songId: UUID, fallbackIndex: Int) -> URL {
+        let fm = FileManager.default
+        let uuidDir = rootFolder.appendingPathComponent("songs/\(songId.uuidString)", isDirectory: true)
+        if fm.fileExists(atPath: uuidDir.path) {
+            return uuidDir
+        }
+        let disambigDir = rootFolder.appendingPathComponent("songs/\(songId.uuidString)_\(fallbackIndex)", isDirectory: true)
+        if fm.fileExists(atPath: disambigDir.path) {
+            return disambigDir
+        }
+        return rootFolder.appendingPathComponent("songs/song_\(fallbackIndex)", isDirectory: true)
+    }
+
+    private func writePeaksSidecarIfNeeded(_ peaksByTrackId: [UUID: [Float]], to peaksURL: URL) {
+        let nonEmpty = peaksByTrackId.filter { !$0.value.isEmpty }
+        let fm = FileManager.default
+        if nonEmpty.isEmpty {
+            if fm.fileExists(atPath: peaksURL.path) {
+                try? fm.removeItem(at: peaksURL)
+            }
+            return
+        }
+        let newData = Self.encodeSongPeaksSidecar(nonEmpty)
+        if fm.fileExists(atPath: peaksURL.path),
+           let existing = try? Data(contentsOf: peaksURL),
+           existing == newData {
+            return
+        }
+        do {
+            try coordinatedWriteData(newData, to: peaksURL)
+        } catch {
+            PeanutButterLog.storage.error("Failed writing peaks.bin at \(peaksURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    public func loadPeaksSidecarMap(from directoryURL: URL, triggerDownload: Bool = false) -> [UUID: [Float]] {
+        let fm = FileManager.default
+        let peaksURL = directoryURL.appendingPathComponent("peaks.bin")
+        let placeholderURL = directoryURL.appendingPathComponent(".peaks.bin.icloud")
+        guard fm.fileExists(atPath: peaksURL.path) || fm.fileExists(atPath: placeholderURL.path) else {
+            return [:]
+        }
+        if !LibraryBrowserManager.checkIsDownloaded(at: peaksURL) {
+            if triggerDownload {
+                LibraryBrowserManager.ensureCloudItemDownloaded(at: peaksURL, timeout: 10.0)
+            } else {
+                LibraryBrowserManager.triggerCloudDownload(at: peaksURL)
+                return [:]
+            }
+        }
+        guard let data = try? Data(contentsOf: peaksURL) else { return [:] }
+        return Self.decodeSongPeaksSidecar(data)
+    }
+
+    /// Zero-copy APFS hardlink for purely local files, or data-only copy (staged outside synced
+    /// cloud folders via `itemReplacementDirectory` and committed with `NSFileCoordinator` +
+    /// `replaceItemAt`) whenever either endpoint touches Cloud Storage or carries cloud xattrs.
     public func linkOrCopyFile(from sourceURL: URL, to destinationURL: URL) throws {
         let fm = FileManager.default
         if sourceURL.standardizedFileURL == destinationURL.standardizedFileURL { return }
@@ -490,41 +897,34 @@ public final class PlaybackFileManager: @unchecked Sendable {
             LibraryBrowserManager.ensureCloudItemDownloaded(at: sourceURL, timeout: 120.0)
         }
 
-        try fm.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let destParent = destinationURL.deletingLastPathComponent()
+        try fm.createDirectory(at: destParent, withIntermediateDirectories: true)
+
+        let stagingDir = try Self.allocateReplacementStagingDirectory(appropriateFor: destParent)
+        defer { try? fm.removeItem(at: stagingDir) }
+        let stagedURL = stagingDir.appendingPathComponent(destinationURL.lastPathComponent)
 
         if srcIsCloud || dstIsCloud || Self.hasCloudExtendedAttributes(at: sourceURL) {
-            let tmpURL = destinationURL.deletingLastPathComponent()
-                .appendingPathComponent(".pb_tmp_\(UUID().uuidString)_\(destinationURL.lastPathComponent)")
-            defer {
-                if fm.fileExists(atPath: tmpURL.path) {
-                    try? fm.removeItem(at: tmpURL)
-                }
-            }
-            let rc = Darwin.copyfile(sourceURL.path, tmpURL.path, nil, copyfile_flags_t(COPYFILE_DATA))
+            let rc = Darwin.copyfile(sourceURL.path, stagedURL.path, nil, copyfile_flags_t(COPYFILE_DATA))
             if rc != 0 {
                 let data = try Data(contentsOf: sourceURL)
-                try data.write(to: tmpURL, options: .atomic)
+                try data.write(to: stagedURL, options: .atomic)
             }
-            Self.stripCloudExtendedAttributes(at: tmpURL)
-            if fm.fileExists(atPath: destinationURL.path) {
-                try? fm.removeItem(at: destinationURL)
-            }
-            try fm.moveItem(at: tmpURL, to: destinationURL)
+            Self.stripCloudExtendedAttributes(at: stagedURL)
+            try coordinatedReplaceFile(stagedFileURL: stagedURL, destinationURL: destinationURL)
             return
         }
 
-        if fm.fileExists(atPath: destinationURL.path) {
-            try? fm.removeItem(at: destinationURL)
-        }
         do {
-            try fm.linkItem(at: sourceURL, to: destinationURL)
+            try fm.linkItem(at: sourceURL, to: stagedURL)
         } catch {
-            let rc = Darwin.copyfile(sourceURL.path, destinationURL.path, nil, copyfile_flags_t(COPYFILE_DATA))
+            let rc = Darwin.copyfile(sourceURL.path, stagedURL.path, nil, copyfile_flags_t(COPYFILE_DATA))
             if rc != 0 {
-                try fm.copyItem(at: sourceURL, to: destinationURL)
-                Self.stripCloudExtendedAttributes(at: destinationURL)
+                try fm.copyItem(at: sourceURL, to: stagedURL)
+                Self.stripCloudExtendedAttributes(at: stagedURL)
             }
         }
+        try coordinatedReplaceFile(stagedFileURL: stagedURL, destinationURL: destinationURL)
     }
 
     private static func hasCloudExtendedAttributes(at url: URL) -> Bool {
@@ -792,38 +1192,45 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 LibraryBrowserManager.ensureCloudItemDownloaded(at: origURL, timeout: 120.0)
             }
             if fm.fileExists(atPath: origURL.path) {
+                try? fm.createDirectory(at: stemCacheDirectory, withIntermediateDirectories: true)
                 try? linkOrCopyFile(from: origURL, to: cacheURL)
                 try linkOrCopyFile(from: origURL, to: destinationStemURL)
                 return
             }
         }
         
-        // 3. Encode from RAM buffer into StemCache, then copy/link to destination
+        // 3. Encode from RAM buffer into the target staging directory, then populate StemCache best-effort
         if let buf = buffer, buf.frameLength > 100 {
-            let tmpCacheURL = stemCacheDirectory.appendingPathComponent("enc_\(UUID().uuidString).m4a")
-            defer { try? fm.removeItem(at: tmpCacheURL) }
-            try writeCompressedStem(buf, to: tmpCacheURL)
+            let destDir = destinationStemURL.deletingLastPathComponent()
+            try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+            let tmpDestURL = destDir.appendingPathComponent(".enc_\(UUID().uuidString).m4a")
+            defer { try? fm.removeItem(at: tmpDestURL) }
+            try writeCompressedStem(buf, to: tmpDestURL)
+            try linkOrCopyFile(from: tmpDestURL, to: destinationStemURL)
             if !hasValidCachedStem(for: track.id) {
-                try? linkOrCopyFile(from: tmpCacheURL, to: cacheURL)
+                try? fm.createDirectory(at: stemCacheDirectory, withIntermediateDirectories: true)
+                try? linkOrCopyFile(from: destinationStemURL, to: cacheURL)
             }
-            try linkOrCopyFile(from: tmpCacheURL, to: destinationStemURL)
             return
         }
         
-        // 4. Fallback: read from original non-M4A fileURL or sourceFileURL, encode to M4A
+        // 4. Fallback: read from original non-M4A fileURL or sourceFileURL, encode to M4A in target staging directory
         for origURL in candidateFileURLs {
             if LibraryBrowserManager.isCloudStorageURL(origURL) && !LibraryBrowserManager.checkIsDownloaded(at: origURL) {
                 LibraryBrowserManager.ensureCloudItemDownloaded(at: origURL, timeout: 120.0)
             }
             guard fm.fileExists(atPath: origURL.path) else { continue }
             if let fileBuf = try? readPCMBuffer(from: origURL), fileBuf.frameLength > 10 {
-                let tmpCacheURL = stemCacheDirectory.appendingPathComponent("enc_\(UUID().uuidString).m4a")
-                defer { try? fm.removeItem(at: tmpCacheURL) }
-                try writeCompressedStem(fileBuf, to: tmpCacheURL)
+                let destDir = destinationStemURL.deletingLastPathComponent()
+                try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+                let tmpDestURL = destDir.appendingPathComponent(".enc_\(UUID().uuidString).m4a")
+                defer { try? fm.removeItem(at: tmpDestURL) }
+                try writeCompressedStem(fileBuf, to: tmpDestURL)
+                try linkOrCopyFile(from: tmpDestURL, to: destinationStemURL)
                 if !hasValidCachedStem(for: track.id) {
-                    try? linkOrCopyFile(from: tmpCacheURL, to: cacheURL)
+                    try? fm.createDirectory(at: stemCacheDirectory, withIntermediateDirectories: true)
+                    try? linkOrCopyFile(from: destinationStemURL, to: cacheURL)
                 }
-                try linkOrCopyFile(from: tmpCacheURL, to: destinationStemURL)
                 return
             } else {
                 try linkOrCopyFile(from: origURL, to: destinationStemURL)
@@ -943,8 +1350,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     if !hasValidCachedStem(for: tm.id) {
                         try? linkOrCopyFile(from: loose, to: cached)
                     }
-                } else if let existByName = byName[tm.name.lowercased()] {
-                    let altStaged = stagingDir.appendingPathComponent(existByName)
+                } else if let existByName = byName[tm.name.lowercased()],
+                          let altStaged = Self.containedFileURL(baseDirectory: stagingDir, relativePath: existByName) {
                     if hasValidStemFile(at: altStaged) {
                         try? linkOrCopyFile(from: altStaged, to: stagedFile)
                     }
@@ -959,28 +1366,39 @@ public final class PlaybackFileManager: @unchecked Sendable {
         guard !byId.isEmpty else { return }
 
         let manifest = CloudStemPackManifest(songId: songId, byId: byId, byName: byName)
-        if let manifestData = try? JSONEncoder().encode(manifest) {
-            try? manifestData.write(to: stagingDir.appendingPathComponent("tracks.json"), options: .atomic)
-            try? manifestData.write(to: sidecarURL, options: .atomic)
-        }
+        guard let manifestData = try? JSONEncoder().encode(manifest) else { return }
+        try? manifestData.write(to: stagingDir.appendingPathComponent("tracks.json"), options: .atomic)
 
-        let tempZip = fm.temporaryDirectory.appendingPathComponent("pbstems_out_\(UUID().uuidString).pbstems")
+        let replacementDir = try? Self.allocateReplacementStagingDirectory(appropriateFor: cloudStemsDir)
+        defer {
+            if let dir = replacementDir {
+                try? fm.removeItem(at: dir)
+            }
+        }
+        let tempZip = (replacementDir ?? fm.temporaryDirectory)
+            .appendingPathComponent("pbstems_out_\(UUID().uuidString).pbstems")
         defer { try? fm.removeItem(at: tempZip) }
 
         let process = Process()
         process.currentDirectoryURL = stagingDir
         process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
         process.arguments = ["-0", "-r", "-q", tempZip.path, "."]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         try? process.run()
         process.waitUntilExit()
 
-        if fm.fileExists(atPath: tempZip.path) {
-            try? linkOrCopyFile(from: tempZip, to: packURL)
+        guard process.terminationStatus == 0, fm.fileExists(atPath: tempZip.path) else { return }
+
+        // Commit `.pbstems` pack FIRST via coordinated atomic replacement, then commit `.tracks.json` sidecar.
+        do {
+            try coordinatedReplaceFile(stagedFileURL: tempZip, destinationURL: packURL)
+            try coordinatedWriteData(manifestData, to: sidecarURL)
             if fm.fileExists(atPath: looseDir.path) {
                 try? fm.removeItem(at: looseDir)
             }
+        } catch {
+            PeanutButterLog.storage.error("Failed to commit coordinated cloud stem pack \(packURL.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -1060,8 +1478,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
                             // 2. Track-Name Fallback: if a track's UUID changed across imports, resolve by lowercased track name
                             if let manifest = manifest {
                                 for tm in songEntry.tracks where !tm.relativeAudioPath.isEmpty && !hasValidCachedStem(for: tm.id) {
-                                    if let matchedFileName = manifest.byId[tm.id.uuidString] ?? manifest.byName[tm.name.lowercased()] {
-                                        let srcFile = unpackDir.appendingPathComponent(matchedFileName)
+                                    if let matchedFileName = manifest.byId[tm.id.uuidString] ?? manifest.byName[tm.name.lowercased()],
+                                       let srcFile = Self.containedFileURL(baseDirectory: unpackDir, relativePath: matchedFileName) {
                                         if hasValidStemFile(at: srcFile) {
                                             try? linkOrCopyFile(from: srcFile, to: cachedStemURL(for: tm.id))
                                         }
@@ -1083,18 +1501,20 @@ public final class PlaybackFileManager: @unchecked Sendable {
         if relativePath.hasPrefix("cloudstems/") {
             let subPath = String(relativePath.dropFirst("cloudstems/".count))
             var candidates: [URL] = []
-            if let configured = LibraryBrowserManager.cloudStemsDirectoryURL {
-                candidates.append(configured.appendingPathComponent(subPath))
+            if let configured = LibraryBrowserManager.cloudStemsDirectoryURL,
+               let containedConfigured = Self.containedFileURL(baseDirectory: configured, relativePath: subPath) {
+                candidates.append(containedConfigured)
             }
             // Also resolve relative to `<CloudRoot>/{Songs|Setlists}/Package` -> `<CloudRoot>/Stems`
             let inferredStemsRoot = rootFolder
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .appendingPathComponent("Stems", isDirectory: true)
-            let inferredStems = inferredStemsRoot.appendingPathComponent(subPath)
-            if !candidates.contains(where: { $0.standardizedFileURL == inferredStems.standardizedFileURL }) {
+            if let inferredStems = Self.containedFileURL(baseDirectory: inferredStemsRoot, relativePath: subPath),
+               !candidates.contains(where: { $0.standardizedFileURL == inferredStems.standardizedFileURL }) {
                 candidates.append(inferredStems)
             }
+            guard !candidates.isEmpty else { return nil }
 
             // Fast non-blocking path for Stage 1 metadata loading on @MainActor
             if !triggerDownload {
@@ -1134,17 +1554,19 @@ public final class PlaybackFileManager: @unchecked Sendable {
             }
 
             // Cross-song-folder fallback: search `<CloudRoot>/Stems/*/<trackId>.m4a` if songId changed
-            let targetFileName = URL(fileURLWithPath: subPath).lastPathComponent
-            let stemsRoots = [LibraryBrowserManager.cloudStemsDirectoryURL, inferredStemsRoot].compactMap { $0 }
-            for stemsRoot in stemsRoots {
-                guard let songDirs = try? fm.contentsOfDirectory(at: stemsRoot, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { continue }
-                for sDir in songDirs {
-                    let altCandidate = sDir.appendingPathComponent(targetFileName)
-                    if fm.fileExists(atPath: altCandidate.path) {
-                        if !LibraryBrowserManager.checkIsDownloaded(at: altCandidate) {
-                            LibraryBrowserManager.ensureCloudItemDownloaded(at: altCandidate, timeout: 90.0)
+            if let targetFileName = subPath.split(separator: "/").last.map(String.init),
+               !targetFileName.isEmpty && targetFileName != "." && targetFileName != ".." {
+                let stemsRoots = [LibraryBrowserManager.cloudStemsDirectoryURL, inferredStemsRoot].compactMap { $0 }
+                for stemsRoot in stemsRoots {
+                    guard let songDirs = try? fm.contentsOfDirectory(at: stemsRoot, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { continue }
+                    for sDir in songDirs {
+                        if let altCandidate = Self.containedFileURL(baseDirectory: sDir, relativePath: targetFileName),
+                           fm.fileExists(atPath: altCandidate.path) {
+                            if !LibraryBrowserManager.checkIsDownloaded(at: altCandidate) {
+                                LibraryBrowserManager.ensureCloudItemDownloaded(at: altCandidate, timeout: 90.0)
+                            }
+                            return altCandidate
                         }
-                        return altCandidate
                     }
                 }
             }
@@ -1152,7 +1574,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
             return candidates.first
         }
 
-        let localURL = rootFolder.appendingPathComponent(relativePath)
+        guard let localURL = Self.containedFileURL(baseDirectory: rootFolder, relativePath: relativePath) else {
+            return nil
+        }
         if triggerDownload && !LibraryBrowserManager.checkIsDownloaded(at: localURL) {
             LibraryBrowserManager.ensureCloudItemDownloaded(at: localURL, timeout: 90.0)
         }
@@ -1167,7 +1591,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                existing == newData {
                 return
             }
-            try? newData.write(to: artURL, options: .atomic)
+            try? coordinatedWriteData(newData, to: artURL)
         } else if fm.fileExists(atPath: artURL.path) {
             try? fm.removeItem(at: artURL)
         }
@@ -1200,11 +1624,12 @@ public final class PlaybackFileManager: @unchecked Sendable {
         let isCloudDest = LibraryBrowserManager.isURLInCloudLibrary(destinationURL)
         let cloudStemsDir = isCloudDest ? LibraryBrowserManager.cloudStemsDirectoryURL : nil
 
-        let stagingDir = fm.temporaryDirectory.appendingPathComponent("pb_copy_dst_\(UUID().uuidString)")
+        let stagingRoot = try Self.allocateReplacementStagingDirectory(appropriateFor: destinationURL.deletingLastPathComponent())
+        let stagingDir = stagingRoot.appendingPathComponent(destinationURL.lastPathComponent, isDirectory: true)
         try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
         defer {
-            if fm.fileExists(atPath: stagingDir.path) {
-                try? fm.removeItem(at: stagingDir)
+            if fm.fileExists(atPath: stagingRoot.path) {
+                try? fm.removeItem(at: stagingRoot)
             }
         }
 
@@ -1215,6 +1640,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             let srcJSON = rootFolder.appendingPathComponent("song.json")
             var meta = try decoder.decode(SongPackageMetadata.self, from: try Data(contentsOf: srcJSON))
             _ = unpackCloudStemPackIfNeeded(for: meta, rootFolder: rootFolder)
+            let srcPeaks = loadPeaksSidecarMap(from: rootFolder, triggerDownload: true)
             let srcArt = rootFolder.appendingPathComponent("artwork.png")
             if fm.fileExists(atPath: srcArt.path) {
                 try? fm.copyItem(at: srcArt, to: stagingDir.appendingPathComponent("artwork.png"))
@@ -1225,7 +1651,12 @@ public final class PlaybackFileManager: @unchecked Sendable {
             }
 
             var updatedTracks: [TrackFileMetadata] = []
+            var copiedPeaksByTrackId: [UUID: [Float]] = [:]
             for var tm in meta.tracks {
+                let existingTrackPeaks = srcPeaks[tm.id] ?? TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
+                if !existingTrackPeaks.isEmpty {
+                    copiedPeaksByTrackId[tm.id] = existingTrackPeaks
+                }
                 let resolvedAudioURL: URL? = {
                     if hasValidCachedStem(for: tm.id) {
                         return cachedStemURL(for: tm.id)
@@ -1258,7 +1689,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                             relativeAudioPath: cloudStemRelativePath(songId: meta.id, trackId: tm.id),
                             volume: tm.volume, pan: tm.pan, isMuted: tm.isMuted, isSoloed: tm.isSoloed, isSoloSafe: tm.isSoloSafe,
                             routing: tm.routing, assignedBusName: tm.assignedBusName, includeInWaveform: tm.includeInWaveform,
-                            duration: tm.duration, waveformPeaksData: tm.waveformPeaksData,
+                            duration: tm.duration, waveformPeaksData: nil,
                             relativeTransposedAudioPath: nil, transposedSemitones: tm.transposedSemitones,
                             sourceFilePath: tm.sourceFilePath
                         )
@@ -1271,16 +1702,19 @@ public final class PlaybackFileManager: @unchecked Sendable {
                             relativeAudioPath: "stems/\(filename)",
                             volume: tm.volume, pan: tm.pan, isMuted: tm.isMuted, isSoloed: tm.isSoloed, isSoloSafe: tm.isSoloSafe,
                             routing: tm.routing, assignedBusName: tm.assignedBusName, includeInWaveform: tm.includeInWaveform,
-                            duration: tm.duration, waveformPeaksData: tm.waveformPeaksData,
+                            duration: tm.duration, waveformPeaksData: nil,
                             relativeTransposedAudioPath: nil, transposedSemitones: tm.transposedSemitones,
                             sourceFilePath: tm.sourceFilePath
                         )
                     }
+                } else {
+                    tm.waveformPeaksData = nil
                 }
                 updatedTracks.append(tm)
             }
 
             meta.tracks = updatedTracks
+            writePeaksSidecarIfNeeded(copiedPeaksByTrackId, to: stagingDir.appendingPathComponent("peaks.bin"))
             try encoder.encode(meta).write(to: stagingDir.appendingPathComponent("song.json"), options: .atomic)
             if let csDir = cloudStemsDir {
                 writeCloudStemPack(cloudStemsDir: csDir, songId: meta.id, tracks: updatedTracks)
@@ -1292,21 +1726,30 @@ public final class PlaybackFileManager: @unchecked Sendable {
             try fm.createDirectory(at: songsDir, withIntermediateDirectories: true)
 
             var updatedEntries: [SongPackageMetadata] = []
+            var usedDestSongFolders = Set<String>()
             for (songIndex, songEntry) in meta.songEntries.enumerated() {
                 _ = unpackCloudStemPackIfNeeded(for: songEntry, rootFolder: rootFolder)
-                let songSubDir = songsDir.appendingPathComponent("song_\(songIndex)", isDirectory: true)
+                let destFolderName = Self.sessionSongFolderName(for: songEntry.id, usedNames: &usedDestSongFolders, fallbackIndex: songIndex)
+                let songSubDir = songsDir.appendingPathComponent(destFolderName, isDirectory: true)
                 try fm.createDirectory(at: songSubDir, withIntermediateDirectories: true)
-                let srcArt = rootFolder.appendingPathComponent("songs/song_\(songIndex)/artwork.png")
+                let srcSongDir = Self.resolveSessionSongDirectory(rootFolder: rootFolder, songId: songEntry.id, fallbackIndex: songIndex)
+                let srcArt = srcSongDir.appendingPathComponent("artwork.png")
                 if fm.fileExists(atPath: srcArt.path) {
                     try? fm.copyItem(at: srcArt, to: songSubDir.appendingPathComponent("artwork.png"))
                 }
+                let srcPeaks = loadPeaksSidecarMap(from: srcSongDir, triggerDownload: true)
                 let stemsSubDir = songSubDir.appendingPathComponent("stems", isDirectory: true)
                 if cloudStemsDir == nil {
                     try fm.createDirectory(at: stemsSubDir, withIntermediateDirectories: true)
                 }
 
                 var updatedTracks: [TrackFileMetadata] = []
+                var copiedPeaksByTrackId: [UUID: [Float]] = [:]
                 for tm in songEntry.tracks {
+                    let existingTrackPeaks = srcPeaks[tm.id] ?? TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
+                    if !existingTrackPeaks.isEmpty {
+                        copiedPeaksByTrackId[tm.id] = existingTrackPeaks
+                    }
                     let resolvedAudioURL: URL? = {
                         if hasValidCachedStem(for: tm.id) {
                             return cachedStemURL(for: tm.id)
@@ -1339,7 +1782,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                                 relativeAudioPath: cloudStemRelativePath(songId: songEntry.id, trackId: tm.id),
                                 volume: tm.volume, pan: tm.pan, isMuted: tm.isMuted, isSoloed: tm.isSoloed, isSoloSafe: tm.isSoloSafe,
                                 routing: tm.routing, assignedBusName: tm.assignedBusName, includeInWaveform: tm.includeInWaveform,
-                                duration: tm.duration, waveformPeaksData: tm.waveformPeaksData,
+                                duration: tm.duration, waveformPeaksData: nil,
                                 relativeTransposedAudioPath: nil, transposedSemitones: tm.transposedSemitones,
                                 sourceFilePath: tm.sourceFilePath
                             ))
@@ -1349,19 +1792,22 @@ public final class PlaybackFileManager: @unchecked Sendable {
                             try linkOrCopyFile(from: srcAudio, to: dstStem)
                             updatedTracks.append(TrackFileMetadata(
                                 id: tm.id, name: tm.name, role: tm.role,
-                                relativeAudioPath: "songs/song_\(songIndex)/stems/\(filename)",
+                                relativeAudioPath: "songs/\(destFolderName)/stems/\(filename)",
                                 volume: tm.volume, pan: tm.pan, isMuted: tm.isMuted, isSoloed: tm.isSoloed, isSoloSafe: tm.isSoloSafe,
                                 routing: tm.routing, assignedBusName: tm.assignedBusName, includeInWaveform: tm.includeInWaveform,
-                                duration: tm.duration, waveformPeaksData: tm.waveformPeaksData,
+                                duration: tm.duration, waveformPeaksData: nil,
                                 relativeTransposedAudioPath: nil, transposedSemitones: tm.transposedSemitones,
                                 sourceFilePath: tm.sourceFilePath
                             ))
                         }
                     } else {
-                        updatedTracks.append(tm)
+                        var strippedTrack = tm
+                        strippedTrack.waveformPeaksData = nil
+                        updatedTracks.append(strippedTrack)
                     }
                 }
 
+                writePeaksSidecarIfNeeded(copiedPeaksByTrackId, to: songSubDir.appendingPathComponent("peaks.bin"))
                 var updatedEntry = songEntry
                 updatedEntry.tracks = updatedTracks
                 updatedEntries.append(updatedEntry)
@@ -1381,10 +1827,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             try encoder.encode(meta).write(to: stagingDir.appendingPathComponent("session.json"), options: .atomic)
         }
 
-        if fm.fileExists(atPath: destinationURL.path) {
-            try fm.removeItem(at: destinationURL)
-        }
-        try fm.moveItem(at: stagingDir, to: destinationURL)
+        try coordinatedReplaceDirectory(stagedDirectoryURL: stagingDir, destinationURL: destinationURL)
         if !isSong {
             LibraryBrowserManager.invalidateSetlistPackageCache(for: destinationURL)
         }
@@ -1410,19 +1853,31 @@ public final class PlaybackFileManager: @unchecked Sendable {
             fileManager.fileExists(atPath: destinationURL.path, isDirectory: &existingIsDir) &&
             existingIsDir.boolValue
 
-        let parentDir = asDirectoryPackage ? destinationURL.deletingLastPathComponent() : fileManager.temporaryDirectory
-        let tempDir = parentDir.appendingPathComponent("pbsong_export_\(UUID().uuidString)")
+        let stagingRoot: URL?
+        let tempDir: URL
         let targetRoot: URL
         if canUpdateInPlace {
+            stagingRoot = nil
+            tempDir = destinationURL
             targetRoot = destinationURL
+        } else if asDirectoryPackage {
+            let allocRoot = try Self.allocateReplacementStagingDirectory(appropriateFor: destinationURL.deletingLastPathComponent())
+            let dir = allocRoot.appendingPathComponent(destinationURL.lastPathComponent, isDirectory: true)
+            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+            stagingRoot = allocRoot
+            tempDir = dir
+            targetRoot = dir
         } else {
-            try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            targetRoot = tempDir
+            let dir = fileManager.temporaryDirectory.appendingPathComponent("pbsong_export_\(UUID().uuidString)")
+            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+            stagingRoot = dir
+            tempDir = dir
+            targetRoot = dir
         }
         
         defer {
-            if !canUpdateInPlace && fileManager.fileExists(atPath: tempDir.path) {
-                try? fileManager.removeItem(at: tempDir)
+            if let root = stagingRoot, fileManager.fileExists(atPath: root.path) {
+                try? fileManager.removeItem(at: root)
             }
         }
         
@@ -1439,23 +1894,45 @@ public final class PlaybackFileManager: @unchecked Sendable {
             metaBox.deallocate()
         }
         
-        let isTransposed = song.transposeSemitones != 0 && transposedBuffers != nil
-        
         let stemSongId = song.sourceSongId ?? song.id
 
-        // Safe-Save Guard: Read existing song.json (if updating an existing package) so an unhydrated
-        // track in RAM never overwrites a previously valid `relativeAudioPath` with `""`.
+        // Safe-Save Guard: Read existing song.json and peaks.bin (if updating an existing package)
+        // so an unhydrated track in RAM never overwrites valid metadata or peaks.
         var existingRelPathById: [UUID: String] = [:]
         var existingRelPathByName: [String: String] = [:]
+        var existingPeaksById: [UUID: [Float]] = loadPeaksSidecarMap(from: destinationURL, triggerDownload: false)
         let existingSongJSONURL = destinationURL.appendingPathComponent("song.json")
         if let oldData = try? Data(contentsOf: existingSongJSONURL),
            let oldMeta = try? JSONDecoder().decode(SongPackageMetadata.self, from: oldData) {
-            for ot in oldMeta.tracks where !ot.relativeAudioPath.isEmpty {
-                existingRelPathById[ot.id] = ot.relativeAudioPath
-                existingRelPathByName[ot.name.lowercased()] = ot.relativeAudioPath
+            for ot in oldMeta.tracks {
+                if !ot.relativeAudioPath.isEmpty {
+                    existingRelPathById[ot.id] = ot.relativeAudioPath
+                    existingRelPathByName[ot.name.lowercased()] = ot.relativeAudioPath
+                }
+                if existingPeaksById[ot.id] == nil {
+                    let legacyPeaks = TrackFileMetadata.decodePeaks(ot.waveformPeaksData)
+                    if !legacyPeaks.isEmpty {
+                        existingPeaksById[ot.id] = legacyPeaks
+                    }
+                }
             }
         }
+
+        let peaksBox = UnsafeMutableBufferPointer<[Float]?>.allocate(capacity: max(1, tracks.count))
+        peaksBox.initialize(repeating: nil)
+        defer {
+            peaksBox.deinitialize()
+            peaksBox.deallocate()
+        }
         
+        let exportErrorLock = NSLock()
+        var firstExportError: Error? = nil
+        func recordExportError(_ error: Error) {
+            exportErrorLock.lock()
+            if firstExportError == nil { firstExportError = error }
+            exportErrorLock.unlock()
+        }
+
         // Encode/link all stems concurrently across all CPU cores (skipping existing files on in-place/cloud updates)
         DispatchQueue.concurrentPerform(iterations: tracks.count) { idx in
             let track = tracks[idx]
@@ -1467,6 +1944,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 || (track.sourceFileURL != nil && fileManager.fileExists(atPath: track.sourceFileURL!.path))
             let shouldSkipAudioExport = (isGeneratedClick || isGeneratedGuide) && !hasBackingAudio
             let stemFileName = stemFileNames[idx]
+            let isUnhydratedPlaceholder = (buffers[track.id]?.frameLength ?? 0) <= 100
             
             var relativePath = ""
             if !shouldSkipAudioExport {
@@ -1479,12 +1957,14 @@ public final class PlaybackFileManager: @unchecked Sendable {
                         }
                         relativePath = self.cloudStemRelativePath(songId: stemSongId, trackId: track.id)
                     } catch {
-                        if let preserved = existingRelPathById[track.id] ?? existingRelPathByName[track.name.lowercased()] {
+                        if isUnhydratedPlaceholder,
+                           let preserved = existingRelPathById[track.id] ?? existingRelPathByName[track.name.lowercased()],
+                           !preserved.isEmpty {
                             relativePath = preserved
                         } else {
-                            relativePath = self.cloudStemRelativePath(songId: stemSongId, trackId: track.id)
+                            recordExportError(error)
                         }
-                        print("Failed to write cloud stem \(track.name) (preserved \(relativePath)): \(error)")
+                        PeanutButterLog.storage.error("Failed to write cloud stem \(track.name, privacy: .public) (preserved \(relativePath, privacy: .public)): \(error.localizedDescription, privacy: .public)")
                     }
                 } else {
                     let stemURL = stemsDir.appendingPathComponent(stemFileName)
@@ -1494,23 +1974,30 @@ public final class PlaybackFileManager: @unchecked Sendable {
                         }
                         relativePath = "stems/\(stemFileName)"
                     } catch {
-                        if let preserved = existingRelPathById[track.id] ?? existingRelPathByName[track.name.lowercased()] {
+                        if canUpdateInPlace,
+                           isUnhydratedPlaceholder,
+                           let preserved = existingRelPathById[track.id] ?? existingRelPathByName[track.name.lowercased()],
+                           let oldLocal = Self.containedFileURL(baseDirectory: destinationURL, relativePath: preserved),
+                           fileManager.fileExists(atPath: oldLocal.path) {
                             relativePath = preserved
+                        } else {
+                            recordExportError(error)
                         }
-                        print("Failed to write stem \(track.name): \(error)")
+                        PeanutButterLog.storage.error("Failed to write stem \(track.name, privacy: .public): \(error.localizedDescription, privacy: .public)")
                     }
                 }
             }
             
-            let isClickOrGuide = track.role == .click || track.role == .guide ||
-                track.assignedBusName.lowercased() == "click" || track.assignedBusName.lowercased() == "guide" ||
-                track.name.lowercased().contains("click") || track.name.lowercased().contains("guide")
-            
             let relTransPath: String? = nil
             
             var peaks = track.waveformPeaks
-            if peaks.isEmpty && track.includeInWaveform, let buf = buffers[track.id] {
+            if peaks.isEmpty, let preservedPeaks = existingPeaksById[track.id] {
+                peaks = preservedPeaks
+            } else if peaks.isEmpty && track.includeInWaveform, let buf = buffers[track.id], buf.frameLength > 100 {
                 peaks = Self.extractPeaks(from: buf, samplesCount: 4000)
+            }
+            if !peaks.isEmpty {
+                peaksBox[idx] = peaks
             }
             
             metaBox[idx] = TrackFileMetadata(
@@ -1527,7 +2014,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 assignedBusName: track.assignedBusName,
                 includeInWaveform: track.includeInWaveform,
                 duration: track.duration > 0 ? track.duration : nil,
-                waveformPeaksData: TrackFileMetadata.encodePeaks(peaks),
+                waveformPeaksData: nil,
                 relativeTransposedAudioPath: relTransPath,
                 transposedSemitones: (relTransPath != nil) ? song.transposeSemitones : nil,
                 sourceFilePath: (track.sourceFileURL ?? track.fileURL)?.path
@@ -1535,6 +2022,15 @@ public final class PlaybackFileManager: @unchecked Sendable {
         }
         
         let trackEntries = (0..<tracks.count).compactMap { metaBox[$0] }
+        if let err = firstExportError {
+            throw err
+        }
+        var peaksByTrackId: [UUID: [Float]] = [:]
+        for idx in 0..<tracks.count {
+            if let p = peaksBox[idx], !p.isEmpty {
+                peaksByTrackId[tracks[idx].id] = p
+            }
+        }
         
         if let csDir = cloudStemsDir {
             writeCloudStemPack(cloudStemsDir: csDir, songId: stemSongId, tracks: trackEntries)
@@ -1556,21 +2052,24 @@ public final class PlaybackFileManager: @unchecked Sendable {
         }
         
         writeArtworkIfNeeded(song.artworkData, to: targetRoot.appendingPathComponent("artwork.png"))
+        writePeaksSidecarIfNeeded(peaksByTrackId, to: targetRoot.appendingPathComponent("peaks.bin"))
         
         let songMeta = makeSongPackageMetadata(song: song, tracks: trackEntries, embedArtworkInJSON: false)
         
         let encoder = JSONEncoder()
         let metaData = try encoder.encode(songMeta)
-        try metaData.write(to: targetRoot.appendingPathComponent("song.json"), options: .atomic)
+        try coordinatedWriteData(metaData, to: targetRoot.appendingPathComponent("song.json"))
+        recordLocalLosslessSources(tracks.map { ($0.id, $0.sourceFileURL ?? $0.fileURL) })
         
         if !canUpdateInPlace {
-            if fileManager.fileExists(atPath: destinationURL.path) {
-                try fileManager.removeItem(at: destinationURL)
-            }
             if asDirectoryPackage {
-                try fileManager.moveItem(at: tempDir, to: destinationURL)
+                try coordinatedReplaceDirectory(stagedDirectoryURL: tempDir, destinationURL: destinationURL)
             } else {
-                try zipFolder(folderURL: tempDir, toArchiveURL: destinationURL)
+                let archiveStageDir = try Self.allocateReplacementStagingDirectory(appropriateFor: destinationURL.deletingLastPathComponent())
+                defer { try? fileManager.removeItem(at: archiveStageDir) }
+                let stagedZip = archiveStageDir.appendingPathComponent(destinationURL.lastPathComponent)
+                try zipFolder(folderURL: tempDir, toArchiveURL: stagedZip)
+                try coordinatedReplaceFile(stagedFileURL: stagedZip, destinationURL: destinationURL)
             }
         }
     }
@@ -1618,11 +2117,13 @@ public final class PlaybackFileManager: @unchecked Sendable {
             }
         }
         
+        let sidecarPeaks = loadPeaksSidecarMap(from: folderURL, triggerDownload: true)
         return decodeSongEntry(
             songEntry: songMeta,
             rootFolder: folderURL,
             artworkOverride: loadedArtwork,
-            canonicalFormat: canonicalFormat
+            canonicalFormat: canonicalFormat,
+            preloadedPeaksByTrackId: sidecarPeaks
         )
     }
 
@@ -1684,15 +2185,17 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 LibraryBrowserManager.ensureCloudItemDownloaded(at: sourceURL)
             }
             let tempDir = fm.temporaryDirectory.appendingPathComponent("pbsong_meta_\(UUID().uuidString)")
-            try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
-
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-            process.arguments = ["-qq", "-o", sourceURL.path, "song.json", "artwork.png", "-d", tempDir.path]
-            process.standardOutput = Pipe()
-            process.standardError = Pipe()
-            try process.run()
-            process.waitUntilExit()
+            do {
+                try unzipSelectedEntries(
+                    archiveURL: sourceURL,
+                    entryPatterns: ["song.json", "artwork.png", "peaks.bin"],
+                    toFolderURL: tempDir,
+                    requiredRelativeFile: "song.json"
+                )
+            } catch {
+                try? fm.removeItem(at: tempDir)
+                throw NSError(domain: "PlaybackFileManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "Corrupted song package: missing song.json (\(error.localizedDescription))"])
+            }
 
             let metaURL = tempDir.appendingPathComponent("song.json")
             guard fm.fileExists(atPath: metaURL.path) else {
@@ -1721,6 +2224,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
         let resolvedClickSource: ClickSource = hasUploadedClickFile ? (songMeta.clickSource ?? .uploaded) : .generated
         let resolvedGuideSource: GuideSource = hasUploadedGuideFile ? (songMeta.guideSource ?? .uploaded) : .generated
 
+        let sidecarPeaks = loadPeaksSidecarMap(from: rootFolder, triggerDownload: true)
+
         let stubFmt = canonicalFormat ?? AVAudioFormat(standardFormatWithSampleRate: 48000.0, channels: 2)!
         var stubTracks: [(StemTrack, AVAudioPCMBuffer)] = []
         stubTracks.reserveCapacity(songMeta.tracks.count)
@@ -1741,7 +2246,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 name: tm.name,
                 role: tm.role,
                 fileURL: resolvedURL,
-                sourceFileURL: tm.sourceFilePath.map { URL(fileURLWithPath: $0) } ?? resolvedURL,
+                sourceFileURL: tm.sourceFilePath.map { URL(fileURLWithPath: $0) }
+                    ?? self.lookupLocalLosslessSourceURL(for: tm.id)
+                    ?? resolvedURL,
                 volume: tm.volume,
                 pan: tm.pan,
                 isMuted: tm.isMuted,
@@ -1752,7 +2259,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 includeInWaveform: tm.includeInWaveform
             )
             stemTrack.duration = tm.duration ?? 0.0
-            stemTrack.waveformPeaks = TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
+            stemTrack.waveformPeaks = sidecarPeaks[tm.id] ?? TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
             stubTracks.append((stemTrack, tinyBuf))
         }
 
@@ -1798,36 +2305,64 @@ public final class PlaybackFileManager: @unchecked Sendable {
             fileManager.fileExists(atPath: destinationURL.path, isDirectory: &existingIsDir) &&
             existingIsDir.boolValue
 
-        let parentDir = asDirectoryPackage ? destinationURL.deletingLastPathComponent() : fileManager.temporaryDirectory
-        let stagingDir = parentDir.appendingPathComponent("pbsession_export_\(UUID().uuidString)")
+        let stagingRoot: URL?
+        let stagingDir: URL
         let targetRoot: URL
         if canUpdateInPlace {
+            stagingRoot = nil
+            stagingDir = destinationURL
             targetRoot = destinationURL
+        } else if asDirectoryPackage {
+            let allocRoot = try Self.allocateReplacementStagingDirectory(appropriateFor: destinationURL.deletingLastPathComponent())
+            let dir = allocRoot.appendingPathComponent(destinationURL.lastPathComponent, isDirectory: true)
+            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+            stagingRoot = allocRoot
+            stagingDir = dir
+            targetRoot = dir
         } else {
-            try fileManager.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-            targetRoot = stagingDir
+            let dir = fileManager.temporaryDirectory.appendingPathComponent("pbsession_export_\(UUID().uuidString)")
+            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+            stagingRoot = dir
+            stagingDir = dir
+            targetRoot = dir
         }
         
         defer {
-            if !canUpdateInPlace && fileManager.fileExists(atPath: stagingDir.path) {
-                try? fileManager.removeItem(at: stagingDir)
+            if let root = stagingRoot, fileManager.fileExists(atPath: root.path) {
+                try? fileManager.removeItem(at: root)
             }
         }
         
         let songsDir = targetRoot.appendingPathComponent("songs")
         try fileManager.createDirectory(at: songsDir, withIntermediateDirectories: true)
 
-        // Safe-Save Guard: Read existing session.json (if updating an existing session) so unhydrated
-        // tracks in RAM never overwrite a previously valid `relativeAudioPath` with `""`.
+        // Safe-Save Guard: Read existing session.json and peaks (if updating an existing session)
+        // so unhydrated tracks in RAM never lose previously valid `relativeAudioPath` or `peaks.bin` entries.
         var existingRelPathByTrackId: [UUID: String] = [:]
         var existingRelPathBySongAndName: [String: String] = [:]
+        var existingPeaksByTrackId: [UUID: [Float]] = [:]
         let existingSessionJSONURL = destinationURL.appendingPathComponent("session.json")
         if let oldData = try? Data(contentsOf: existingSessionJSONURL),
            let oldSession = try? JSONDecoder().decode(SessionPackageMetadata.self, from: oldData) {
-            for oldSong in oldSession.songEntries {
-                for ot in oldSong.tracks where !ot.relativeAudioPath.isEmpty {
-                    existingRelPathByTrackId[ot.id] = ot.relativeAudioPath
-                    existingRelPathBySongAndName["\(oldSong.id.uuidString)::\(ot.name.lowercased())"] = ot.relativeAudioPath
+            for (oldIdx, oldSong) in oldSession.songEntries.enumerated() {
+                if canUpdateInPlace {
+                    let oldSongDir = Self.resolveSessionSongDirectory(rootFolder: destinationURL, songId: oldSong.id, fallbackIndex: oldIdx)
+                    let oldSidecarPeaks = loadPeaksSidecarMap(from: oldSongDir, triggerDownload: false)
+                    for (tid, p) in oldSidecarPeaks where !p.isEmpty {
+                        existingPeaksByTrackId[tid] = p
+                    }
+                }
+                for ot in oldSong.tracks {
+                    if !ot.relativeAudioPath.isEmpty {
+                        existingRelPathByTrackId[ot.id] = ot.relativeAudioPath
+                        existingRelPathBySongAndName["\(oldSong.id.uuidString)::\(ot.name.lowercased())"] = ot.relativeAudioPath
+                    }
+                    if existingPeaksByTrackId[ot.id] == nil {
+                        let legacyPeaks = TrackFileMetadata.decodePeaks(ot.waveformPeaksData)
+                        if !legacyPeaks.isEmpty {
+                            existingPeaksByTrackId[ot.id] = legacyPeaks
+                        }
+                    }
                 }
             }
         }
@@ -1843,14 +2378,17 @@ public final class PlaybackFileManager: @unchecked Sendable {
             let stemFileName: String
             let stemURL: URL
             let relativePath: String
-            let sharedRelativeAudioPath: String?
+            let primaryJobIndex: Int?
             let relativeTransposedPath: String?
             let transposedURL: URL?
         }
         
         var jobs: [StemExportJob] = []
         var songTrackCounts: [Int] = []
-        var seenBufferRelativePaths: [ObjectIdentifier: String] = [:]
+        var songFolderNames: [String] = []
+        var songSubDirs: [URL] = []
+        var usedSongFolders = Set<String>()
+        var seenBufferPrimaryJobIndex: [ObjectIdentifier: Int] = [:]
         var packedCloudTrackIdsBySong: [UUID: Set<String>] = [:]
         if let csDir = cloudStemsDir {
             for songData in allSongsData {
@@ -1870,12 +2408,15 @@ public final class PlaybackFileManager: @unchecked Sendable {
         }
         
         for (songIndex, songData) in allSongsData.enumerated() {
-            let songSubDir = songsDir.appendingPathComponent("song_\(songIndex)")
+            let songFolderName = Self.sessionSongFolderName(for: songData.song.id, usedNames: &usedSongFolders, fallbackIndex: songIndex)
+            let songSubDir = songsDir.appendingPathComponent(songFolderName)
             let stemsSubDir = songSubDir.appendingPathComponent("stems")
             try fileManager.createDirectory(at: songSubDir, withIntermediateDirectories: true)
             if cloudStemsDir == nil {
                 try fileManager.createDirectory(at: stemsSubDir, withIntermediateDirectories: true)
             }
+            songFolderNames.append(songFolderName)
+            songSubDirs.append(songSubDir)
             
             writeArtworkIfNeeded(songData.song.artworkData, to: songSubDir.appendingPathComponent("artwork.png"))
             
@@ -1892,7 +2433,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     relativePath = self.cloudStemRelativePath(songId: stemSongId, trackId: track.id)
                 } else {
                     stemURL = stemsSubDir.appendingPathComponent(stemFileName)
-                    relativePath = "songs/song_\(songIndex)/stems/\(stemFileName)"
+                    relativePath = "songs/\(songFolderName)/stems/\(stemFileName)"
                 }
 
                 let cat = StemCategory.category(for: track.name, role: track.role)
@@ -1903,14 +2444,15 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     || (track.sourceFileURL != nil && fileManager.fileExists(atPath: track.sourceFileURL!.path))
                 let shouldSkipAudioExport = (isGeneratedClick || isGeneratedGuide) && !hasBackingAudio
                 let buf = songData.buffers[track.id]
-                var sharedRelPath: String? = nil
-                // Only deduplicate identical in-RAM buffers for local embedded packages when buffer is hydrated (> 100 frames)
+                let currentJobIndex = jobs.count
+                var primaryJobIdx: Int? = nil
+                // Deduplicate encoding of identical in-RAM buffers for local embedded packages when buffer is hydrated (> 100 frames)
                 if !shouldSkipAudioExport, cloudStemsDir == nil, let b = buf, b.frameLength > 100 {
                     let bufKey = ObjectIdentifier(b)
-                    if let existingPath = seenBufferRelativePaths[bufKey] {
-                        sharedRelPath = existingPath
+                    if let existingJobIdx = seenBufferPrimaryJobIndex[bufKey] {
+                        primaryJobIdx = existingJobIdx
                     } else {
-                        seenBufferRelativePaths[bufKey] = relativePath
+                        seenBufferPrimaryJobIndex[bufKey] = currentJobIndex
                     }
                 }
                 
@@ -1929,7 +2471,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                         stemFileName: stemFileName,
                         stemURL: stemURL,
                         relativePath: relativePath,
-                        sharedRelativeAudioPath: sharedRelPath,
+                        primaryJobIndex: primaryJobIdx,
                         relativeTransposedPath: relTransPath,
                         transposedURL: transURL
                     )
@@ -1939,11 +2481,23 @@ public final class PlaybackFileManager: @unchecked Sendable {
         
         let resultsBox = UnsafeMutableBufferPointer<TrackFileMetadata?>.allocate(capacity: max(1, jobs.count))
         resultsBox.initialize(repeating: nil)
+        let peaksBox = UnsafeMutableBufferPointer<[Float]?>.allocate(capacity: max(1, jobs.count))
+        peaksBox.initialize(repeating: nil)
         defer {
             resultsBox.deinitialize()
             resultsBox.deallocate()
+            peaksBox.deinitialize()
+            peaksBox.deallocate()
         }
         
+        let sessionErrorLock = NSLock()
+        var firstSessionExportError: Error? = nil
+        func recordSessionExportError(_ error: Error) {
+            sessionErrorLock.lock()
+            if firstSessionExportError == nil { firstSessionExportError = error }
+            sessionErrorLock.unlock()
+        }
+
         if !jobs.isEmpty {
             DispatchQueue.concurrentPerform(iterations: jobs.count) { jobIdx in
                 let job = jobs[jobIdx]
@@ -1956,11 +2510,13 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     || (track.fileURL != nil && fileManager.fileExists(atPath: track.fileURL!.path))
                     || (track.sourceFileURL != nil && fileManager.fileExists(atPath: track.sourceFileURL!.path))
                 let shouldSkipAudioExport = (isGeneratedClick || isGeneratedGuide) && !hasBackingAudio
+                let isUnhydratedPlaceholder = (job.buffer?.frameLength ?? 0) <= 100
                 
                 var relPath = ""
                 if !shouldSkipAudioExport {
-                    if let sharedRelPath = job.sharedRelativeAudioPath {
-                        relPath = sharedRelPath
+                    if job.primaryJobIndex != nil {
+                        // Link after parallel encoding of primary jobs completes so every song owns its own stem file/hardlink.
+                        relPath = job.relativePath
                     } else {
                         do {
                             try fileManager.createDirectory(at: job.stemURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1976,17 +2532,40 @@ public final class PlaybackFileManager: @unchecked Sendable {
                                 return false
                             }()
                             if !skipExisting {
-                                try self.writeOrLinkStem(track: track, buffer: job.buffer, to: job.stemURL)
+                                if canUpdateInPlace,
+                                   cloudStemsDir == nil,
+                                   !self.hasValidCachedStem(for: track.id),
+                                   track.fileURL == nil,
+                                   let oldRel = existingRelPathByTrackId[track.id] ?? existingRelPathBySongAndName["\(song.id.uuidString)::\(track.name.lowercased())"],
+                                   let oldLocalFile = Self.containedFileURL(baseDirectory: destinationURL, relativePath: oldRel),
+                                   fileManager.fileExists(atPath: oldLocalFile.path) {
+                                    try self.linkOrCopyFile(from: oldLocalFile, to: job.stemURL)
+                                } else {
+                                    try self.writeOrLinkStem(track: track, buffer: job.buffer, to: job.stemURL)
+                                }
                             }
                             relPath = job.relativePath
                         } catch {
                             let stemSongId = song.sourceSongId ?? song.id
-                            if let preserved = existingRelPathByTrackId[track.id] ?? existingRelPathBySongAndName["\(song.id.uuidString)::\(track.name.lowercased())"] ?? existingRelPathBySongAndName["\(stemSongId.uuidString)::\(track.name.lowercased())"] {
-                                relPath = preserved
-                            } else if cloudStemsDir != nil {
-                                relPath = job.relativePath
+                            let preserved = existingRelPathByTrackId[track.id]
+                                ?? existingRelPathBySongAndName["\(song.id.uuidString)::\(track.name.lowercased())"]
+                                ?? existingRelPathBySongAndName["\(stemSongId.uuidString)::\(track.name.lowercased())"]
+                            if cloudStemsDir != nil {
+                                if isUnhydratedPlaceholder, let p = preserved, !p.isEmpty {
+                                    relPath = p
+                                } else {
+                                    recordSessionExportError(error)
+                                }
+                            } else if canUpdateInPlace,
+                                      isUnhydratedPlaceholder,
+                                      let p = preserved,
+                                      let oldLocal = Self.containedFileURL(baseDirectory: destinationURL, relativePath: p),
+                                      fileManager.fileExists(atPath: oldLocal.path) {
+                                relPath = p
+                            } else {
+                                recordSessionExportError(error)
                             }
-                            print("Failed to export session stem \(track.name) (preserved \(relPath)): \(error)")
+                            PeanutButterLog.storage.error("Failed to export session stem \(track.name, privacy: .public) (preserved \(relPath, privacy: .public)): \(error.localizedDescription, privacy: .public)")
                         }
                     }
                 }
@@ -1997,6 +2576,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 
                 var peaks = track.waveformPeaks
                 var resolvedDuration: TimeInterval? = track.duration > 0 ? track.duration : nil
+                if peaks.isEmpty, let preservedPeaks = existingPeaksByTrackId[track.id] {
+                    peaks = preservedPeaks
+                }
                 if peaks.isEmpty && track.includeInWaveform {
                     if let buf = job.buffer, buf.frameLength > 100 {
                         peaks = Self.extractPeaks(from: buf, samplesCount: 4000)
@@ -2015,6 +2597,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
                         }
                     }
                 }
+                if !peaks.isEmpty {
+                    peaksBox[jobIdx] = peaks
+                }
                 
                 resultsBox[jobIdx] = TrackFileMetadata(
                     id: track.id,
@@ -2030,11 +2615,36 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     assignedBusName: track.assignedBusName,
                     includeInWaveform: track.includeInWaveform,
                     duration: resolvedDuration,
-                    waveformPeaksData: TrackFileMetadata.encodePeaks(peaks),
+                    waveformPeaksData: nil,
                     relativeTransposedAudioPath: job.relativeTransposedPath,
                     transposedSemitones: (job.song.transposeSemitones != 0) ? job.song.transposeSemitones : nil,
                     sourceFilePath: (track.sourceFileURL ?? track.fileURL)?.path
                 )
+            }
+        }
+
+        if let err = firstSessionExportError {
+            throw err
+        }
+
+        // Link/copy duplicated in-RAM song stems per song directory sequentially after primary writes finish
+        // so deleting the original song later never deletes another song's stems via shared paths.
+        if cloudStemsDir == nil {
+            for jobIdx in jobs.indices {
+                guard let primaryIdx = jobs[jobIdx].primaryJobIndex else { continue }
+                let job = jobs[jobIdx]
+                let primaryURL = jobs[primaryIdx].stemURL
+                try fileManager.createDirectory(at: job.stemURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if !self.isSameFile(primaryURL, job.stemURL) {
+                    if fileManager.fileExists(atPath: primaryURL.path) {
+                        try self.linkOrCopyFile(from: primaryURL, to: job.stemURL)
+                    } else {
+                        try self.writeOrLinkStem(track: job.track, buffer: job.buffer, to: job.stemURL)
+                    }
+                }
+                if !self.hasValidCachedStem(for: job.track.id), fileManager.fileExists(atPath: job.stemURL.path) {
+                    try? self.linkOrCopyFile(from: job.stemURL, to: self.cachedStemURL(for: job.track.id))
+                }
             }
         }
         
@@ -2044,12 +2654,17 @@ public final class PlaybackFileManager: @unchecked Sendable {
             let count = songTrackCounts[songIndex]
             var trackEntries: [TrackFileMetadata] = []
             trackEntries.reserveCapacity(count)
+            var songPeaksByTrackId: [UUID: [Float]] = [:]
             for i in 0..<count {
                 if let m = resultsBox[cursor + i] {
                     trackEntries.append(m)
                 }
+                if let p = peaksBox[cursor + i], !p.isEmpty {
+                    songPeaksByTrackId[songData.tracks[i].id] = p
+                }
             }
             cursor += count
+            writePeaksSidecarIfNeeded(songPeaksByTrackId, to: songSubDirs[songIndex].appendingPathComponent("peaks.bin"))
             let songMeta = makeSongPackageMetadata(song: songData.song, tracks: trackEntries, embedArtworkInJSON: false)
             songPackageEntries.append(songMeta)
             if let csDir = cloudStemsDir {
@@ -2077,17 +2692,34 @@ public final class PlaybackFileManager: @unchecked Sendable {
         
         let encoder = JSONEncoder()
         let sessionData = try encoder.encode(sessionMeta)
-        try sessionData.write(to: targetRoot.appendingPathComponent("session.json"), options: .atomic)
+        try coordinatedWriteData(sessionData, to: targetRoot.appendingPathComponent("session.json"))
+        let allLosslessPairs: [(UUID, URL?)] = allSongsData.flatMap { songData in
+            songData.tracks.map { ($0.id, $0.sourceFileURL ?? $0.fileURL) }
+        }
+        recordLocalLosslessSources(allLosslessPairs)
         
         if canUpdateInPlace {
             if let existingSubDirs = try? fileManager.contentsOfDirectory(at: songsDir, includingPropertiesForKeys: nil) {
-                let validSongFolderNames = Set((0..<allSongsData.count).map { "song_\($0)" })
-                for subDir in existingSubDirs where !validSongFolderNames.contains(subDir.lastPathComponent) {
-                    try? fileManager.removeItem(at: subDir)
+                let validSongFolderNames = Set(songFolderNames)
+                var referencedSongFolders = Set<String>()
+                for songMeta in songPackageEntries {
+                    for trackMeta in songMeta.tracks where trackMeta.relativeAudioPath.hasPrefix("songs/") {
+                        let parts = trackMeta.relativeAudioPath.split(separator: "/", omittingEmptySubsequences: true)
+                        if parts.count >= 2 {
+                            referencedSongFolders.insert(String(parts[1]))
+                        }
+                    }
+                }
+                for subDir in existingSubDirs {
+                    let name = subDir.lastPathComponent
+                    if !validSongFolderNames.contains(name) && !referencedSongFolders.contains(name) {
+                        try? fileManager.removeItem(at: subDir)
+                    }
                 }
             }
             for (songIndex, songMeta) in songPackageEntries.enumerated() {
-                let stemsSubDir = songsDir.appendingPathComponent("song_\(songIndex)/stems")
+                let folderName = songFolderNames[songIndex]
+                let stemsSubDir = songsDir.appendingPathComponent("\(folderName)/stems")
                 if cloudStemsDir != nil {
                     if fileManager.fileExists(atPath: stemsSubDir.path) {
                         try? fileManager.removeItem(at: stemsSubDir)
@@ -2095,7 +2727,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 } else if let existingStems = try? fileManager.contentsOfDirectory(at: stemsSubDir, includingPropertiesForKeys: nil) {
                     let validRelPaths = Set(songMeta.tracks.map { $0.relativeAudioPath })
                     for file in existingStems {
-                        let rel = "songs/song_\(songIndex)/stems/\(file.lastPathComponent)"
+                        let rel = "songs/\(folderName)/stems/\(file.lastPathComponent)"
                         if !validRelPaths.contains(rel) {
                             try? fileManager.removeItem(at: file)
                         }
@@ -2103,13 +2735,14 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 }
             }
         } else {
-            if fileManager.fileExists(atPath: destinationURL.path) {
-                try fileManager.removeItem(at: destinationURL)
-            }
             if asDirectoryPackage {
-                try fileManager.moveItem(at: stagingDir, to: destinationURL)
+                try coordinatedReplaceDirectory(stagedDirectoryURL: stagingDir, destinationURL: destinationURL)
             } else {
-                try zipFolder(folderURL: stagingDir, toArchiveURL: destinationURL)
+                let archiveStageDir = try Self.allocateReplacementStagingDirectory(appropriateFor: destinationURL.deletingLastPathComponent())
+                defer { try? fileManager.removeItem(at: archiveStageDir) }
+                let stagedZip = archiveStageDir.appendingPathComponent(destinationURL.lastPathComponent)
+                try zipFolder(folderURL: stagingDir, toArchiveURL: stagedZip)
+                try coordinatedReplaceFile(stagedFileURL: stagedZip, destinationURL: destinationURL)
             }
         }
         LibraryBrowserManager.invalidateSetlistPackageCache(for: destinationURL)
@@ -2165,19 +2798,22 @@ public final class PlaybackFileManager: @unchecked Sendable {
         var restoredTransposed: [UUID: (semitones: Int, buffers: [UUID: AVAudioPCMBuffer])] = [:]
         
         for (songIndex, songEntry) in sessionMeta.songEntries.enumerated() {
+            let songDir = Self.resolveSessionSongDirectory(rootFolder: rootFolder, songId: songEntry.id, fallbackIndex: songIndex)
             var loadedArtwork = songEntry.artworkData
             if loadedArtwork == nil {
-                let artURL = rootFolder.appendingPathComponent("songs/song_\(songIndex)/artwork.png")
+                let artURL = songDir.appendingPathComponent("artwork.png")
                 if fileManager.fileExists(atPath: artURL.path) {
                     loadedArtwork = try? Data(contentsOf: artURL)
                 }
             }
+            let sidecarPeaks = loadPeaksSidecarMap(from: songDir, triggerDownload: true)
             
             let (song, loadedTracks, loadedTransposed) = decodeSongEntry(
                 songEntry: songEntry,
                 rootFolder: rootFolder,
                 artworkOverride: loadedArtwork,
-                canonicalFormat: canonicalFormat
+                canonicalFormat: canonicalFormat,
+                preloadedPeaksByTrackId: sidecarPeaks
             )
             
             restoredSongs.append(song)
@@ -2273,9 +2909,10 @@ public final class PlaybackFileManager: @unchecked Sendable {
         var anyMissingFromStemCache = false
         
         for (songIndex, songEntry) in sessionMeta.songEntries.enumerated() {
+            let songDir = Self.resolveSessionSongDirectory(rootFolder: rootFolder, songId: songEntry.id, fallbackIndex: songIndex)
             var loadedArtwork = songEntry.artworkData
             if loadedArtwork == nil {
-                let artURL = rootFolder.appendingPathComponent("songs/song_\(songIndex)/artwork.png")
+                let artURL = songDir.appendingPathComponent("artwork.png")
                 if fileManager.fileExists(atPath: artURL.path) {
                     if LibraryBrowserManager.checkIsDownloaded(at: artURL) {
                         loadedArtwork = try? Data(contentsOf: artURL)
@@ -2284,6 +2921,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     }
                 }
             }
+            let songSidecarPeaks = loadPeaksSidecarMap(from: songDir, triggerDownload: true)
             
             let fallbackSongDur = songEntry.sections.map { $0.endTime }.max() ?? 240.0
             var placeholderTracks: [(StemTrack, AVAudioPCMBuffer)] = []
@@ -2323,7 +2961,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     name: tm.name,
                     role: tm.role,
                     fileURL: resolvedURL,
-                    sourceFileURL: tm.sourceFilePath.map { URL(fileURLWithPath: $0) },
+                    sourceFileURL: tm.sourceFilePath.map { URL(fileURLWithPath: $0) }
+                        ?? self.lookupLocalLosslessSourceURL(for: tm.id),
                     volume: tm.volume,
                     pan: tm.pan,
                     isMuted: tm.isMuted,
@@ -2334,7 +2973,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     includeInWaveform: tm.includeInWaveform
                 )
                 stemTrack.duration = (tm.duration ?? 0.0) > 0 ? (tm.duration ?? fallbackSongDur) : fallbackSongDur
-                stemTrack.waveformPeaks = TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
+                stemTrack.waveformPeaks = songSidecarPeaks[tm.id] ?? TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
                 placeholderTracks.append((stemTrack, sharedPlaceholderBuffer))
             }
             
@@ -2378,6 +3017,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 proPresenterPlaylistItem: songEntry.proPresenterPlaylistItem,
                 transitionType: songEntry.transitionType,
                 continuePad: songEntry.continuePad,
+                continueClick: songEntry.continueClick,
                 endFadeOutEnabled: songEntry.endFadeOutEnabled,
                 startPadWithSong: songEntry.startPadWithSong,
                 padPresetId: songEntry.padPresetId,
@@ -2441,10 +3081,24 @@ public final class PlaybackFileManager: @unchecked Sendable {
             return nil
         }
         guard let data = try? Data(contentsOf: jsonURL),
-              let sessionMeta = try? JSONDecoder().decode(SessionPackageMetadata.self, from: data) else {
+              let sessionMeta = try? JSONDecoder().decode(SessionPackageMetadata.self, from: data),
+              let idx = sessionMeta.songEntries.firstIndex(where: { $0.id == songId }) else {
             return nil
         }
-        return sessionMeta.songEntries.first(where: { $0.id == songId })?.tracks
+        let songEntry = sessionMeta.songEntries[idx]
+        let songDir = Self.resolveSessionSongDirectory(rootFolder: sessionURL, songId: songEntry.id, fallbackIndex: idx)
+        let sidecarPeaks = loadPeaksSidecarMap(from: songDir, triggerDownload: false)
+        guard !sidecarPeaks.isEmpty else {
+            return songEntry.tracks
+        }
+        return songEntry.tracks.map { tm in
+            guard tm.waveformPeaksData == nil, let p = sidecarPeaks[tm.id], !p.isEmpty else {
+                return tm
+            }
+            var copy = tm
+            copy.waveformPeaksData = TrackFileMetadata.encodePeaks(p)
+            return copy
+        }
     }
     
     public struct LocalLibrarySongEntry: @unchecked Sendable {
@@ -2517,17 +3171,21 @@ public final class PlaybackFileManager: @unchecked Sendable {
     /// Stage 2 helper: Ensures archive stems are extracted if needed and decodes a single song's audio buffers in parallel.
     public func decodeSongEntryAudio(
         songEntry: SongPackageMetadata,
+        songIndex: Int = 0,
         rootFolder: URL,
         canonicalFormat: AVAudioFormat?,
         localLibraryIndex: [LocalLibrarySongEntry]? = nil,
         isCancelled: (() -> Bool)? = nil,
         progressHandler: ((Int, Int) -> Void)? = nil
     ) -> (tracks: [(StemTrack, AVAudioPCMBuffer)], transposedBuffers: [UUID: AVAudioPCMBuffer]) {
+        let songDir = Self.resolveSessionSongDirectory(rootFolder: rootFolder, songId: songEntry.id, fallbackIndex: songIndex)
+        let preloadedPeaks = loadPeaksSidecarMap(from: songDir, triggerDownload: false)
         let (_, loadedTracks, loadedTransposed) = decodeSongEntry(
             songEntry: songEntry,
             rootFolder: rootFolder,
             artworkOverride: songEntry.artworkData,
             canonicalFormat: canonicalFormat,
+            preloadedPeaksByTrackId: preloadedPeaks,
             localLibraryIndex: localLibraryIndex,
             isCancelled: isCancelled,
             progressHandler: progressHandler
@@ -2566,7 +3224,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 var byId: [UUID: URL] = [:]
                 var byName: [String: URL] = [:]
                 for lt in localMeta.tracks where !lt.relativeAudioPath.isEmpty {
-                    let stemURL = pkgURL.appendingPathComponent(lt.relativeAudioPath)
+                    guard let stemURL = Self.containedFileURL(baseDirectory: pkgURL, relativePath: lt.relativeAudioPath) else {
+                        continue
+                    }
                     if fm.fileExists(atPath: stemURL.path) {
                         byId[lt.id] = stemURL
                         byName[lt.name.lowercased()] = stemURL
@@ -2585,6 +3245,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
         rootFolder: URL,
         artworkOverride: Data?,
         canonicalFormat: AVAudioFormat?,
+        preloadedPeaksByTrackId: [UUID: [Float]] = [:],
         localLibraryIndex: [LocalLibrarySongEntry]? = nil,
         isCancelled: (() -> Bool)? = nil,
         progressHandler: ((Int, Int) -> Void)? = nil
@@ -2671,7 +3332,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                         includeInWaveform: tm.includeInWaveform
                     )
                     stemTrack.duration = (tm.duration ?? 0.0) > 0 ? (tm.duration ?? fallbackSongDur) : fallbackSongDur
-                    stemTrack.waveformPeaks = TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
+                    stemTrack.waveformPeaks = preloadedPeaksByTrackId[tm.id] ?? TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
                     decodedBox[idx] = DecodedTrackItem(track: stemTrack, buffer: tinyBuf, persistentURL: nil, transposedBuffer: nil)
                     return
                 }
@@ -2797,7 +3458,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     name: tm.name,
                     role: tm.role,
                     fileURL: persistentURL,
-                    sourceFileURL: tm.sourceFilePath.map { URL(fileURLWithPath: $0) },
+                    sourceFileURL: tm.sourceFilePath.map { URL(fileURLWithPath: $0) }
+                        ?? self.lookupLocalLosslessSourceURL(for: tm.id),
                     volume: tm.volume,
                     pan: tm.pan,
                     isMuted: tm.isMuted,
@@ -2809,7 +3471,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 )
                 stemTrack.duration = Double((transposedBuffer ?? finalBuffer).frameLength) / (transposedBuffer ?? finalBuffer).format.sampleRate
                 
-                let cachedPeaks = TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
+                let cachedPeaks = preloadedPeaksByTrackId[tm.id] ?? TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
                 if !cachedPeaks.isEmpty {
                     stemTrack.waveformPeaks = cachedPeaks
                 } else if stemTrack.includeInWaveform {
@@ -2895,6 +3557,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             proPresenterPlaylistItem: songEntry.proPresenterPlaylistItem,
             transitionType: songEntry.transitionType,
             continuePad: songEntry.continuePad,
+            continueClick: songEntry.continueClick,
             endFadeOutEnabled: songEntry.endFadeOutEnabled,
             startPadWithSong: songEntry.startPadWithSong,
             padPresetId: songEntry.padPresetId,
@@ -2928,7 +3591,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
         embedArtworkInJSON: Bool
     ) -> SongPackageMetadata {
         SongPackageMetadata(
-            version: 2,
+            version: 3,
             id: song.id,
             title: song.title,
             artist: song.artist,
@@ -2958,6 +3621,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             proPresenterPlaylistItem: song.proPresenterPlaylistItem,
             transitionType: song.transitionType,
             continuePad: song.continuePad,
+            continueClick: song.continueClick,
             endFadeOutEnabled: song.endFadeOutEnabled,
             startPadWithSong: song.startPadWithSong,
             padPresetId: song.padPresetId,
@@ -3184,6 +3848,647 @@ public final class PlaybackFileManager: @unchecked Sendable {
         return peaks
     }
     
+    // MARK: - Archive Security & Path Containment
+
+    public static let defaultMaxArchiveUncompressedBytes: UInt64 = 50 * 1024 * 1024 * 1024 // 50 GiB
+    public static let defaultMaxArchiveEntries: Int = 25_000
+
+    private static func readUInt16LE(_ data: Data, at offset: Int) -> UInt16 {
+        let base = data.startIndex + offset
+        return UInt16(data[base]) | (UInt16(data[base + 1]) << 8)
+    }
+
+    private static func readUInt32LE(_ data: Data, at offset: Int) -> UInt32 {
+        let base = data.startIndex + offset
+        return UInt32(data[base])
+            | (UInt32(data[base + 1]) << 8)
+            | (UInt32(data[base + 2]) << 16)
+            | (UInt32(data[base + 3]) << 24)
+    }
+
+    private static func readUInt64LE(_ data: Data, at offset: Int) -> UInt64 {
+        let lo = UInt64(readUInt32LE(data, at: offset))
+        let hi = UInt64(readUInt32LE(data, at: offset + 4))
+        return lo | (hi << 32)
+    }
+
+    private struct ValidatedZipEntry {
+        let name: String
+        let compressionMethod: UInt16
+        let compressedSize: UInt64
+        let declaredUncompressedSize: UInt64
+        let dataOffset: UInt64
+        let isDirectory: Bool
+    }
+
+    private static func hasZip64ExtraField(in extraData: Data) -> Bool {
+        var pos = 0
+        while pos + 4 <= extraData.count {
+            let headerId = readUInt16LE(extraData, at: pos)
+            let dataSize = Int(readUInt16LE(extraData, at: pos + 2))
+            let fieldEnd = pos + 4 + dataSize
+            guard fieldEnd <= extraData.count else { break }
+            if headerId == 0x0001 {
+                return true
+            }
+            pos = fieldEnd
+        }
+        return false
+    }
+
+    private static func parseValidatedZipEntries(
+        handle: FileHandle,
+        maxUncompressedBytes: UInt64,
+        maxEntries: Int,
+        verifyContiguousLayoutAndStreams: Bool = false
+    ) throws -> [ValidatedZipEntry] {
+        let fileSize = try handle.seekToEnd()
+        guard fileSize >= 22 else {
+            throw ArchiveSecurityError.invalidArchive
+        }
+
+        // EOCD + max 64 KiB comment + optional 20B ZIP64 locator + 56B ZIP64 record
+        let tailWindow = Int(min(fileSize, UInt64(65_557 + 98)))
+        let tailStartOffset = fileSize - UInt64(tailWindow)
+        try handle.seek(toOffset: tailStartOffset)
+        guard let tail = try handle.read(upToCount: tailWindow), tail.count >= 22 else {
+            throw ArchiveSecurityError.invalidArchive
+        }
+
+        var foundEocdOffsetInTail: Int?
+        var scan = tail.count - 22
+        while scan >= 0 {
+            if readUInt32LE(tail, at: scan) == 0x06054b50 {
+                let commentLen = Int(readUInt16LE(tail, at: scan + 20))
+                if scan + 22 + commentLen == tail.count {
+                    foundEocdOffsetInTail = scan
+                    break
+                }
+            }
+            if scan == 0 { break }
+            scan -= 1
+        }
+
+        guard let eocdTailOffset = foundEocdOffsetInTail else {
+            throw ArchiveSecurityError.invalidArchive
+        }
+
+        let eocdAbsOffset = tailStartOffset + UInt64(eocdTailOffset)
+        let entryCount16 = readUInt16LE(tail, at: eocdTailOffset + 10)
+        let cdSize32 = readUInt32LE(tail, at: eocdTailOffset + 12)
+        let cdOffset32 = readUInt32LE(tail, at: eocdTailOffset + 16)
+
+        var cdEntries = UInt64(entryCount16)
+        var cdSize = UInt64(cdSize32)
+        var cdOffset = UInt64(cdOffset32)
+        var preTrailingStructureOffset = eocdAbsOffset
+
+        if entryCount16 == 0xFFFF || cdSize32 == 0xFFFFFFFF || cdOffset32 == 0xFFFFFFFF {
+            guard eocdAbsOffset >= 20 else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            try handle.seek(toOffset: eocdAbsOffset - 20)
+            guard let locData = try handle.read(upToCount: 20), locData.count == 20,
+                  readUInt32LE(locData, at: 0) == 0x07064b50 else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            let zip64EocdOffset = readUInt64LE(locData, at: 8)
+            guard zip64EocdOffset + 56 <= eocdAbsOffset - 20 else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            try handle.seek(toOffset: zip64EocdOffset)
+            guard let zip64Record = try handle.read(upToCount: 56), zip64Record.count == 56,
+                  readUInt32LE(zip64Record, at: 0) == 0x06064b50 else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            cdEntries = readUInt64LE(zip64Record, at: 32)
+            cdSize = readUInt64LE(zip64Record, at: 40)
+            cdOffset = readUInt64LE(zip64Record, at: 48)
+            preTrailingStructureOffset = zip64EocdOffset
+        }
+
+        if cdEntries > UInt64(maxEntries) {
+            throw ArchiveSecurityError.tooManyEntries(Int(min(cdEntries, UInt64(Int.max))))
+        }
+        guard cdOffset <= fileSize, cdSize <= fileSize - cdOffset else {
+            throw ArchiveSecurityError.invalidArchive
+        }
+        guard cdSize <= 512 * 1024 * 1024 else {
+            throw ArchiveSecurityError.invalidArchive
+        }
+        if verifyContiguousLayoutAndStreams {
+            guard cdOffset + cdSize == preTrailingStructureOffset else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+        }
+
+        if cdSize == 0 && cdEntries == 0 {
+            if verifyContiguousLayoutAndStreams {
+                guard cdOffset == 0 else {
+                    throw ArchiveSecurityError.invalidArchive
+                }
+            }
+            return []
+        }
+
+        try handle.seek(toOffset: cdOffset)
+        guard let cdData = try handle.read(upToCount: Int(cdSize)), cdData.count == Int(cdSize) else {
+            throw ArchiveSecurityError.invalidArchive
+        }
+
+        var pos = 0
+        var entriesSeen = 0
+        var totalUncompressedBytes: UInt64 = 0
+        var parsedEntries: [ValidatedZipEntry] = []
+        parsedEntries.reserveCapacity(Int(min(cdEntries, 4096)))
+        var entrySpans: [(start: UInt64, end: UInt64)] = []
+        if verifyContiguousLayoutAndStreams {
+            entrySpans.reserveCapacity(Int(min(cdEntries, 4096)))
+        }
+
+        while pos < cdData.count {
+            guard pos + 46 <= cdData.count,
+                  readUInt32LE(cdData, at: pos) == 0x02014b50 else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+
+            let versionMadeBy = readUInt16LE(cdData, at: pos + 4)
+            let gpFlags = readUInt16LE(cdData, at: pos + 8)
+            let method = readUInt16LE(cdData, at: pos + 10)
+            let cdCRC32 = readUInt32LE(cdData, at: pos + 16)
+            let compressedSize32 = readUInt32LE(cdData, at: pos + 20)
+            let uncompressedSize32 = readUInt32LE(cdData, at: pos + 24)
+            let nameLen = Int(readUInt16LE(cdData, at: pos + 28))
+            let extraLen = Int(readUInt16LE(cdData, at: pos + 30))
+            let commentLen = Int(readUInt16LE(cdData, at: pos + 32))
+            let externalAttrs = readUInt32LE(cdData, at: pos + 38)
+            let localHeaderOffset32 = readUInt32LE(cdData, at: pos + 42)
+
+            let nameStart = pos + 46
+            let extraStart = nameStart + nameLen
+            let commentStart = extraStart + extraLen
+            let headerEnd = commentStart + commentLen
+            guard headerEnd <= cdData.count else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+
+            let nameData = cdData[(cdData.startIndex + nameStart)..<(cdData.startIndex + extraStart)]
+            guard let entryName = String(data: nameData, encoding: .utf8) ?? String(data: nameData, encoding: .isoLatin1),
+                  !entryName.isEmpty else {
+                throw ArchiveSecurityError.unsafeEntryPath("<invalid>")
+            }
+
+            let hasDrivePrefix = entryName.utf8.count >= 2
+                && entryName.utf8[entryName.utf8.index(after: entryName.utf8.startIndex)] == UInt8(ascii: ":")
+            if entryName.contains("\0")
+                || entryName.contains("\\")
+                || hasDrivePrefix
+                || entryName.hasPrefix("/")
+                || entryName.split(separator: "/", omittingEmptySubsequences: false).contains("..") {
+                throw ArchiveSecurityError.unsafeEntryPath(entryName)
+            }
+
+            let creatorOS = versionMadeBy >> 8
+            let posixType = (externalAttrs >> 16) & 0o170000
+            if ((creatorOS == 3 || creatorOS == 19) || (externalAttrs >> 16) != 0) && posixType == 0o120000 {
+                throw ArchiveSecurityError.symlinkEntry(entryName)
+            }
+
+            var entryUncompressedSize = UInt64(uncompressedSize32)
+            var entryCompressedSize = UInt64(compressedSize32)
+            var localHeaderOffset = UInt64(localHeaderOffset32)
+
+            if uncompressedSize32 == 0xFFFFFFFF || compressedSize32 == 0xFFFFFFFF || localHeaderOffset32 == 0xFFFFFFFF {
+                var zip64ExtraData: Data?
+                var exPos = extraStart
+                while exPos + 4 <= commentStart {
+                    let headerId = readUInt16LE(cdData, at: exPos)
+                    let dataSize = Int(readUInt16LE(cdData, at: exPos + 2))
+                    let fieldBodyStart = exPos + 4
+                    let fieldBodyEnd = fieldBodyStart + dataSize
+                    guard fieldBodyEnd <= commentStart else { break }
+                    if headerId == 0x0001 {
+                        zip64ExtraData = Data(cdData[(cdData.startIndex + fieldBodyStart)..<(cdData.startIndex + fieldBodyEnd)])
+                        break
+                    }
+                    exPos = fieldBodyEnd
+                }
+                guard let z64 = zip64ExtraData else {
+                    throw ArchiveSecurityError.invalidArchive
+                }
+                var zPos = 0
+                if uncompressedSize32 == 0xFFFFFFFF {
+                    guard zPos + 8 <= z64.count else { throw ArchiveSecurityError.invalidArchive }
+                    entryUncompressedSize = readUInt64LE(z64, at: zPos)
+                    zPos += 8
+                }
+                if compressedSize32 == 0xFFFFFFFF {
+                    guard zPos + 8 <= z64.count else { throw ArchiveSecurityError.invalidArchive }
+                    entryCompressedSize = readUInt64LE(z64, at: zPos)
+                    zPos += 8
+                }
+                if localHeaderOffset32 == 0xFFFFFFFF {
+                    guard zPos + 8 <= z64.count else { throw ArchiveSecurityError.invalidArchive }
+                    localHeaderOffset = readUInt64LE(z64, at: zPos)
+                    zPos += 8
+                }
+            }
+
+            let (nextTotal, overflow) = totalUncompressedBytes.addingReportingOverflow(entryUncompressedSize)
+            if overflow || nextTotal > maxUncompressedBytes {
+                throw ArchiveSecurityError.uncompressedSizeExceeded(overflow ? UInt64.max : nextTotal)
+            }
+            totalUncompressedBytes = nextTotal
+
+            guard (gpFlags & 0x0001) == 0, method == 0 || method == 8 else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+
+            // Cross-check Local File Header (0x04034b50) to defeat header-differential attacks
+            guard localHeaderOffset + 30 <= cdOffset else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            try handle.seek(toOffset: localHeaderOffset)
+            guard let lhData = try handle.read(upToCount: 30), lhData.count == 30,
+                  readUInt32LE(lhData, at: 0) == 0x04034b50 else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            let lhFlags = readUInt16LE(lhData, at: 6)
+            let lhMethod = readUInt16LE(lhData, at: 8)
+            let lhCRC32 = readUInt32LE(lhData, at: 14)
+            let lhCompressed32 = readUInt32LE(lhData, at: 18)
+            let lhUncompressed32 = readUInt32LE(lhData, at: 22)
+            let lhNameLen = Int(readUInt16LE(lhData, at: 26))
+            let lhExtraLen = Int(readUInt16LE(lhData, at: 28))
+            guard (lhFlags & 0x0001) == 0, lhMethod == method else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            let lhMetaEnd = localHeaderOffset + 30 + UInt64(lhNameLen) + UInt64(lhExtraLen)
+            guard lhMetaEnd <= cdOffset else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            let lhNameData = try handle.read(upToCount: lhNameLen) ?? Data()
+            guard lhNameData.count == lhNameLen else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            if Data(nameData) != lhNameData {
+                let lhName = String(data: lhNameData, encoding: .utf8) ?? "<mismatched>"
+                throw ArchiveSecurityError.unsafeEntryPath(lhName)
+            }
+            let (dataEnd, dataOverflow) = lhMetaEnd.addingReportingOverflow(entryCompressedSize)
+            guard !dataOverflow, dataEnd <= cdOffset else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+
+            if verifyContiguousLayoutAndStreams {
+                let lhExtraData: Data
+                if lhExtraLen > 0 {
+                    guard let extraBytes = try handle.read(upToCount: lhExtraLen), extraBytes.count == lhExtraLen else {
+                        throw ArchiveSecurityError.invalidArchive
+                    }
+                    lhExtraData = extraBytes
+                } else {
+                    lhExtraData = Data()
+                }
+
+                let spanEnd: UInt64
+                if (lhFlags & 0x0008) == 0 {
+                    guard lhCRC32 == cdCRC32,
+                          (lhCompressed32 == 0xFFFFFFFF || UInt64(lhCompressed32) == entryCompressedSize),
+                          (lhUncompressed32 == 0xFFFFFFFF || UInt64(lhUncompressed32) == entryUncompressedSize) else {
+                        throw ArchiveSecurityError.invalidArchive
+                    }
+                    spanEnd = dataEnd
+                } else {
+                    let hasLHZip64 = !lhExtraData.isEmpty && hasZip64ExtraField(in: lhExtraData)
+                    let expectZip64Descriptor = hasLHZip64
+                        || entryCompressedSize > UInt64(UInt32.max)
+                        || entryUncompressedSize > UInt64(UInt32.max)
+                    let maxDescAvail = cdOffset - dataEnd
+                    try handle.seek(toOffset: dataEnd)
+
+                    if expectZip64Descriptor {
+                        let toRead = Int(min(24, maxDescAvail))
+                        guard toRead >= 20, let dd = try handle.read(upToCount: toRead), dd.count == toRead else {
+                            throw ArchiveSecurityError.invalidArchive
+                        }
+                        if dd.count >= 24,
+                           readUInt32LE(dd, at: 0) == 0x08074b50,
+                           readUInt32LE(dd, at: 4) == cdCRC32,
+                           readUInt64LE(dd, at: 8) == entryCompressedSize,
+                           readUInt64LE(dd, at: 16) == entryUncompressedSize {
+                            spanEnd = dataEnd + 24
+                        } else if readUInt32LE(dd, at: 0) == cdCRC32,
+                                  readUInt64LE(dd, at: 4) == entryCompressedSize,
+                                  readUInt64LE(dd, at: 12) == entryUncompressedSize {
+                            spanEnd = dataEnd + 20
+                        } else {
+                            throw ArchiveSecurityError.invalidArchive
+                        }
+                    } else {
+                        let toRead = Int(min(16, maxDescAvail))
+                        guard toRead >= 12, let dd = try handle.read(upToCount: toRead), dd.count == toRead else {
+                            throw ArchiveSecurityError.invalidArchive
+                        }
+                        let comp32 = UInt32(truncatingIfNeeded: entryCompressedSize)
+                        let uncomp32 = UInt32(truncatingIfNeeded: entryUncompressedSize)
+                        if dd.count >= 16,
+                           readUInt32LE(dd, at: 0) == 0x08074b50,
+                           readUInt32LE(dd, at: 4) == cdCRC32,
+                           readUInt32LE(dd, at: 8) == comp32,
+                           readUInt32LE(dd, at: 12) == uncomp32 {
+                            spanEnd = dataEnd + 16
+                        } else if readUInt32LE(dd, at: 0) == cdCRC32,
+                                  readUInt32LE(dd, at: 4) == comp32,
+                                  readUInt32LE(dd, at: 8) == uncomp32 {
+                            spanEnd = dataEnd + 12
+                        } else {
+                            throw ArchiveSecurityError.invalidArchive
+                        }
+                    }
+                }
+                entrySpans.append((start: localHeaderOffset, end: spanEnd))
+            }
+
+            let isDir = entryName.hasSuffix("/") || ((creatorOS == 3 || creatorOS == 19) && posixType == 0o040000)
+            parsedEntries.append(ValidatedZipEntry(
+                name: entryName,
+                compressionMethod: method,
+                compressedSize: entryCompressedSize,
+                declaredUncompressedSize: entryUncompressedSize,
+                dataOffset: lhMetaEnd,
+                isDirectory: isDir
+            ))
+
+            entriesSeen += 1
+            if entriesSeen > maxEntries {
+                throw ArchiveSecurityError.tooManyEntries(entriesSeen)
+            }
+
+            pos = headerEnd
+        }
+
+        guard entriesSeen == Int(cdEntries) else {
+            throw ArchiveSecurityError.invalidArchive
+        }
+
+        if verifyContiguousLayoutAndStreams {
+            entrySpans.sort { $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start }
+            guard let firstSpan = entrySpans.first, firstSpan.start == 0 else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            for idx in 0..<(entrySpans.count - 1) {
+                guard entrySpans[idx].end == entrySpans[idx + 1].start else {
+                    throw ArchiveSecurityError.invalidArchive
+                }
+            }
+            guard entrySpans[entrySpans.count - 1].end == cdOffset else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+        }
+        return parsedEntries
+    }
+
+    private static func inflateRawDeflateStream(
+        handle: FileHandle,
+        entry: ValidatedZipEntry,
+        scratch: inout [UInt8],
+        onProduced: (_ slice: ArraySlice<UInt8>) throws -> Void
+    ) throws -> UInt64 {
+        if entry.compressedSize == 0 {
+            guard entry.declaredUncompressedSize == 0 else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            return 0
+        }
+
+        try handle.seek(toOffset: entry.dataOffset)
+        var strm = z_stream()
+        let initStatus = inflateInit2_(&strm, -MAX_WBITS, zlibVersion(), Int32(MemoryLayout<z_stream>.size))
+        guard initStatus == Z_OK else {
+            throw ArchiveSecurityError.invalidArchive
+        }
+        defer { inflateEnd(&strm) }
+
+        let ioChunkSize = scratch.count
+        var remaining = entry.compressedSize
+        var reachedStreamEnd = false
+        var entryInflated: UInt64 = 0
+
+        while remaining > 0 && !reachedStreamEnd {
+            let toRead = Int(min(UInt64(ioChunkSize), remaining))
+            guard let chunk = try handle.read(upToCount: toRead), !chunk.isEmpty else {
+                throw ArchiveSecurityError.invalidArchive
+            }
+            remaining -= UInt64(chunk.count)
+
+            var trailingInputAfterEnd = false
+            try chunk.withUnsafeBytes { inRaw in
+                guard let baseIn = inRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                strm.next_in = UnsafeMutablePointer(mutating: baseIn)
+                strm.avail_in = uInt(chunk.count)
+
+                while (strm.avail_in > 0 || !reachedStreamEnd) && !reachedStreamEnd {
+                    var produced = 0
+                    let status: Int32 = scratch.withUnsafeMutableBufferPointer { outPtr in
+                        strm.next_out = outPtr.baseAddress
+                        strm.avail_out = uInt(ioChunkSize)
+                        let rc = inflate(&strm, Z_NO_FLUSH)
+                        produced = ioChunkSize - Int(strm.avail_out)
+                        return rc
+                    }
+                    if produced > 0 {
+                        let (nextEntry, entryOverflow) = entryInflated.addingReportingOverflow(UInt64(produced))
+                        if entryOverflow {
+                            throw ArchiveSecurityError.uncompressedSizeExceeded(UInt64.max)
+                        }
+                        entryInflated = nextEntry
+                        try onProduced(scratch[..<produced])
+                    }
+                    if status == Z_STREAM_END {
+                        reachedStreamEnd = true
+                        if strm.avail_in > 0 {
+                            trailingInputAfterEnd = true
+                        }
+                        break
+                    } else if status != Z_OK && status != Z_BUF_ERROR {
+                        throw ArchiveSecurityError.invalidArchive
+                    }
+                    if strm.avail_in == 0 && produced < ioChunkSize {
+                        break
+                    }
+                    if produced == 0 && strm.avail_in > 0 && status == Z_BUF_ERROR {
+                        break
+                    }
+                }
+            }
+            if trailingInputAfterEnd {
+                throw ArchiveSecurityError.invalidArchive
+            }
+        }
+
+        if !reachedStreamEnd {
+            while !reachedStreamEnd {
+                var produced = 0
+                let status: Int32 = scratch.withUnsafeMutableBufferPointer { outPtr in
+                    strm.next_in = nil
+                    strm.avail_in = 0
+                    strm.next_out = outPtr.baseAddress
+                    strm.avail_out = uInt(ioChunkSize)
+                    let rc = inflate(&strm, Z_FINISH)
+                    produced = ioChunkSize - Int(strm.avail_out)
+                    return rc
+                }
+                if produced > 0 {
+                    let (nextEntry, entryOverflow) = entryInflated.addingReportingOverflow(UInt64(produced))
+                    if entryOverflow {
+                        throw ArchiveSecurityError.uncompressedSizeExceeded(UInt64.max)
+                    }
+                    entryInflated = nextEntry
+                    try onProduced(scratch[..<produced])
+                }
+                if status == Z_STREAM_END {
+                    reachedStreamEnd = true
+                    break
+                } else if status != Z_OK && status != Z_BUF_ERROR {
+                    break
+                }
+                if produced == 0 {
+                    break
+                }
+            }
+        }
+
+        guard reachedStreamEnd && remaining == 0 else {
+            throw ArchiveSecurityError.invalidArchive
+        }
+        return entryInflated
+    }
+
+    /// Validates a ZIP archive's Central Directory (ZIP32 & ZIP64) and Local File Headers prior to extraction,
+    /// rejecting header differentials, Zip Slip (`..` / leading `/` / `\`), symbolic links (`0o120000`),
+    /// excessive entry counts, and decompression bombs above `maxUncompressedBytes`.
+    /// When `verifyContiguousLayoutAndStreams` is enabled (used before invoking `/usr/bin/ditto`), it also
+    /// verifies contiguous `[0 ..< cdOffset]` coverage and inflates Deflate streams into a 64 KiB scratch
+    /// buffer to verify actual uncompressed byte counts against declared sizes and `maxUncompressedBytes`.
+    public static func validateZipArchive(
+        at archiveURL: URL,
+        maxUncompressedBytes: UInt64 = defaultMaxArchiveUncompressedBytes,
+        maxEntries: Int = defaultMaxArchiveEntries,
+        verifyContiguousLayoutAndStreams: Bool = false
+    ) throws {
+        let handle = try FileHandle(forReadingFrom: archiveURL)
+        defer { try? handle.close() }
+        let entries = try parseValidatedZipEntries(
+            handle: handle,
+            maxUncompressedBytes: maxUncompressedBytes,
+            maxEntries: maxEntries,
+            verifyContiguousLayoutAndStreams: verifyContiguousLayoutAndStreams
+        )
+        guard verifyContiguousLayoutAndStreams else { return }
+
+        var totalActualBytes: UInt64 = 0
+        var scratch = [UInt8](repeating: 0, count: 64 * 1024)
+
+        func accountVerified(_ delta: UInt64) throws {
+            let (nextTotal, overflow) = totalActualBytes.addingReportingOverflow(delta)
+            if overflow || nextTotal > maxUncompressedBytes {
+                throw ArchiveSecurityError.uncompressedSizeExceeded(overflow ? UInt64.max : nextTotal)
+            }
+            totalActualBytes = nextTotal
+        }
+
+        for entry in entries {
+            if entry.compressionMethod == 0 {
+                guard entry.compressedSize == entry.declaredUncompressedSize else {
+                    throw ArchiveSecurityError.invalidArchive
+                }
+                try accountVerified(entry.compressedSize)
+            } else {
+                let actualEntryBytes = try inflateRawDeflateStream(
+                    handle: handle,
+                    entry: entry,
+                    scratch: &scratch
+                ) { slice in
+                    try accountVerified(UInt64(slice.count))
+                }
+                guard actualEntryBytes == entry.declaredUncompressedSize else {
+                    throw ArchiveSecurityError.invalidArchive
+                }
+            }
+        }
+    }
+
+    public static func rejectSymlinksAndOutsideFiles(in directoryURL: URL) throws {
+        let fm = FileManager.default
+        let canonicalRoot = directoryURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let rootPrefix = canonicalRoot.hasSuffix("/") ? canonicalRoot : canonicalRoot + "/"
+        guard let enumerator = fm.enumerator(
+            at: directoryURL,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            options: [],
+            errorHandler: nil
+        ) else {
+            return
+        }
+        for case let itemURL as URL in enumerator {
+            let isSym = (try? itemURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
+            if isSym {
+                try? fm.removeItem(at: directoryURL)
+                throw ArchiveSecurityError.symlinkEntry(itemURL.lastPathComponent)
+            }
+            let resolved = itemURL.resolvingSymlinksInPath().standardizedFileURL.path
+            if !resolved.hasPrefix(rootPrefix) {
+                try? fm.removeItem(at: directoryURL)
+                throw ArchiveSecurityError.pathTraversal(itemURL.path)
+            }
+        }
+    }
+
+    /// Resolves `relativePath` beneath `baseDirectory`, returning `nil` if the path attempts traversal
+    /// (`..`, leading `/`, backslash, NUL) or traverses a symlink pointing outside `baseDirectory`.
+    public static func containedFileURL(baseDirectory: URL, relativePath: String) -> URL? {
+        let trimmed = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.contains("\0"),
+              !trimmed.contains("\\"),
+              !trimmed.hasPrefix("/") else {
+            return nil
+        }
+        let rawComponents = trimmed.split(separator: "/", omittingEmptySubsequences: true)
+        guard !rawComponents.isEmpty, !rawComponents.contains("..") else {
+            return nil
+        }
+
+        let stdBase = baseDirectory.standardizedFileURL.path
+        let stdBasePrefix = stdBase.hasSuffix("/") ? stdBase : stdBase + "/"
+        let candidate = baseDirectory.appendingPathComponent(trimmed).standardizedFileURL
+        guard candidate.path.hasPrefix(stdBasePrefix) else {
+            return nil
+        }
+
+        let fm = FileManager.default
+        let realBase = baseDirectory.resolvingSymlinksInPath().standardizedFileURL.path
+        let realBasePrefix = realBase.hasSuffix("/") ? realBase : realBase + "/"
+        var cursor = baseDirectory.standardizedFileURL
+        for comp in rawComponents {
+            cursor.appendPathComponent(String(comp))
+            let attrs = try? fm.attributesOfItem(atPath: cursor.path)
+            let isSymLinkAttr = (attrs?[.type] as? FileAttributeType) == .typeSymbolicLink
+            let isSymRes = (try? cursor.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
+            if isSymLinkAttr || isSymRes {
+                return nil
+            }
+            if attrs != nil {
+                let resolved = cursor.resolvingSymlinksInPath().standardizedFileURL.path
+                guard resolved.hasPrefix(realBasePrefix) else {
+                    return nil
+                }
+            }
+        }
+        return candidate
+    }
+
     // MARK: - Zip & Process Helpers
     
     private func zipFolder(folderURL: URL, toArchiveURL: URL) throws {
@@ -3191,6 +4496,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
         process.currentDirectoryURL = folderURL
         process.arguments = ["-0", "-r", "-q", toArchiveURL.path, "."]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         try process.run()
         process.waitUntilExit()
         if process.terminationStatus != 0 {
@@ -3198,33 +4505,179 @@ public final class PlaybackFileManager: @unchecked Sendable {
         }
     }
     
-    private func unzipArchive(archiveURL: URL, toFolderURL: URL) throws {
-        try FileManager.default.createDirectory(at: toFolderURL, withIntermediateDirectories: true)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        process.arguments = ["-q", "-o", archiveURL.path, "-d", toFolderURL.path]
-        try process.run()
-        process.waitUntilExit()
-        if process.terminationStatus != 0 {
-            throw NSError(domain: "PlaybackFileManager", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "Unzip process failed with code \(process.terminationStatus)"])
+    private static func normalizedZipRelativePath(_ raw: String) -> String {
+        var s = raw
+        while s.hasPrefix("./") {
+            s.removeFirst(2)
+        }
+        return s
+    }
+
+    private static func matchesZipGlob(pattern: String, path: String) -> Bool {
+        var regex = "^"
+        for ch in pattern {
+            switch ch {
+            case "*": regex += "[^/]*"
+            case "?": regex += "[^/]"
+            default: regex += NSRegularExpression.escapedPattern(for: String(ch))
+            }
+        }
+        regex += "$"
+        return path.range(of: regex, options: .regularExpression) != nil
+    }
+
+    private func extractValidatedZip(
+        archiveURL: URL,
+        toFolderURL: URL,
+        entryPatterns: [String]?,
+        maxUncompressedBytes: UInt64,
+        maxEntries: Int
+    ) throws {
+        let fm = FileManager.default
+        let handle = try FileHandle(forReadingFrom: archiveURL)
+        defer { try? handle.close() }
+
+        let entries = try Self.parseValidatedZipEntries(
+            handle: handle,
+            maxUncompressedBytes: maxUncompressedBytes,
+            maxEntries: maxEntries
+        )
+        try fm.createDirectory(at: toFolderURL, withIntermediateDirectories: true)
+
+        var totalWrittenBytes: UInt64 = 0
+        let ioChunkSize = 64 * 1024
+
+        do {
+            for entry in entries {
+                let relPath = Self.normalizedZipRelativePath(entry.name)
+                if relPath.isEmpty || relPath == "." || relPath == "./" {
+                    continue
+                }
+                if entry.isDirectory {
+                    if entryPatterns == nil {
+                        let trimmedDir = relPath.hasSuffix("/") ? String(relPath.dropLast()) : relPath
+                        guard let dirURL = Self.containedFileURL(baseDirectory: toFolderURL, relativePath: trimmedDir) else {
+                            throw ArchiveSecurityError.unsafeEntryPath(entry.name)
+                        }
+                        try fm.createDirectory(at: dirURL, withIntermediateDirectories: true)
+                    }
+                    continue
+                }
+                if relPath.hasPrefix("__MACOSX/") {
+                    continue
+                }
+                if let patterns = entryPatterns {
+                    let matched = patterns.contains { Self.matchesZipGlob(pattern: $0, path: relPath) }
+                    if !matched { continue }
+                }
+
+                guard let destURL = Self.containedFileURL(baseDirectory: toFolderURL, relativePath: relPath) else {
+                    throw ArchiveSecurityError.unsafeEntryPath(entry.name)
+                }
+                try fm.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if fm.fileExists(atPath: destURL.path) {
+                    try fm.removeItem(at: destURL)
+                }
+                fm.createFile(atPath: destURL.path, contents: nil)
+                let outHandle = try FileHandle(forWritingTo: destURL)
+
+                func accountWritten(_ delta: Int) throws {
+                    guard delta > 0 else { return }
+                    let uDelta = UInt64(delta)
+                    let (nextTotal, overflow) = totalWrittenBytes.addingReportingOverflow(uDelta)
+                    if overflow || nextTotal > maxUncompressedBytes {
+                        try? outHandle.close()
+                        throw ArchiveSecurityError.uncompressedSizeExceeded(overflow ? UInt64.max : nextTotal)
+                    }
+                    totalWrittenBytes = nextTotal
+                }
+
+                try handle.seek(toOffset: entry.dataOffset)
+
+                if entry.compressionMethod == 0 {
+                    var remaining = entry.compressedSize
+                    while remaining > 0 {
+                        let toRead = Int(min(UInt64(ioChunkSize), remaining))
+                        guard let chunk = try handle.read(upToCount: toRead), !chunk.isEmpty else {
+                            try? outHandle.close()
+                            throw ArchiveSecurityError.invalidArchive
+                        }
+                        try accountWritten(chunk.count)
+                        try outHandle.write(contentsOf: chunk)
+                        remaining -= UInt64(chunk.count)
+                    }
+                } else {
+                    var scratch = [UInt8](repeating: 0, count: ioChunkSize)
+                    do {
+                        _ = try Self.inflateRawDeflateStream(
+                            handle: handle,
+                            entry: entry,
+                            scratch: &scratch
+                        ) { slice in
+                            try accountWritten(slice.count)
+                            try outHandle.write(contentsOf: slice)
+                        }
+                    } catch {
+                        try? outHandle.close()
+                        throw error
+                    }
+                }
+                try outHandle.close()
+            }
+            try Self.rejectSymlinksAndOutsideFiles(in: toFolderURL)
+        } catch {
+            try? fm.removeItem(at: toFolderURL)
+            throw error
+        }
+    }
+
+    public func unzipArchive(
+        archiveURL: URL,
+        toFolderURL: URL,
+        maxUncompressedBytes: UInt64 = defaultMaxArchiveUncompressedBytes,
+        maxEntries: Int = defaultMaxArchiveEntries
+    ) throws {
+        try extractValidatedZip(
+            archiveURL: archiveURL,
+            toFolderURL: toFolderURL,
+            entryPatterns: nil,
+            maxUncompressedBytes: maxUncompressedBytes,
+            maxEntries: maxEntries
+        )
+    }
+
+    public func unzipSelectedEntries(
+        archiveURL: URL,
+        entryPatterns: [String],
+        toFolderURL: URL,
+        requiredRelativeFile: String? = nil,
+        maxUncompressedBytes: UInt64 = defaultMaxArchiveUncompressedBytes,
+        maxEntries: Int = defaultMaxArchiveEntries
+    ) throws {
+        try extractValidatedZip(
+            archiveURL: archiveURL,
+            toFolderURL: toFolderURL,
+            entryPatterns: entryPatterns,
+            maxUncompressedBytes: maxUncompressedBytes,
+            maxEntries: maxEntries
+        )
+
+        if let req = requiredRelativeFile {
+            guard let targetURL = Self.containedFileURL(baseDirectory: toFolderURL, relativePath: req),
+                  FileManager.default.fileExists(atPath: targetURL.path) else {
+                throw NSError(domain: "PlaybackFileManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Archive missing required metadata file \(req)."])
+            }
         }
     }
     
-    /// Extracts only `session.json` and `songs/*/artwork.png` from a `.pbsession` zip archive in milliseconds, skipping all heavy `.m4a` stems
+    /// Extracts only `session.json`, `songs/*/artwork.png`, and `songs/*/peaks.bin` from a `.pbsession` zip archive in milliseconds, skipping all heavy `.m4a` stems
     private func unzipMetadataOnly(archiveURL: URL, toFolderURL: URL) throws {
-        try FileManager.default.createDirectory(at: toFolderURL, withIntermediateDirectories: true)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        process.arguments = ["-q", "-o", archiveURL.path, "session.json", "songs/*/artwork.png", "-d", toFolderURL.path]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        try process.run()
-        process.waitUntilExit()
-        // Note: unzip returns 11 when optional "songs/*/artwork.png" wildcard doesn't match any file, while still extracting session.json
-        let jsonURL = toFolderURL.appendingPathComponent("session.json")
-        if !FileManager.default.fileExists(atPath: jsonURL.path) {
-            throw NSError(domain: "PlaybackFileManager", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "Unzip metadata failed with code \(process.terminationStatus)"])
-        }
+        try unzipSelectedEntries(
+            archiveURL: archiveURL,
+            entryPatterns: ["session.json", "songs/*/artwork.png", "songs/*/peaks.bin"],
+            toFolderURL: toFolderURL,
+            requiredRelativeFile: "session.json"
+        )
     }
     
     private func sanitizeFileName(_ name: String) -> String {
@@ -3264,8 +4717,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     var updatedTracks: [TrackFileMetadata] = []
                     for var tm in meta.tracks {
                         if !tm.relativeAudioPath.isEmpty && !tm.relativeAudioPath.hasPrefix("cloudstems/") {
-                            let embeddedURL = pkgURL.appendingPathComponent(tm.relativeAudioPath)
-                            if self.hasValidStemFile(at: embeddedURL) {
+                            if let embeddedURL = Self.containedFileURL(baseDirectory: pkgURL, relativePath: tm.relativeAudioPath),
+                               self.hasValidStemFile(at: embeddedURL) {
                                 if !self.hasValidCachedStem(for: tm.id) {
                                     try? self.linkOrCopyFile(from: embeddedURL, to: self.cachedStemURL(for: tm.id))
                                 }
@@ -3291,7 +4744,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     if didUpdateJSON {
                         meta.tracks = updatedTracks
                         if let outData = try? encoder.encode(meta) {
-                            try? outData.write(to: jsonURL, options: .atomic)
+                            try? self.coordinatedWriteData(outData, to: jsonURL)
                         }
                         if fm.fileExists(atPath: embeddedStemsDir.path) {
                             try? fm.removeItem(at: embeddedStemsDir)

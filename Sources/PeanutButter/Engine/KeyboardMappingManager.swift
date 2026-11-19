@@ -246,7 +246,7 @@ public final class KeyboardMappingManager: ObservableObject {
         case "fade_out":
             eng.toggleFade()
         case "restart_song":
-            eng.seek(to: 0.0)
+            eng.returnToZero()
         case "prev_song":
             if eng.currentSongIndex > 0 {
                 eng.selectSongInSetlist(at: eng.currentSongIndex - 1)

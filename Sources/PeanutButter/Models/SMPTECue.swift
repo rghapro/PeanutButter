@@ -14,9 +14,16 @@ public enum SMPTEFrameRate: String, CaseIterable, Identifiable, Codable, Sendabl
         switch self {
         case .fps24: return 24.0
         case .fps25: return 25.0
-        case .fps2997: return 29.97
+        case .fps2997, .fps30df: return 30000.0 / 1001.0
         case .fps30: return 30.0
-        case .fps30df: return 29.97
+        }
+    }
+
+    public var nominalFPS: Int {
+        switch self {
+        case .fps24: return 24
+        case .fps25: return 25
+        case .fps2997, .fps30, .fps30df: return 30
         }
     }
     
@@ -29,6 +36,7 @@ public enum SMPTEFrameRate: String, CaseIterable, Identifiable, Codable, Sendabl
 public struct SMPTECue: Identifiable, Hashable, Sendable, Codable {
     public let id: UUID
     public var time: TimeInterval         // Timeline Location (exact time in seconds where transmission begins)
+    public var sectionId: UUID? = nil     // Owning section ID for arrangement reindex shifts
     public var timeStartHours: Int        // SMPTE Time Start hours (0..23)
     public var timeStartMinutes: Int      // SMPTE Time Start minutes (0..59)
     public var timeStartSeconds: Int      // SMPTE Time Start seconds (0..59)
@@ -37,6 +45,7 @@ public struct SMPTECue: Identifiable, Hashable, Sendable, Codable {
     public init(
         id: UUID = UUID(),
         time: TimeInterval,
+        sectionId: UUID? = nil,
         timeStartHours: Int = 0,
         timeStartMinutes: Int = 0,
         timeStartSeconds: Int = 0,
@@ -44,6 +53,7 @@ public struct SMPTECue: Identifiable, Hashable, Sendable, Codable {
     ) {
         self.id = id
         self.time = time
+        self.sectionId = sectionId
         self.timeStartHours = timeStartHours
         self.timeStartMinutes = timeStartMinutes
         self.timeStartSeconds = timeStartSeconds
@@ -54,8 +64,30 @@ public struct SMPTECue: Identifiable, Hashable, Sendable, Codable {
         return String(format: "%02dh %02dm", timeStartHours, timeStartMinutes)
     }
     
+    public func startFrameIndex(for frameRate: SMPTEFrameRate) -> Int64 {
+        let nom = frameRate.nominalFPS
+        let hh = max(0, min(23, timeStartHours))
+        let mm = max(0, min(59, timeStartMinutes))
+        let ss = max(0, min(59, timeStartSeconds))
+        var ff = max(0, min(nom - 1, timeStartFrames))
+        if frameRate.isDropFrame && (mm % 10) != 0 && ss == 0 && ff < 2 {
+            ff = 2
+        }
+        let unadjusted = Int64(hh * 3600 + mm * 60 + ss) * Int64(nom) + Int64(ff)
+        if frameRate.isDropFrame {
+            let totalMinutes = Int64(hh * 60 + mm)
+            let droppedFrames = 2 * (totalMinutes - totalMinutes / 10)
+            return unadjusted - droppedFrames
+        }
+        return unadjusted
+    }
+
+    public func totalStartSeconds(for frameRate: SMPTEFrameRate) -> Double {
+        return Double(startFrameIndex(for: frameRate)) / frameRate.framesPerSecond
+    }
+
     public var totalStartSeconds: Double {
-        return Double(timeStartHours * 3600 + timeStartMinutes * 60 + timeStartSeconds)
+        return totalStartSeconds(for: .fps30)
     }
     
     public func formattedTimelineLocation() -> String {

@@ -25,6 +25,7 @@ public final class ClickGenerator: @unchecked Sendable {
         eighthVolume: Float = 0.70,
         sixteenthVolume: Float = 0.0,
         soloedSubdivisions: Set<ClickSubdivision> = [],
+        suppressEndCutoff: Bool = false,
         format: AVAudioFormat
     ) -> AVAudioPCMBuffer? {
         guard duration > 0 else { return nil }
@@ -54,7 +55,7 @@ public final class ClickGenerator: @unchecked Sendable {
                    lowerName.starts(with: "end ") || lowerName.hasSuffix(" end") ||
                    lowerAbbrev == "end" || (lowerAbbrev == "e" && lowerName.contains("end"))
         })
-        let endCutoffTime: TimeInterval? = endSection?.startTime
+        let endCutoffTime: TimeInterval? = suppressEndCutoff ? nil : endSection?.startTime
         
         let accentFreq: Double
         let quarterFreq: Double
@@ -498,6 +499,84 @@ public final class ClickGenerator: @unchecked Sendable {
         }
         
         return buffer
+    }
+
+    /// Synthesizes a phase-exact, sample-seamless 1-bar looping click buffer for continuous post-song click playback.
+    public func generateOneBarLoopBuffer(
+        bpm: Double,
+        timeSignatureNumerator: Int = 4,
+        timeSignatureDenominator: Int = 4,
+        soundType: ClickSoundType = .classic,
+        accentEnabled: Bool = true,
+        quarterEnabled: Bool = true,
+        eighthEnabled: Bool = true,
+        sixteenthEnabled: Bool = false,
+        accentVolume: Float = 0.80,
+        quarterVolume: Float = 0.80,
+        eighthVolume: Float = 0.70,
+        sixteenthVolume: Float = 0.0,
+        soloedSubdivisions: Set<ClickSubdivision> = [],
+        format: AVAudioFormat
+    ) -> AVAudioPCMBuffer? {
+        let sr = format.sampleRate > 0 ? format.sampleRate : 48000.0
+        let safeBPM = max(20.0, min(300.0, bpm))
+        let beatsPerBar = max(1, timeSignatureNumerator)
+        let beatScale = 4.0 / Double(max(1, timeSignatureDenominator))
+        let secPerBeat = (60.0 / safeBPM) * beatScale
+        let barFrames = max(1, Int((Double(beatsPerBar) * secPerBeat * sr).rounded()))
+        let barSec = Double(barFrames) / sr
+        let exactBeatSec = barSec / Double(beatsPerBar)
+
+        var twoBarGrid: [BeatGridMarker] = []
+        twoBarGrid.reserveCapacity(beatsPerBar * 2)
+        for b in 0..<beatsPerBar {
+            twoBarGrid.append(BeatGridMarker(time: Double(b) * exactBeatSec, bar: 1, beat: b + 1, instantaneousBPM: safeBPM))
+        }
+        for b in 0..<beatsPerBar {
+            twoBarGrid.append(BeatGridMarker(time: barSec + Double(b) * exactBeatSec, bar: 2, beat: b + 1, instantaneousBPM: safeBPM))
+        }
+
+        guard let rendered = generateClickBuffer(
+            bpm: safeBPM,
+            timeSignatureNumerator: timeSignatureNumerator,
+            timeSignatureDenominator: timeSignatureDenominator,
+            duration: barSec * 2.5,
+            beatGrid: twoBarGrid,
+            sections: [],
+            soundType: soundType,
+            accentEnabled: accentEnabled,
+            quarterEnabled: quarterEnabled,
+            eighthEnabled: eighthEnabled,
+            sixteenthEnabled: sixteenthEnabled,
+            accentVolume: accentVolume,
+            quarterVolume: quarterVolume,
+            eighthVolume: eighthVolume,
+            sixteenthVolume: sixteenthVolume,
+            soloedSubdivisions: soloedSubdivisions,
+            suppressEndCutoff: true,
+            format: format
+        ) else {
+            return nil
+        }
+
+        let targetFrameCount = AVAudioFrameCount(barFrames)
+        guard let loopBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: targetFrameCount) else {
+            return nil
+        }
+        loopBuffer.frameLength = targetFrameCount
+
+        let channelCount = Int(min(format.channelCount, rendered.format.channelCount))
+        let renderedTotal = Int(rendered.frameLength)
+        let copyCount = min(barFrames, max(0, renderedTotal - barFrames))
+        for ch in 0..<channelCount {
+            if let dst = loopBuffer.floatChannelData?[ch] {
+                memset(dst, 0, barFrames * MemoryLayout<Float>.size)
+                if copyCount > 0, let src = rendered.floatChannelData?[ch] {
+                    memcpy(dst, src.advanced(by: barFrames), copyCount * MemoryLayout<Float>.size)
+                }
+            }
+        }
+        return loopBuffer
     }
     
     // MARK: - Internal Unified Click Playback Helper

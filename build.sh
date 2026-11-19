@@ -84,6 +84,26 @@ fi
 
 codesign --verify --deep --strict "PeanutButter.app"
 
+strip_nonredistributable_audio() {
+    local app_bundle="$1"
+    local audio_res="$app_bundle/Contents/Resources/Audio"
+    rm -rf \
+        "$audio_res/Click" \
+        "$audio_res/Dynamic Cues" \
+        "$audio_res/Song Sections" \
+        "$audio_res/Guides/Rita"
+    if [ -d "$audio_res/Pads" ]; then
+        for pad_dir in "$audio_res/Pads"/*; do
+            [ -d "$pad_dir" ] || continue
+            local base
+            base=$(basename "$pad_dir")
+            if [ "$base" != "Simple" ] && [ "$base" != "Soft" ]; then
+                rm -rf "$pad_dir"
+            fi
+        done
+    fi
+}
+
 if [ "$DO_NOTARIZE" -eq 1 ]; then
     if [ -z "$SIGN_IDENTITY" ]; then
         echo "ERROR: --notarize requires a Developer ID Application certificate in your Keychain (or CODESIGN_IDENTITY env var)." >&2
@@ -98,10 +118,7 @@ if [ "$DO_NOTARIZE" -eq 1 ]; then
     trap cleanup_stage EXIT
 
     ditto "PeanutButter.app" "$STAGE_DIR/PeanutButter.app"
-    rm -rf \
-        "$STAGE_DIR/PeanutButter.app/Contents/Resources/Audio/Click" \
-        "$STAGE_DIR/PeanutButter.app/Contents/Resources/Audio/Dynamic Cues" \
-        "$STAGE_DIR/PeanutButter.app/Contents/Resources/Audio/Song Sections"
+    strip_nonredistributable_audio "$STAGE_DIR/PeanutButter.app"
     /usr/bin/xattr -cr "$STAGE_DIR/PeanutButter.app"
 
     echo "Signing staged PeanutButter.app with $SIGN_IDENTITY..."
@@ -138,9 +155,25 @@ if [ "$DO_NOTARIZE" -eq 1 ]; then
     chmod +x "./scripts/make_dmg.sh"
     ./scripts/make_dmg.sh "$STAGE_DIR/PeanutButter.app" "PeanutButter.dmg" "$SIGN_IDENTITY" "$NOTARY_PROFILE"
 elif [ "$DO_DMG" -eq 1 ]; then
-    echo "Packaging PeanutButter.dmg..."
+    echo "Staging clean bundle and packaging PeanutButter.dmg..."
+    STAGE_DIR=$(mktemp -d /tmp/pb_dmg_stage.XXXXXX)
+    cleanup_dmg_stage() {
+        rm -rf "$STAGE_DIR"
+    }
+    trap cleanup_dmg_stage EXIT
+
+    ditto "PeanutButter.app" "$STAGE_DIR/PeanutButter.app"
+    strip_nonredistributable_audio "$STAGE_DIR/PeanutButter.app"
+    /usr/bin/xattr -cr "$STAGE_DIR/PeanutButter.app"
+    if [ -n "$SIGN_IDENTITY" ]; then
+        codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$STAGE_DIR/PeanutButter.app"
+    else
+        codesign --force --deep --sign - "$STAGE_DIR/PeanutButter.app"
+    fi
+    codesign --verify --deep --strict "$STAGE_DIR/PeanutButter.app"
+
     chmod +x "./scripts/make_dmg.sh"
-    ./scripts/make_dmg.sh "PeanutButter.app" "PeanutButter.dmg" "$SIGN_IDENTITY"
+    ./scripts/make_dmg.sh "$STAGE_DIR/PeanutButter.app" "PeanutButter.dmg" "$SIGN_IDENTITY"
 fi
 
 echo "Build and packaging successful! You can now launch 'PeanutButter.app' or run 'open \"PeanutButter.app\"'."

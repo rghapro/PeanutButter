@@ -346,7 +346,7 @@ public struct OfflineBounceSheetView: View {
     private func startSessionReferenceBounce() {
         let panel = NSSavePanel()
         let baseName = engine.currentSetlist.name.isEmpty ? "Service" : engine.currentSetlist.name
-        panel.nameFieldStringValue = "\(baseName) Reference.\(selectedFormat.fileExtension)"
+        panel.nameFieldStringValue = LibraryBrowserManager.sanitizedPackageFilename("\(baseName) Reference", ext: selectedFormat.fileExtension)
         panel.allowedContentTypes = [UTType(filenameExtension: selectedFormat.fileExtension) ?? .audio]
         panel.message = "Choose destination for Session Reference Track"
 

@@ -16,7 +16,9 @@ public final class AppUpdateManager: ObservableObject {
     private static let skippedVersionKey = "PeanutButter_SkippedUpdateVersion"
     private static let suppressMoveToApplicationsKey = "PeanutButter_SuppressMoveToApplications"
     private static let autoCheckInterval: TimeInterval = 86_400
-    private static let expectedBundleIdentifier = "com.peanutbutter.app"
+    public nonisolated static let expectedBundleIdentifier = "com.peanutbutter.app"
+    public nonisolated static let expectedTeamIdentifier = "M9F8W3VQ4P"
+    public nonisolated static let designatedCodeRequirement = "identifier \"com.peanutbutter.app\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = M9F8W3VQ4P"
 
     public struct ReleaseInfo: Equatable, Sendable {
         public let tagName: String
@@ -192,17 +194,37 @@ public final class AppUpdateManager: ObservableObject {
 
     public enum ParseError: LocalizedError {
         case invalidHTMLURL
+        case untrustedAssetURL
         public var errorDescription: String? {
             switch self {
-            case .invalidHTMLURL: return "GitHub release metadata did not contain a valid release URL."
+            case .invalidHTMLURL: return "GitHub release metadata did not contain a valid HTTPS release URL."
+            case .untrustedAssetURL: return "GitHub release asset URL pointed to an untrusted host."
             }
         }
+    }
+
+    private nonisolated static let allowedGitHubHosts: Set<String> = [
+        "github.com",
+        "api.github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "codeload.github.com"
+    ]
+
+    public nonisolated static func isAllowedGitHubUpdateURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(),
+              !host.isEmpty else {
+            return false
+        }
+        return allowedGitHubHosts.contains(host)
     }
 
     /// Parses GitHub `/releases/latest` JSON payload into `ReleaseInfo`.
     public nonisolated static func parseReleaseJSON(_ data: Data) throws -> (release: ReleaseInfo, isDraftOrPrerelease: Bool) {
         let dto = try JSONDecoder().decode(GitHubReleaseDTO.self, from: data)
-        guard let htmlURL = URL(string: dto.htmlURL) else {
+        guard let htmlURL = URL(string: dto.htmlURL),
+              isAllowedGitHubUpdateURL(htmlURL) else {
             throw ParseError.invalidHTMLURL
         }
 
@@ -214,7 +236,16 @@ public final class AppUpdateManager: ObservableObject {
         let assets = dto.assets ?? []
         let zipAsset = assets.first(where: { $0.name.caseInsensitiveCompare("PeanutButter.zip") == .orderedSame })
             ?? assets.first(where: { $0.name.lowercased().hasSuffix(".zip") })
-        let zipAssetURL = zipAsset.flatMap { URL(string: $0.browserDownloadURL) }
+        let zipAssetURL: URL?
+        if let zipAsset {
+            guard let parsed = URL(string: zipAsset.browserDownloadURL),
+                  isAllowedGitHubUpdateURL(parsed) else {
+                throw ParseError.untrustedAssetURL
+            }
+            zipAssetURL = parsed
+        } else {
+            zipAssetURL = nil
+        }
 
         let rawTitle = (dto.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let title = rawTitle.isEmpty ? "PeanutButter v\(display)" : rawTitle
@@ -347,6 +378,10 @@ public final class AppUpdateManager: ObservableObject {
             openReleasePageInBrowser()
             return
         }
+        guard Self.isAllowedGitHubUpdateURL(assetURL) || (overrideAssetURL != nil && assetURL.isFileURL) else {
+            phase = .error("Blocked update download from untrusted host.")
+            return
+        }
 
         let rootDir: URL
         if let customStagingRoot {
@@ -363,7 +398,10 @@ public final class AppUpdateManager: ObservableObject {
         let fm = FileManager.default
         try? fm.removeItem(at: tagDir)
         do {
-            try fm.createDirectory(at: tagDir, withIntermediateDirectories: true)
+            try fm.createDirectory(at: rootDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: rootDir.path)
+            try fm.createDirectory(at: tagDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: tagDir.path)
         } catch {
             phase = .error("Could not prepare update folder: \(error.localizedDescription)")
             return
@@ -428,18 +466,47 @@ public final class AppUpdateManager: ObservableObject {
         }
     }
 
+    public nonisolated static func verifyCodeSignatureAndNotarization(at appURL: URL) -> Bool {
+        let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
+        guard let plistData = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
+              (plist["CFBundleIdentifier"] as? String) == expectedBundleIdentifier else {
+            return false
+        }
+
+        let codesignStatus = runProcess(
+            "/usr/bin/codesign",
+            arguments: ["--verify", "--deep", "--strict", "-R=\(designatedCodeRequirement)", appURL.path]
+        )
+        guard codesignStatus == 0 else { return false }
+
+        let spctlStatus = runProcess(
+            "/usr/sbin/spctl",
+            arguments: ["--assess", "--type", "execute", appURL.path]
+        )
+        return spctlStatus == 0
+    }
+
     private func unpackAndVerify(zipURL: URL, tagDir: URL, release: ReleaseInfo) async {
         let unpackDir = tagDir.appendingPathComponent("Unpacked", isDirectory: true)
         do {
             let stagedAppURL: URL = try await Task.detached(priority: .userInitiated) {
                 let fm = FileManager.default
                 try? fm.removeItem(at: unpackDir)
-                try fm.createDirectory(at: unpackDir, withIntermediateDirectories: true)
+                try fm.createDirectory(at: unpackDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: unpackDir.path)
 
+                try PlaybackFileManager.validateZipArchive(
+                    at: zipURL,
+                    maxUncompressedBytes: 2 * 1024 * 1024 * 1024,
+                    maxEntries: 10_000,
+                    verifyContiguousLayoutAndStreams: true
+                )
                 let dittoStatus = Self.runProcess("/usr/bin/ditto", arguments: ["-x", "-k", zipURL.path, unpackDir.path])
                 guard dittoStatus == 0 else {
                     throw NSError(domain: "AppUpdateManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to unpack PeanutButter.zip (exit \(dittoStatus))."])
                 }
+                try PlaybackFileManager.rejectSymlinksAndOutsideFiles(in: unpackDir)
 
                 let preferredApp = unpackDir.appendingPathComponent("PeanutButter.app")
                 let stagedApp: URL
@@ -452,21 +519,10 @@ public final class AppUpdateManager: ObservableObject {
                     throw NSError(domain: "AppUpdateManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "Downloaded archive did not contain PeanutButter.app."])
                 }
 
-                // Strip any quarantine attributes so relaunch does not nag Gatekeeper.
+                try Self.verifyExtractedAppBundle(at: stagedApp)
+
+                // Strip quarantine only AFTER full signature and notarization verification succeed.
                 _ = Self.runProcess("/usr/bin/xattr", arguments: ["-dr", "com.apple.quarantine", stagedApp.path])
-
-                // Verify bundle identifier and strict code signature before arming install.
-                let plistURL = stagedApp.appendingPathComponent("Contents/Info.plist")
-                guard let plistData = try? Data(contentsOf: plistURL),
-                      let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
-                      (plist["CFBundleIdentifier"] as? String) == Self.expectedBundleIdentifier else {
-                    throw NSError(domain: "AppUpdateManager", code: -3, userInfo: [NSLocalizedDescriptionKey: "Staged app bundle identifier mismatch."])
-                }
-
-                let codesignStatus = Self.runProcess("/usr/bin/codesign", arguments: ["--verify", "--deep", "--strict", stagedApp.path])
-                guard codesignStatus == 0 else {
-                    throw NSError(domain: "AppUpdateManager", code: -4, userInfo: [NSLocalizedDescriptionKey: "Code signature verification failed for downloaded update."])
-                }
 
                 try? fm.removeItem(at: zipURL)
                 return stagedApp
@@ -475,7 +531,42 @@ public final class AppUpdateManager: ObservableObject {
             isBannerDismissedForSession = false
             phase = .readyToInstall(release, stagedAppURL: stagedAppURL, installOnQuitArmed: true)
         } catch {
+            try? FileManager.default.removeItem(at: unpackDir)
             phase = .error(error.localizedDescription)
+        }
+    }
+
+    public nonisolated static func verifyNotarizedProductionBundle(at appURL: URL) -> Bool {
+        do {
+            try verifyExtractedAppBundle(at: appURL)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private nonisolated static func verifyExtractedAppBundle(at appURL: URL) throws {
+        let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
+        guard let plistData = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
+              (plist["CFBundleIdentifier"] as? String) == expectedBundleIdentifier else {
+            throw NSError(domain: "AppUpdateManager", code: -3, userInfo: [NSLocalizedDescriptionKey: "Staged app bundle identifier mismatch."])
+        }
+
+        let codesignStatus = runProcess(
+            "/usr/bin/codesign",
+            arguments: ["--verify", "--deep", "--strict", "-R=\(designatedCodeRequirement)", appURL.path]
+        )
+        guard codesignStatus == 0 else {
+            throw NSError(domain: "AppUpdateManager", code: -4, userInfo: [NSLocalizedDescriptionKey: "Code signature / Developer ID verification failed for downloaded update."])
+        }
+
+        let spctlStatus = runProcess(
+            "/usr/sbin/spctl",
+            arguments: ["--assess", "--type", "execute", appURL.path]
+        )
+        guard spctlStatus == 0 else {
+            throw NSError(domain: "AppUpdateManager", code: -5, userInfo: [NSLocalizedDescriptionKey: "Notarization / Gatekeeper assessment failed for downloaded update."])
         }
     }
 
@@ -520,48 +611,57 @@ public final class AppUpdateManager: ObservableObject {
     public func promptMoveToApplicationsIfNeeded() {
         guard !hasPromptedMoveToApplications else { return }
         guard !UserDefaults.standard.bool(forKey: Self.suppressMoveToApplicationsKey) else { return }
+        let bundleURL = Bundle.main.bundleURL
         let bundlePath = Bundle.main.bundlePath
         guard Self.shouldOfferMoveToApplications(bundlePath: bundlePath) else { return }
         hasPromptedMoveToApplications = true
 
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Move PeanutButter to Applications?"
-        alert.informativeText = "PeanutButter is currently running from your Downloads folder. Moving it to Applications keeps future updates fast and password-free."
-        alert.addButton(withTitle: "Move to Applications")
-        alert.addButton(withTitle: "Not Now")
-        alert.addButton(withTitle: "Don't Ask Again")
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            let isProductionSigned = await Task.detached(priority: .utility) {
+                Self.verifyNotarizedProductionBundle(at: bundleURL)
+            }.value
+            guard isProductionSigned else { return }
 
-        let response = alert.runModal()
-        switch response {
-        case .alertFirstButtonReturn:
-            let destURL = URL(fileURLWithPath: "/Applications/PeanutButter.app")
-            let downloadsAppURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?
-                .appendingPathComponent("PeanutButter.app")
-            let extraCleanup = bundlePath.contains("/AppTranslocation/") ? downloadsAppURL : nil
-            onBeforeRelaunch?()
-            if spawnSwapHelper(
-                targetAppURL: destURL,
-                stagedAppURL: Bundle.main.bundleURL,
-                relaunch: true,
-                stagingRootPath: "",
-                extraCleanupAppPath: extraCleanup?.path ?? ""
-            ) {
-                hasSpawnedSwapHelper = true
-                NSApplication.shared.terminate(nil)
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "Move PeanutButter to Applications?"
+            alert.informativeText = "PeanutButter is currently running from your Downloads folder. Moving it to Applications keeps future updates fast and password-free."
+            alert.addButton(withTitle: "Move to Applications")
+            alert.addButton(withTitle: "Not Now")
+            alert.addButton(withTitle: "Don't Ask Again")
+
+            let response = alert.runModal()
+            switch response {
+            case .alertFirstButtonReturn:
+                let destURL = URL(fileURLWithPath: "/Applications/PeanutButter.app")
+                let downloadsAppURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?
+                    .appendingPathComponent("PeanutButter.app")
+                let extraCleanup = bundlePath.contains("/AppTranslocation/") ? downloadsAppURL : nil
+                self.onBeforeRelaunch?()
+                if self.spawnSwapHelper(
+                    targetAppURL: destURL,
+                    stagedAppURL: bundleURL,
+                    relaunch: true,
+                    stagingRootPath: "",
+                    extraCleanupAppPath: extraCleanup?.path ?? ""
+                ) {
+                    self.hasSpawnedSwapHelper = true
+                    NSApplication.shared.terminate(nil)
+                }
+            case .alertThirdButtonReturn:
+                UserDefaults.standard.set(true, forKey: Self.suppressMoveToApplicationsKey)
+            default:
+                break
             }
-        case .alertThirdButtonReturn:
-            UserDefaults.standard.set(true, forKey: Self.suppressMoveToApplicationsKey)
-        default:
-            break
         }
     }
 
-    /// Returns a self-cleaning `/bin/sh` script that waits for `PID`, swaps the staged `.app` bundle
-    /// cleanly (using instant `mv` when possible with `ditto` fallback, automatic rollback, and an osascript
-    /// admin prompt fallback if `/Applications` is locked), relaunches first, and cleans up in the background.
+    /// Returns a self-cleaning `/bin/sh` script that waits for `PID`, re-verifies the staged bundle's
+    /// Team ID designated requirement and notarization right before swapping, atomically swaps `/Applications`,
+    /// and (when elevation is required) stages inside a root-owned `0700` directory without shell interpolation.
     public nonisolated static func buildSwapShellScript() -> String {
-        return """
+        return #"""
         #!/bin/sh
         APP_PID="$1"
         TARGET_APP="$2"
@@ -569,6 +669,7 @@ public final class AppUpdateManager: ObservableObject {
         RELAUNCH="$4"
         STAGING_ROOT="$5"
         EXTRA_CLEANUP_APP="${6:-}"
+        CODE_REQ='identifier "com.peanutbutter.app" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = M9F8W3VQ4P'
 
         if [ -n "$APP_PID" ] && [ "$APP_PID" -gt 0 ] 2>/dev/null; then
             TRIES=0
@@ -591,6 +692,8 @@ public final class AppUpdateManager: ObservableObject {
         BACKUP_APP="${TARGET_APP}.pb_backup_$$"
 
         perform_swap() {
+            /usr/bin/codesign --verify --deep --strict -R="$CODE_REQ" "$STAGED_APP" >/dev/null 2>&1 || return 1
+            /usr/sbin/spctl --assess --type execute "$STAGED_APP" >/dev/null 2>&1 || return 1
             if [ -e "$TARGET_APP" ]; then
                 mv "$TARGET_APP" "$BACKUP_APP" || return 1
             fi
@@ -615,12 +718,26 @@ public final class AppUpdateManager: ObservableObject {
                 exit 1
             fi
         else
-            ESC_TARGET=$(printf '%s' "$TARGET_APP" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
-            ESC_STAGED=$(printf '%s' "$STAGED_APP" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
-            ESC_BACKUP=$(printf '%s' "$BACKUP_APP" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
-            ADMIN_CMD="rm -rf \\"${ESC_BACKUP}\\" && ([ ! -e \\"${ESC_TARGET}\\" ] || mv \\"${ESC_TARGET}\\" \\"${ESC_BACKUP}\\") && (mv \\"${ESC_STAGED}\\" \\"${ESC_TARGET}\\" 2>/dev/null || /usr/bin/ditto \\"${ESC_STAGED}\\" \\"${ESC_TARGET}\\" || (rm -rf \\"${ESC_TARGET}\\"; [ -e \\"${ESC_BACKUP}\\" ] && mv \\"${ESC_BACKUP}\\" \\"${ESC_TARGET}\\"; exit 1)) && /usr/bin/xattr -dr com.apple.quarantine \\"${ESC_TARGET}\\" 2>/dev/null; rm -rf \\"${ESC_BACKUP}\\""
-            ESC_ADMIN=$(printf '%s' "$ADMIN_CMD" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
-            if ! /usr/bin/osascript -e "do shell script \\"${ESC_ADMIN}\\" with administrator privileges" >/dev/null 2>&1; then
+            if ! printf '%s\n' \
+                'on run argv' \
+                '    set stagedApp to quoted form of (item 1 of argv)' \
+                '    set targetApp to quoted form of (item 2 of argv)' \
+                '    set backupApp to quoted form of (item 3 of argv)' \
+                '    set codeReq to quoted form of (item 4 of argv)' \
+                '    set cmd to "ROOT_STAGE=$(/usr/bin/mktemp -d /private/tmp/pb_root_stage.XXXXXX) && /bin/chmod 700 \"$ROOT_STAGE\" && "' \
+                '    set cmd to cmd & "if /usr/bin/ditto " & stagedApp & " \"$ROOT_STAGE/PeanutButter.app\" && "' \
+                '    set cmd to cmd & "/usr/bin/codesign --verify --deep --strict -R=" & codeReq & " \"$ROOT_STAGE/PeanutButter.app\" >/dev/null 2>&1 && "' \
+                '    set cmd to cmd & "/usr/sbin/spctl --assess --type execute \"$ROOT_STAGE/PeanutButter.app\" >/dev/null 2>&1; then "' \
+                '    set cmd to cmd & "rm -rf " & backupApp & " && "' \
+                '    set cmd to cmd & "([ ! -e " & targetApp & " ] || mv " & targetApp & " " & backupApp & ") && "' \
+                '    set cmd to cmd & "(mv \"$ROOT_STAGE/PeanutButter.app\" " & targetApp & " 2>/dev/null || /usr/bin/ditto \"$ROOT_STAGE/PeanutButter.app\" " & targetApp & " || (rm -rf " & targetApp & "; [ -e " & backupApp & " ] && mv " & backupApp & " " & targetApp & "; rm -rf \"$ROOT_STAGE\"; exit 1)) && "' \
+                '    set cmd to cmd & "(/usr/bin/xattr -dr com.apple.quarantine " & targetApp & " 2>/dev/null || true) && "' \
+                '    set cmd to cmd & "rm -rf " & backupApp & " \"$ROOT_STAGE\"; "' \
+                '    set cmd to cmd & "else rm -rf \"$ROOT_STAGE\"; exit 1; fi"' \
+                '    do shell script cmd with administrator privileges' \
+                'end run' \
+                | /usr/bin/osascript - "$STAGED_APP" "$TARGET_APP" "$BACKUP_APP" "$CODE_REQ" >/dev/null 2>&1
+            then
                 rm -f "$0"
                 exit 1
             fi
@@ -644,7 +761,7 @@ public final class AppUpdateManager: ObservableObject {
 
         rm -f "$0"
         exit 0
-        """
+        """#
     }
 
     private func resolvedInstallTargetAndCleanup() -> (targetURL: URL, extraCleanupPath: String) {
@@ -721,7 +838,7 @@ public final class AppUpdateManager: ObservableObject {
         let scriptContent = Self.buildSwapShellScript()
         do {
             try scriptContent.write(to: scriptURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
         } catch {
             return false
         }
@@ -809,6 +926,25 @@ private final class DownloadSessionDelegate: NSObject, URLSessionDownloadDelegat
             completeOnce(.success(zipDestination))
         } catch {
             completeOnce(.failure(error))
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        if let targetURL = request.url, AppUpdateManager.isAllowedGitHubUpdateURL(targetURL) {
+            completionHandler(request)
+        } else {
+            completionHandler(nil)
+            completeOnce(.failure(NSError(
+                domain: "AppUpdateManager",
+                code: -10,
+                userInfo: [NSLocalizedDescriptionKey: "Blocked redirect to untrusted update host."]
+            )))
         }
     }
 

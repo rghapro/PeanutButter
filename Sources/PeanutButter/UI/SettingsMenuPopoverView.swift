@@ -19,6 +19,7 @@ public struct SettingsMenuPopoverView: View {
     @State private var isCustomPreRoll: Bool = false
     @State private var customPreRollText: String = ""
     @State private var installedVoices: [InstalledVoiceInfo] = GuideAudioGenerator.shared.installedVoiceList().filter { !$0.isNovelty }
+    @FocusState private var isRemotePasswordFocused: Bool
     
     public init(
         engine: MultitrackAudioEngine,
@@ -890,9 +891,46 @@ public struct SettingsMenuPopoverView: View {
                                     .padding(.top, 2)
 
                                 if remoteServer.isPasswordRequired {
-                                    SecureField("Remote Password...", text: $remoteServer.remotePassword)
+                                    HStack(spacing: 6) {
+                                        SecureField(
+                                            remoteServer.hasConfiguredPassword && remoteServer.remotePassword.isEmpty
+                                                ? "Password saved (type new to change)..."
+                                                : "Remote Password...",
+                                            text: $remoteServer.remotePassword
+                                        )
                                         .textFieldStyle(.roundedBorder)
                                         .font(.system(size: 11))
+                                        .focused($isRemotePasswordFocused)
+                                        .onSubmit {
+                                            remoteServer.commitPendingPassword()
+                                        }
+                                        .onChange(of: isRemotePasswordFocused) { focused in
+                                            if !focused {
+                                                remoteServer.commitPendingPassword()
+                                            }
+                                        }
+
+                                        if remoteServer.hasConfiguredPassword {
+                                            Button("Clear") {
+                                                isRemotePasswordFocused = false
+                                                remoteServer.clearPassword()
+                                                onStatus("Cleared Remote Password")
+                                            }
+                                            .buttonStyle(.plain)
+                                            .font(.system(size: 10, weight: .semibold))
+                                            .foregroundColor(Color(red: 0.98, green: 0.45, blue: 0.48))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 3)
+                                            .background(Color(white: 0.22))
+                                            .cornerRadius(4)
+                                        }
+                                    }
+
+                                    if !remoteServer.hasConfiguredPassword {
+                                        Text("Enter a password to allow remote connections")
+                                            .font(.system(size: 9.5, weight: .medium))
+                                            .foregroundColor(Color(red: 0.98, green: 0.72, blue: 0.30))
+                                    }
                                 }
                             }
                             .padding(.leading, 32)
@@ -1083,6 +1121,9 @@ public struct SettingsMenuPopoverView: View {
             isCustomPreRoll = ![1, 2, 4, 8].contains(engine.sectionPreRollLengthBars)
             customPreRollText = "\(engine.sectionPreRollLengthBars)"
             installedVoices = GuideAudioGenerator.shared.installedVoiceList().filter { !$0.isNovelty }
+        }
+        .onDisappear {
+            remoteServer.commitPendingPassword()
         }
     }
     

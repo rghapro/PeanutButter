@@ -170,11 +170,11 @@ public final class AudioDeviceManager: ObservableObject {
         let status = AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, nil, &propertySize)
         guard status == noErr, propertySize > 0 else { return "Audio Device (\(deviceID))" }
         
-        var nameCF: CFString = "" as CFString
-        var cfSize = UInt32(MemoryLayout<CFString>.size)
+        var nameCF: Unmanaged<CFString>? = nil
+        var cfSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let getStatus = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &cfSize, &nameCF)
-        if getStatus == noErr {
-            return nameCF as String
+        if getStatus == noErr, let resolved = nameCF?.takeRetainedValue() as String? {
+            return resolved
         }
         return "Audio Device (\(deviceID))"
     }
@@ -185,11 +185,11 @@ public final class AudioDeviceManager: ObservableObject {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var uidCF: CFString = "" as CFString
-        var cfSize = UInt32(MemoryLayout<CFString>.size)
+        var uidCF: Unmanaged<CFString>? = nil
+        var cfSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &cfSize, &uidCF)
-        if status == noErr {
-            return uidCF as String
+        if status == noErr, let resolved = uidCF?.takeRetainedValue() as String? {
+            return resolved
         }
         return UUID().uuidString
     }

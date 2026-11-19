@@ -1063,7 +1063,7 @@ public final class PlaybackImporter {
         }
         
         let fm = FileManager.default
-        let setlistsDir = destinationDirectory ?? LibraryBrowserManager.shared.setlistsDirectory
+        let setlistsDir = destinationDirectory ?? LibraryBrowserManager.localSetlistsDirectoryURL
         try fm.createDirectory(at: setlistsDir, withIntermediateDirectories: true)
         
         return try withReadOnlySnapshot(dbURL: dbURL) { db in

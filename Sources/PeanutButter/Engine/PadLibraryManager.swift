@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import AppKit
+import CryptoKit
 
 /// Represents an ambient pad sound library pack containing 12 key audio tracks
 public struct PadSoundPack: Identifiable, Hashable, Codable, Sendable {
@@ -53,12 +54,57 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
     @Published public var activePackId: String = "simple"
     
     private let customPadsDirectory: URL
+    private let includeCloudPads: Bool
     
-    public init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        self.customPadsDirectory = appSupport.appendingPathComponent("PeanutButter").appendingPathComponent("Pads")
-        let savedDefault = UserDefaults.standard.string(forKey: "Playback_DefaultAmbientPadId") ?? "simple"
-        self.activePackId = (savedDefault == "fundamental") ? "simple" : savedDefault
+    public static func opaqueCustomPackId(forFolderPath path: String) -> String {
+        let canonical = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        let digest = SHA256.hash(data: Data(canonical.utf8))
+        let prefix = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "custom-\(prefix)"
+    }
+
+    public func resolvePack(for idOrLegacyPath: String?) -> PadSoundPack? {
+        guard let target = idOrLegacyPath, !target.isEmpty else { return nil }
+        if target == "fundamental" {
+            return availablePacks.first(where: { $0.id == "simple" })
+        }
+        if let exact = availablePacks.first(where: { $0.id == target }) {
+            return exact
+        }
+        let canonicalTarget = URL(fileURLWithPath: target).resolvingSymlinksInPath().standardizedFileURL.path
+        if let byLegacyPath = availablePacks.first(where: { pack in
+            guard let fp = pack.folderPath else { return false }
+            return fp == target || URL(fileURLWithPath: fp).resolvingSymlinksInPath().standardizedFileURL.path == canonicalTarget
+        }) {
+            return byLegacyPath
+        }
+        let legacyHashedId = Self.opaqueCustomPackId(forFolderPath: canonicalTarget)
+        if let byHashedPath = availablePacks.first(where: { $0.id == legacyHashedId }) {
+            return byHashedPath
+        }
+        return availablePacks.first(where: { $0.name.caseInsensitiveCompare(target) == .orderedSame })
+    }
+
+    public init(customPadsDirectoryOverride: URL? = nil) {
+        if let customPadsDirectoryOverride {
+            self.customPadsDirectory = customPadsDirectoryOverride
+            self.includeCloudPads = false
+            self.activePackId = "simple"
+        } else {
+            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            self.customPadsDirectory = appSupport.appendingPathComponent("PeanutButter").appendingPathComponent("Pads")
+            self.includeCloudPads = true
+            let savedDefault = UserDefaults.standard.string(forKey: "Playback_DefaultAmbientPadId") ?? "simple"
+            if savedDefault == "fundamental" {
+                self.activePackId = "simple"
+            } else if savedDefault.hasPrefix("/") {
+                let migrated = Self.opaqueCustomPackId(forFolderPath: savedDefault)
+                self.activePackId = migrated
+                UserDefaults.standard.set(migrated, forKey: "Playback_DefaultAmbientPadId")
+            } else {
+                self.activePackId = savedDefault
+            }
+        }
         
         try? FileManager.default.createDirectory(at: customPadsDirectory, withIntermediateDirectories: true)
         
@@ -66,7 +112,7 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
     }
     
     public var activePack: PadSoundPack {
-        availablePacks.first(where: { $0.id == activePackId }) ?? availablePacks.first ?? PadSoundPack(id: "simple", name: "Simple", subtitle: "PeanutButterPads", isBundled: true)
+        resolvePack(for: activePackId) ?? availablePacks.first ?? PadSoundPack(id: "simple", name: "Simple", subtitle: "PeanutButterPads", isBundled: true)
     }
     
     public func reloadPacks() {
@@ -80,7 +126,7 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
         var customFoldersScanned: Set<String> = []
         let scanDirectories: [(url: URL, subtitle: String)] = {
             var dirs: [(URL, String)] = [(customPadsDirectory, "Custom Pad")]
-            if let cloudPadsDir = LibraryBrowserManager.cloudPadsDirectoryURL {
+            if includeCloudPads, let cloudPadsDir = LibraryBrowserManager.cloudPadsDirectoryURL {
                 dirs.append((cloudPadsDir, "Cloud Custom Pad"))
             }
             return dirs
@@ -94,7 +140,7 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
                         guard !customFoldersScanned.contains(folderName.lowercased()) else { continue }
                         customFoldersScanned.insert(folderName.lowercased())
                         let pack = PadSoundPack(
-                            id: sub.path,
+                            id: Self.opaqueCustomPackId(forFolderPath: sub.path),
                             name: folderName,
                             subtitle: entry.subtitle,
                             folderPath: sub.path,
@@ -109,7 +155,11 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
         let applyPacks = {
             self.availablePacks = packs
             if !packs.contains(where: { $0.id == self.activePackId }) {
-                self.activePackId = "simple"
+                if let migrated = self.resolvePack(for: self.activePackId) {
+                    self.activePackId = migrated.id
+                } else {
+                    self.activePackId = "simple"
+                }
             }
         }
         if Thread.isMainThread {
@@ -120,19 +170,20 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
     }
     
     public func selectPack(id: String) {
-        activePackId = id
+        activePackId = resolvePack(for: id)?.id ?? id
     }
     
     /// Deletes a custom (non-bundled) pad pack from Application Support and falls back to Fundamental if active (4.7).
     public func deletePack(id: String) {
-        guard let pack = availablePacks.first(where: { $0.id == id }), !pack.isBundled else { return }
+        guard let pack = resolvePack(for: id), !pack.isBundled else { return }
         if let folderPath = pack.folderPath {
             try? FileManager.default.removeItem(atPath: folderPath)
         }
-        if activePackId == id {
+        if activePackId == id || activePackId == pack.id {
             activePackId = "simple"
         }
-        if UserDefaults.standard.string(forKey: "Playback_DefaultAmbientPadId") == id {
+        let savedDefault = UserDefaults.standard.string(forKey: "Playback_DefaultAmbientPadId")
+        if savedDefault == id || savedDefault == pack.id || savedDefault == pack.folderPath {
             UserDefaults.standard.set("simple", forKey: "Playback_DefaultAmbientPadId")
         }
         reloadPacks()
@@ -162,7 +213,7 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
             return .failure(.reservedName)
         }
 
-        guard let pack = availablePacks.first(where: { $0.id == id }),
+        guard let pack = resolvePack(for: id),
               !pack.isBundled,
               let folderPath = pack.folderPath else {
             return .failure(.notFound)
@@ -179,7 +230,7 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
         }
 
         let hasExistingPackConflict = availablePacks.contains { other in
-            other.id != id && !other.isBundled && other.name.lowercased() == lowerSanitized
+            other.id != pack.id && !other.isBundled && other.name.lowercased() == lowerSanitized
         }
         if hasExistingPackConflict {
             return .failure(.duplicateName(sanitized))
@@ -203,11 +254,12 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
             return .failure(.moveFailed(error.localizedDescription))
         }
 
-        let newId = newURL.path
-        if activePackId == id {
+        let newId = Self.opaqueCustomPackId(forFolderPath: newURL.path)
+        if activePackId == id || activePackId == pack.id {
             activePackId = newId
         }
-        if UserDefaults.standard.string(forKey: "Playback_DefaultAmbientPadId") == id {
+        let savedDefault = UserDefaults.standard.string(forKey: "Playback_DefaultAmbientPadId")
+        if savedDefault == id || savedDefault == pack.id || savedDefault == folderPath {
             UserDefaults.standard.set(newId, forKey: "Playback_DefaultAmbientPadId")
         }
         reloadPacks()
@@ -241,7 +293,7 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
                 try? fm.copyItem(at: firstURL, to: dest)
                 
                 self.reloadPacks()
-                self.activePackId = dest.path
+                self.activePackId = Self.opaqueCustomPackId(forFolderPath: dest.path)
                 completion(true)
             } else {
                 // User picked multiple audio files
@@ -255,7 +307,7 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
                 }
                 
                 self.reloadPacks()
-                self.activePackId = dest.path
+                self.activePackId = Self.opaqueCustomPackId(forFolderPath: dest.path)
                 completion(true)
             }
         }
@@ -263,7 +315,7 @@ public final class PadLibraryManager: ObservableObject, @unchecked Sendable {
     
     public func getPadBuffer(for key: String, packId: String? = nil, format: AVAudioFormat) -> AVAudioPCMBuffer? {
         let chosenId = packId ?? activePackId
-        let pack = availablePacks.first(where: { $0.id == chosenId }) ?? activePack
+        let pack = resolvePack(for: chosenId) ?? activePack
         let normKey = AudioSampleBank.normalizeKeyForPad(key)
         
         if pack.isBundled || pack.folderPath == nil {

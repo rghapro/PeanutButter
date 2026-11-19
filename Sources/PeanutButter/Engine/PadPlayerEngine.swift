@@ -26,8 +26,18 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
     @Published public private(set) var activeKey: String = "C"
     @Published public private(set) var activePackId: String? = nil
     @Published public private(set) var isPlaying: Bool = false
+
+    // Internal lock-protected audio thread state (never trigger @Published on CoreAudio thread)
+    private var renderIsPlaying: Bool = false
+    private var renderActiveKey: String = "C"
+    private var renderActivePackId: String? = nil
     public private(set) var isFadingIn: Bool = false
     public private(set) var isFadingOut: Bool = false
+
+    // Fixed-capacity retirement slots so AVAudioPCMBuffer dealloc/free never executes on CoreAudio's RT thread
+    private var retiredBufferSlots: [AVAudioPCMBuffer?] = Array(repeating: nil, count: 256)
+    private var retiredBufferCount: Int = 0
+    private var housekeepingTimer: DispatchSourceTimer?
     
     private var fadeGain: Float = 0.0
     private var padBusGain: Float = 1.0
@@ -88,6 +98,8 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
     }
     
     deinit {
+        housekeepingTimer?.cancel()
+        housekeepingTimer = nil
         detach()
     }
     
@@ -105,7 +117,42 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         self.processingFormat = format
     }
     
+    private func ensureHousekeepingTimerOnMain() {
+        let startTimer: @Sendable () -> Void = { [weak self] in
+            guard let self = self, self.housekeepingTimer == nil else { return }
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(deadline: .now() + .milliseconds(66), repeating: .milliseconds(66), leeway: .milliseconds(10))
+            timer.setEventHandler { [weak self] in
+                guard let self = self else { return }
+                self.syncUIStateAndDrainRetiredBuffers()
+                os_unfair_lock_lock(&self.lock)
+                let stillBusy = self.renderIsPlaying || self.isFadingOut || self.fadeGain > 0.0001 || self.retiredBufferCount > 0
+                os_unfair_lock_unlock(&self.lock)
+                if !stillBusy {
+                    self.housekeepingTimer?.cancel()
+                    self.housekeepingTimer = nil
+                }
+            }
+            self.housekeepingTimer = timer
+            timer.resume()
+        }
+        if Thread.isMainThread {
+            startTimer()
+        } else {
+            DispatchQueue.main.async(execute: startTimer)
+        }
+    }
+
     public func detach() {
+        if Thread.isMainThread {
+            housekeepingTimer?.cancel()
+            housekeepingTimer = nil
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.housekeepingTimer?.cancel()
+                self?.housekeepingTimer = nil
+            }
+        }
         if let existing = sourceNode {
             if let engine = audioEngine {
                 engine.disconnectNodeOutput(existing)
@@ -158,6 +205,67 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         }
     }
     
+    public var isFadingOutState: Bool {
+        os_unfair_lock_lock(&lock)
+        let fading = isFadingOut
+        os_unfair_lock_unlock(&lock)
+        return fading
+    }
+
+    /// Must be called ONLY while holding `lock` on the RT thread. Keeps displaced buffers alive until drained on Main thread.
+    private func retireBufferLocked(_ buffer: AVAudioPCMBuffer?) {
+        guard let buffer, retiredBufferCount < retiredBufferSlots.count else { return }
+        retiredBufferSlots[retiredBufferCount] = buffer
+        retiredBufferCount += 1
+    }
+
+    /// Must be called ONLY while holding `lock`. Caller drops returned array after unlocking.
+    private func takeRetiredBuffersLocked() -> [AVAudioPCMBuffer] {
+        guard retiredBufferCount > 0 else { return [] }
+        var drained: [AVAudioPCMBuffer] = []
+        drained.reserveCapacity(retiredBufferCount)
+        for idx in 0..<retiredBufferCount {
+            if let buf = retiredBufferSlots[idx] {
+                drained.append(buf)
+                retiredBufferSlots[idx] = nil
+            }
+        }
+        retiredBufferCount = 0
+        return drained
+    }
+
+    /// Releases any buffers retired by the CoreAudio thread and publishes render state changes on Main thread.
+    public func syncUIStateAndDrainRetiredBuffers() {
+        os_unfair_lock_lock(&lock)
+        let playingNow = renderIsPlaying
+        let keyNow = renderActiveKey
+        let packNow = renderActivePackId
+        let drained = takeRetiredBuffersLocked()
+        os_unfair_lock_unlock(&lock)
+
+        _ = drained // Drop outside lock on caller thread (Main thread during UI ticks)
+
+        if Thread.isMainThread {
+            if isPlaying != playingNow { isPlaying = playingNow }
+            if activeKey != keyNow { activeKey = keyNow }
+            if activePackId != packNow { activePackId = packNow }
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                os_unfair_lock_lock(&self.lock)
+                let p = self.renderIsPlaying
+                let k = self.renderActiveKey
+                let pk = self.renderActivePackId
+                let more = self.takeRetiredBuffersLocked()
+                os_unfair_lock_unlock(&self.lock)
+                _ = more
+                if self.isPlaying != p { self.isPlaying = p }
+                if self.activeKey != k { self.activeKey = k }
+                if self.activePackId != pk { self.activePackId = pk }
+            }
+        }
+    }
+
     public func start(key: String, packId: String? = nil) {
         let normKey = AudioSampleBank.normalizeKeyForPad(key)
         let fmt = processingFormat ?? AVAudioFormat(standardFormatWithSampleRate: 44100.0, channels: 2)!
@@ -171,17 +279,19 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         
         // If already playing the same key and same pack and fading out, reverse to fade in smoothly
-        if isPlaying && activeKey == normKey && activePackId == packId {
+        if renderIsPlaying && renderActiveKey == normKey && renderActivePackId == packId {
             isFadingOut = false
             isFadingIn = true
             os_unfair_lock_unlock(&lock)
+            syncUIStateAndDrainRetiredBuffers()
             return
         }
         
         // If playing a DIFFERENT key or pack, smoothly crossfade
-        if isPlaying && activeBuffer != nil {
-            activeKey = normKey
-            activePackId = packId
+        if renderIsPlaying && activeBuffer != nil {
+            let displacedNext = nextBuffer
+            renderActiveKey = normKey
+            renderActivePackId = packId
             nextBuffer = buffer
             nextBufferLength = Int64(buffer.frameLength)
             if let ch = buffer.floatChannelData {
@@ -196,12 +306,16 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
             keyCrossfadeProgress = 0.0
             isFadingOut = false
             os_unfair_lock_unlock(&lock)
+            _ = displacedNext
+            syncUIStateAndDrainRetiredBuffers()
             return
         }
         
         // Fresh start
-        activeKey = normKey
-        activePackId = packId ?? PadLibraryManager.shared.activePackId
+        let displacedActive = activeBuffer
+        let displacedNext = nextBuffer
+        renderActiveKey = normKey
+        renderActivePackId = packId ?? PadLibraryManager.shared.activePackId
         activeBuffer = buffer
         activeBufferLength = Int64(buffer.frameLength)
         if let ch = buffer.floatChannelData {
@@ -215,21 +329,27 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         crossfadeFrame = 0
         
         nextBuffer = nil
+        nextDataL = nil
+        nextDataR = nil
         isKeyCrossfading = false
         
-        isPlaying = true
+        renderIsPlaying = true
         isFadingIn = true
         isFadingOut = false
         fadeGain = 0.0
         
         os_unfair_lock_unlock(&lock)
+        _ = displacedActive
+        _ = displacedNext
+        ensureHousekeepingTimerOnMain()
+        syncUIStateAndDrainRetiredBuffers()
     }
     
     public func transitionToKey(_ key: String, packId: String? = nil) {
         let normKey = AudioSampleBank.normalizeKeyForPad(key)
         let resolvedPack = packId ?? PadLibraryManager.shared.activePackId
         os_unfair_lock_lock(&lock)
-        guard isPlaying, (activeKey != normKey || activePackId != resolvedPack) else {
+        guard renderIsPlaying, (renderActiveKey != normKey || renderActivePackId != resolvedPack) else {
             os_unfair_lock_unlock(&lock)
             return
         }
@@ -242,8 +362,9 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         applyMicroEdgeFades(to: buffer)
         
         os_unfair_lock_lock(&lock)
-        activeKey = normKey
-        activePackId = resolvedPack
+        let displacedNext = nextBuffer
+        renderActiveKey = normKey
+        renderActivePackId = resolvedPack
         nextBuffer = buffer
         nextBufferLength = Int64(buffer.frameLength)
         if let ch = buffer.floatChannelData {
@@ -257,15 +378,19 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         isKeyCrossfading = true
         keyCrossfadeProgress = 0.0
         os_unfair_lock_unlock(&lock)
+        _ = displacedNext
+        ensureHousekeepingTimerOnMain()
+        syncUIStateAndDrainRetiredBuffers()
     }
     
     public func reloadCurrentKey(packId: String? = nil) {
         os_unfair_lock_lock(&lock)
-        let curKey = activeKey
+        let curKey = renderActiveKey
         let targetPack = packId ?? PadLibraryManager.shared.activePackId
-        guard isPlaying else {
-            activePackId = targetPack
+        guard renderIsPlaying else {
+            renderActivePackId = targetPack
             os_unfair_lock_unlock(&lock)
+            syncUIStateAndDrainRetiredBuffers()
             return
         }
         os_unfair_lock_unlock(&lock)
@@ -277,7 +402,8 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         applyMicroEdgeFades(to: buffer)
         
         os_unfair_lock_lock(&lock)
-        activePackId = targetPack
+        let displacedNext = nextBuffer
+        renderActivePackId = targetPack
         nextBuffer = buffer
         nextBufferLength = Int64(buffer.frameLength)
         if let ch = buffer.floatChannelData {
@@ -291,50 +417,93 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         isKeyCrossfading = true
         keyCrossfadeProgress = 0.0
         os_unfair_lock_unlock(&lock)
+        _ = displacedNext
+        ensureHousekeepingTimerOnMain()
+        syncUIStateAndDrainRetiredBuffers()
     }
 
     /// Updates `activePackId` after a custom pad pack is renamed on disk without interrupting playback.
     public func updateActivePackIdAfterRename(from oldId: String, to newId: String) {
         os_unfair_lock_lock(&lock)
-        let matches = (activePackId == oldId)
+        let matches = (renderActivePackId == oldId)
+        if matches {
+            renderActivePackId = newId
+        }
         os_unfair_lock_unlock(&lock)
         guard matches else { return }
 
-        let apply = {
-            os_unfair_lock_lock(&self.lock)
-            if self.activePackId == oldId {
-                self.activePackId = newId
-            }
-            os_unfair_lock_unlock(&self.lock)
-        }
         if Thread.isMainThread {
-            apply()
+            if activePackId != newId { activePackId = newId }
         } else {
-            DispatchQueue.main.async(execute: apply)
+            DispatchQueue.main.async { [weak self] in
+                self?.syncUIStateAndDrainRetiredBuffers()
+            }
         }
     }
     
     public func stop() {
+        var shouldKeepHousekeeping = false
         os_unfair_lock_lock(&lock)
-        if isPlaying {
+        if renderIsPlaying {
             isFadingIn = false
             isFadingOut = true
+            shouldKeepHousekeeping = true
         }
         os_unfair_lock_unlock(&lock)
+        if shouldKeepHousekeeping {
+            ensureHousekeepingTimerOnMain()
+        }
     }
     
     public func stopImmediately() {
         os_unfair_lock_lock(&lock)
-        isPlaying = false
+        let displacedNext = nextBuffer
+        renderIsPlaying = false
         isFadingIn = false
         isFadingOut = false
         fadeGain = 0.0
+        nextBuffer = nil
+        nextDataL = nil
+        nextDataR = nil
+        isKeyCrossfading = false
         os_unfair_lock_unlock(&lock)
+        _ = displacedNext
+        syncUIStateAndDrainRetiredBuffers()
+    }
+
+    func loadBufferForTesting(_ buffer: AVAudioPCMBuffer, key: String = "C", immediateGain: Float = 1.0) {
+        os_unfair_lock_lock(&lock)
+        let displacedActive = activeBuffer
+        let displacedNext = nextBuffer
+        activeBuffer = buffer
+        activeBufferLength = Int64(buffer.frameLength)
+        if let ch = buffer.floatChannelData {
+            activeDataL = ch[0]
+            activeDataR = buffer.format.channelCount > 1 ? ch[1] : ch[0]
+        } else {
+            activeDataL = nil
+            activeDataR = nil
+        }
+        nextBuffer = nil
+        nextDataL = nil
+        nextDataR = nil
+        isKeyCrossfading = false
+        primaryFrame = 0
+        crossfadeFrame = 0
+        renderActiveKey = key
+        renderIsPlaying = true
+        isFadingIn = false
+        isFadingOut = false
+        fadeGain = immediateGain
+        os_unfair_lock_unlock(&lock)
+        _ = displacedActive
+        _ = displacedNext
+        ensureHousekeepingTimerOnMain()
     }
     
     public var hasActiveAudioToRender: Bool {
         os_unfair_lock_lock(&lock)
-        let active = (isPlaying || fadeGain > 0.0001) && activeDataL != nil && activeDataR != nil && activeBufferLength > 0
+        let active = (renderIsPlaying || fadeGain > 0.0001) && activeDataL != nil && activeDataR != nil && activeBufferLength > 0
         os_unfair_lock_unlock(&lock)
         return active
     }
@@ -352,7 +521,7 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         
-        guard (isPlaying || fadeGain > 0.0001),
+        guard (renderIsPlaying || fadeGain > 0.0001),
               let initialBufL = activeDataL,
               let initialBufR = activeDataR,
               activeBufferLength > 0 else {
@@ -376,10 +545,17 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
         var loopPoint = max(1, curBufferLength - crossfadeFrames)
         
         let busVol = padBusGain * padVolume * 0.355 // Boosted +3 dB (-9 dB total trim vs raw sample) while keeping fader in place
+        let safeBusVol = busVol.isFinite ? max(0.0, min(8.0, busVol)) : 0.0
+        let safeMaster = masterGain.isFinite ? max(0.0, min(8.0, masterGain)) : 0.0
         let panGainL: Float = padPan <= 0 ? 1.0 : max(0.0, 1.0 - padPan)
         let panGainR: Float = padPan >= 0 ? 1.0 : max(0.0, 1.0 + padPan)
         var blockPeakL: Float = 0.0
         var blockPeakR: Float = 0.0
+
+        @inline(__always)
+        func sanitizePadSample(_ x: Float) -> Float {
+            x.isFinite ? max(-8.0, min(8.0, x)) : 0.0
+        }
         
         for i in 0..<frameCount {
             // Envelope update
@@ -394,7 +570,7 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
                 if fadeGain <= 0.0 {
                     fadeGain = 0.0
                     isFadingOut = false
-                    isPlaying = false
+                    renderIsPlaying = false
                     break
                 }
             }
@@ -404,8 +580,8 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
             var sR: Float = 0.0
             
             if primaryFrame < loopPoint {
-                sL = bufL[Int(primaryFrame)]
-                sR = bufR[Int(primaryFrame)]
+                sL = sanitizePadSample(bufL[Int(primaryFrame)])
+                sR = sanitizePadSample(bufR[Int(primaryFrame)])
                 primaryFrame += 1
             } else {
                 // In loop self-crossfade region
@@ -418,11 +594,11 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
                 let w1 = cos(angle)
                 let w2 = sin(angle)
                 
-                let s1L = bufL[Int(min(primaryFrame, curBufferLength - 1))]
-                let s1R = bufR[Int(min(primaryFrame, curBufferLength - 1))]
+                let s1L = sanitizePadSample(bufL[Int(min(primaryFrame, curBufferLength - 1))])
+                let s1R = sanitizePadSample(bufR[Int(min(primaryFrame, curBufferLength - 1))])
                 
-                let s2L = bufL[Int(crossfadeFrame % curBufferLength)]
-                let s2R = bufR[Int(crossfadeFrame % curBufferLength)]
+                let s2L = sanitizePadSample(bufL[Int(crossfadeFrame % curBufferLength)])
+                let s2R = sanitizePadSample(bufR[Int(crossfadeFrame % curBufferLength)])
                 
                 sL = (s1L * w1) + (s2L * w2)
                 sR = (s1R * w1) + (s2R * w2)
@@ -447,8 +623,8 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
                 let kwOld = cos(kAngle)
                 let kwNew = sin(kAngle)
                 
-                let nSampL = nL[Int(nextFrame % nextBufferLength)]
-                let nSampR = nR[Int(nextFrame % nextBufferLength)]
+                let nSampL = sanitizePadSample(nL[Int(nextFrame % nextBufferLength)])
+                let nSampR = sanitizePadSample(nR[Int(nextFrame % nextBufferLength)])
                 nextFrame += 1
                 
                 sL = (sL * kwOld) + (nSampL * kwNew)
@@ -457,6 +633,8 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
                 keyCrossfadeProgress += keyStep
                 if keyCrossfadeProgress >= 1.0 {
                     isKeyCrossfading = false
+                    // Keep displaced buffer alive in retired slots so free() runs on main thread outside RT callback.
+                    retireBufferLocked(activeBuffer)
                     activeBuffer = nextBuffer
                     activeBufferLength = nextBufferLength
                     activeDataL = nextDataL
@@ -474,14 +652,21 @@ public final class PadPlayerEngine: ObservableObject, @unchecked Sendable {
                         loopPoint = lp
                     }
                     nextBuffer = nil
+                    nextDataL = nil
+                    nextDataR = nil
                 }
             }
             
-            let curGain = fadeGain * busVol
-            let preMasterL = sL * curGain * panGainL
-            let preMasterR = sR * curGain * panGainR
-            let outSampleL = preMasterL * masterGain
-            let outSampleR = preMasterR * masterGain
+            let safeFade = fadeGain.isFinite ? max(0.0, min(1.0, fadeGain)) : 0.0
+            let curGain = safeFade * safeBusVol
+            let rawPreL = sL * curGain * panGainL
+            let rawPreR = sR * curGain * panGainR
+            let preMasterL = rawPreL.isFinite ? rawPreL : 0.0
+            let preMasterR = rawPreR.isFinite ? rawPreR : 0.0
+            let rawOutL = preMasterL * safeMaster
+            let rawOutR = preMasterR * safeMaster
+            let outSampleL = rawOutL.isFinite ? rawOutL : 0.0
+            let outSampleR = rawOutR.isFinite ? rawOutR : 0.0
             outL[i] += outSampleL
             if chR != chL {
                 outR[i] += outSampleR
