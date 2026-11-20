@@ -104,8 +104,13 @@ extension MultitrackAudioEngine {
                 if section.isIntroOrOutro {
                     if !isPadActive || !padPlayer.isPlaying {
                         startPadPlayer()
+                    } else if isPadLinked {
+                        syncActivePadToCurrentSongIfNeeded()
                     }
                 } else {
+                    if isPadLinked, let lockedKey = linkedSongPadKey {
+                        currentPadKey = lockedKey
+                    }
                     isPadActive = true
                     if padPlayer.isPlaying {
                         padPlayer.stop()
@@ -113,6 +118,8 @@ extension MultitrackAudioEngine {
                 }
             } else if !isPadActive || !padPlayer.isPlaying {
                 startPadPlayer()
+            } else if isPadLinked {
+                syncActivePadToCurrentSongIfNeeded()
             }
         } else if isPadActive {
             if currentSong.padIntroOutroOnly {
@@ -121,14 +128,14 @@ extension MultitrackAudioEngine {
                 } else if isPadLinked && section.isIntroOrOutro && !padPlayer.isPlaying {
                     startPadPlayer()
                 }
-            } else if isPadLinked {
-                let candidateKey = !currentSong.currentTransposedKey.isEmpty && currentSong.currentTransposedKey != "—" ? currentSong.currentTransposedKey : currentSong.musicalKey
-                let normalized = AudioSampleBank.normalizeKeyForPad(candidateKey)
+            } else if isPadLinked, let normalized = linkedSongPadKey {
                 if currentPadKey != normalized || padPlayer.activePackId != currentSong.padPresetId {
                     currentPadKey = normalized
                     padPlayer.transitionToKey(normalized, packId: currentSong.padPresetId)
                 }
             }
+        } else if isPadLinked, let normalized = linkedSongPadKey {
+            currentPadKey = normalized
         }
         
         if !isMIDIMuted {
@@ -345,7 +352,7 @@ extension MultitrackAudioEngine {
         }
         
         let needsPreGenClick = !nextSong.excludesClickAndGuide && nextSong.clickSource == .generated && (generatedClickBuffers[nextSong.id]?.frameLength ?? 0) <= 1
-        let expectedNextGuideState = Self.defaultGuideLoopState(for: nextSong)
+        let expectedNextGuideState = expectedDefaultGuideLoopState(forSongAt: currentSongIndex + 1, song: nextSong)
         let needsPreGenGuide = !nextSong.excludesClickAndGuide && nextSong.guideSource == .generated &&
             ((generatedGuideBuffers[nextSong.id]?.frameLength ?? 0) <= 1 || generatedGuideLoopStates[nextSong.id] != expectedNextGuideState)
         if needsPreGenClick || needsPreGenGuide {
@@ -661,6 +668,9 @@ extension MultitrackAudioEngine {
                         syncActivePadToCurrentSongIfNeeded()
                     }
                 } else {
+                    if isPadLinked, let lockedKey = linkedSongPadKey {
+                        currentPadKey = lockedKey
+                    }
                     isPadActive = true
                     if padPlayer.isPlaying {
                         padPlayer.stop()
@@ -687,6 +697,8 @@ extension MultitrackAudioEngine {
             } else {
                 syncActivePadToCurrentSongIfNeeded()
             }
+        } else if isPadLinked, let lockedKey = linkedSongPadKey {
+            currentPadKey = lockedKey
         }
         
         // Whenever the song is started from anywhere in the song, transmit ProPresenter Playlist (F-1) & Playlist Item (F#-1) if configured
@@ -928,17 +940,9 @@ extension MultitrackAudioEngine {
             updateAutomationSelectionForPlayhead(at: clampedTime)
         }
         if !songEndBaseVolumes.isEmpty {
-            let effectiveEndTime = currentSong.sections.isEmpty
-                ? currentSongDuration
-                : (currentSong.sections.map { $0.endTime }.max() ?? currentSongDuration)
-            if clampedTime < max(0.0, effectiveEndTime - 5.0) {
-                for track in tracks {
-                    if let baseVol = songEndBaseVolumes[track.id] {
-                        track.setLiveVolume(baseVol, forceDisplay: true)
-                    }
-                }
-                songEndBaseVolumes.removeAll()
-                updateAllNonPadTrackGainsFastPath()
+            let fadeWindow = resolveSongEndFadeWindow(for: currentSong, fallbackDuration: currentSongDuration)
+            if fadeWindow == nil || clampedTime < (fadeWindow?.start ?? 0.0) {
+                restoreSongEndFadeVolumesIfNeeded()
             }
         }
     }
@@ -994,7 +998,11 @@ extension MultitrackAudioEngine {
         if didJumpToQueuedSection {
             queuedNextSection = nil
             if !currentSong.excludesClickAndGuide {
-                regenerateGuideTrack()
+                if currentSong.guideSource == .generated {
+                    regenerateGuideTrack()
+                } else if currentSong.cueNextSongSection {
+                    applyGuideBuffer()
+                }
             }
             objectWillChange.send()
         }
@@ -1005,7 +1013,11 @@ extension MultitrackAudioEngine {
             loopedSection = nil
             singleLoopRemaining = 0
             if !currentSong.excludesClickAndGuide {
-                regenerateGuideTrack()
+                if currentSong.guideSource == .generated {
+                    regenerateGuideTrack()
+                } else if currentSong.cueNextSongSection {
+                    applyGuideBuffer()
+                }
             }
             objectWillChange.send()
         }
@@ -1017,7 +1029,11 @@ extension MultitrackAudioEngine {
             singleLoopRemaining = 0
             syncMixState()
             if !currentSong.excludesClickAndGuide {
-                regenerateGuideTrack()
+                if currentSong.guideSource == .generated {
+                    regenerateGuideTrack()
+                } else if currentSong.cueNextSongSection {
+                    applyGuideBuffer()
+                }
             }
             objectWillChange.send()
         }
@@ -1119,38 +1135,8 @@ extension MultitrackAudioEngine {
             }
         }
         
-        // 5-Second Fade Out on Song End if enabled (respecting section trims)
-        if currentSong.endFadeOutEnabled {
-            let effectiveEndTime: TimeInterval = {
-                if !currentSong.sections.isEmpty {
-                    return currentSong.sections.map { $0.endTime }.max() ?? currentSongDuration
-                }
-                return currentSongDuration
-            }()
-            let fadeStart = max(0.0, effectiveEndTime - 5.0)
-            if currentSec >= fadeStart && currentSec <= effectiveEndTime && effectiveEndTime > 5.0 {
-                let remaining = max(0.0, effectiveEndTime - currentSec)
-                let progress = 1.0 - (remaining / 5.0)
-                let t = Float((1.0 - cos(progress * .pi)) * 0.5)
-                for track in tracks {
-                    if isExemptFromFade(track) { continue }
-                    if songEndBaseVolumes[track.id] == nil {
-                        songEndBaseVolumes[track.id] = track.volume
-                    }
-                    let baseVol = songEndBaseVolumes[track.id] ?? 0.80
-                    track.setLiveVolume(max(0.0, baseVol * (1.0 - t)), forceDisplay: remaining <= 0.01)
-                }
-                updateAllNonPadTrackGainsFastPath()
-            } else if currentSec < fadeStart && !songEndBaseVolumes.isEmpty {
-                for track in tracks {
-                    if let baseVol = songEndBaseVolumes[track.id] {
-                        track.setLiveVolume(baseVol, forceDisplay: true)
-                    }
-                }
-                songEndBaseVolumes.removeAll()
-                updateAllNonPadTrackGainsFastPath()
-            }
-        }
+        // Automatic Fade Out on Song End ("Fade End" over End section or "5 Second Fade Out")
+        applySongEndFadeIfNeeded(at: currentSec)
         
         playbackOffsetSeconds = effectiveDisplaySec
         updateTransportPosition(to: effectiveDisplaySec)
@@ -1164,23 +1150,70 @@ extension MultitrackAudioEngine {
         let isLastSong = index >= currentSetlist.songs.count - 1
         let incompatible = !isLastSong && (type == .autoLink || type == .overlap || type == .crossfade)
         let prevClickCutoff = currentSetlist.songs[index].isContinueClickEffective(isLastSongInSetlist: isLastSong)
+        let prevType = currentSetlist.songs[index].transitionType
+        let prevCueNext = currentSetlist.songs[index].isCueNextSongSectionEffective(isLastSongInSetlist: isLastSong)
         currentSetlist.songs[index].transitionType = type
         if incompatible {
             currentSetlist.songs[index].continuePad = false
             currentSetlist.songs[index].continueClick = false
+        } else {
+            currentSetlist.songs[index].cueNextSongSection = false
         }
         let nextClickCutoff = currentSetlist.songs[index].isContinueClickEffective(isLastSongInSetlist: isLastSong)
+        let nextCueNext = currentSetlist.songs[index].isCueNextSongSectionEffective(isLastSongInSetlist: isLastSong)
         if prevClickCutoff != nextClickCutoff {
             generatedClickBuffers.removeValue(forKey: songId)
+        }
+        let guideCueChanged = (prevCueNext != nextCueNext) || (nextCueNext && prevType != type)
+        if guideCueChanged {
+            generatedGuideBuffers.removeValue(forKey: songId)
+            generatedGuideLoopStates.removeValue(forKey: songId)
         }
         if index == currentSongIndex {
             currentSong.transitionType = type
             if incompatible {
                 currentSong.continuePad = false
                 currentSong.continueClick = false
+            } else {
+                currentSong.cueNextSongSection = false
             }
             if prevClickCutoff != nextClickCutoff && !currentSong.excludesClickAndGuide && currentSong.clickSource == .generated {
                 regenerateClickTrack()
+            }
+            if guideCueChanged && !currentSong.excludesClickAndGuide {
+                if currentSong.guideSource == .generated {
+                    regenerateGuideTrack()
+                } else {
+                    applyGuideBuffer()
+                }
+            }
+            syncMixState()
+        } else if index == currentSongIndex + 1 {
+            syncMixState()
+        }
+        markSessionChanged()
+        objectWillChange.send()
+    }
+    
+    public func updateSongCueNextSongSection(at index: Int, enabled: Bool) {
+        guard index >= 0 && index < currentSetlist.songs.count else { return }
+        let isLastSong = index >= currentSetlist.songs.count - 1
+        let t = currentSetlist.songs[index].transitionType
+        let allowed = !isLastSong && (t == .autoLink || t == .overlap || t == .crossfade)
+        let resolved = allowed ? enabled : false
+        let songId = currentSetlist.songs[index].id
+
+        currentSetlist.songs[index].cueNextSongSection = resolved
+        generatedGuideBuffers.removeValue(forKey: songId)
+        generatedGuideLoopStates.removeValue(forKey: songId)
+        if index == currentSongIndex {
+            currentSong.cueNextSongSection = resolved
+            if !currentSong.excludesClickAndGuide {
+                if currentSong.guideSource == .generated {
+                    regenerateGuideTrack()
+                } else {
+                    applyGuideBuffer()
+                }
             }
             syncMixState()
         } else if index == currentSongIndex + 1 {
@@ -1225,11 +1258,88 @@ extension MultitrackAudioEngine {
     }
     
     
+    func resolveSongEndFadeWindow(for song: Song, fallbackDuration: TimeInterval) -> (start: TimeInterval, end: TimeInterval)? {
+        if song.fadeEndSectionEnabled {
+            return song.endSectionForFade.map { (start: max(0.0, $0.startTime), end: $0.endTime) }
+        }
+        if song.endFadeOutEnabled {
+            let effectiveEndTime: TimeInterval = song.sections.isEmpty
+                ? fallbackDuration
+                : (song.sections.map { $0.endTime }.max() ?? fallbackDuration)
+            guard effectiveEndTime > 5.0 else { return nil }
+            return (start: max(0.0, effectiveEndTime - 5.0), end: effectiveEndTime)
+        }
+        return nil
+    }
+
+    func restoreSongEndFadeVolumesIfNeeded() {
+        guard !songEndBaseVolumes.isEmpty else { return }
+        for track in tracks {
+            if let baseVol = songEndBaseVolumes[track.id] {
+                track.setLiveVolume(baseVol, forceDisplay: true)
+            }
+        }
+        songEndBaseVolumes.removeAll()
+        updateAllNonPadTrackGainsFastPath()
+    }
+
+    func applySongEndFadeIfNeeded(at currentSec: TimeInterval) {
+        guard let window = resolveSongEndFadeWindow(for: currentSong, fallbackDuration: currentSongDuration) else {
+            restoreSongEndFadeVolumesIfNeeded()
+            return
+        }
+        let fadeDuration = max(0.05, window.end - window.start)
+        if currentSec >= window.start {
+            let remaining = max(0.0, window.end - currentSec)
+            let progress = min(1.0, max(0.0, 1.0 - (remaining / fadeDuration)))
+            let t = Float((1.0 - cos(progress * .pi)) * 0.5)
+            for track in tracks {
+                if isExemptFromFade(track) { continue }
+                if songEndBaseVolumes[track.id] == nil {
+                    songEndBaseVolumes[track.id] = track.volume
+                }
+                let baseVol = songEndBaseVolumes[track.id] ?? 0.80
+                track.setLiveVolume(max(0.0, baseVol * (1.0 - t)), forceDisplay: remaining <= 0.01)
+            }
+            updateAllNonPadTrackGainsFastPath()
+        } else {
+            restoreSongEndFadeVolumesIfNeeded()
+        }
+    }
+
     public func updateSongEndFadeOut(at index: Int, enabled: Bool) {
         guard index >= 0 && index < currentSetlist.songs.count else { return }
         currentSetlist.songs[index].endFadeOutEnabled = enabled
+        if enabled {
+            currentSetlist.songs[index].fadeEndSectionEnabled = false
+        }
         if index == currentSongIndex {
             currentSong.endFadeOutEnabled = enabled
+            if enabled {
+                currentSong.fadeEndSectionEnabled = false
+            }
+            if !currentSong.endFadeOutEnabled && !currentSong.fadeEndSectionEnabled {
+                restoreSongEndFadeVolumesIfNeeded()
+            }
+        }
+        markSessionChanged()
+        objectWillChange.send()
+    }
+
+    public func updateSongFadeEndSection(at index: Int, enabled: Bool) {
+        guard index >= 0 && index < currentSetlist.songs.count else { return }
+        currentSetlist.songs[index].fadeEndSectionEnabled = enabled
+        if enabled {
+            currentSetlist.songs[index].endFadeOutEnabled = false
+        }
+        if index == currentSongIndex {
+            currentSong.fadeEndSectionEnabled = enabled
+            if enabled {
+                currentSong.endFadeOutEnabled = false
+            }
+            if !currentSong.endFadeOutEnabled && !currentSong.fadeEndSectionEnabled {
+                restoreSongEndFadeVolumesIfNeeded()
+            }
         }
         markSessionChanged()
         objectWillChange.send()
@@ -1333,7 +1443,28 @@ extension MultitrackAudioEngine {
     
     
     // MARK: - Ambient Pad Player Controls
-    
+
+    /// Normalized pad key matching the current song's active transposed key (or `nil` if the song has no key set).
+    public var linkedSongPadKey: String? {
+        let transposed = currentSong.currentTransposedKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw: String
+        if !transposed.isEmpty && transposed != "—" && transposed != "--" {
+            raw = transposed
+        } else {
+            let musical = currentSong.musicalKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !musical.isEmpty && musical != "—" && musical != "--" else {
+                return nil
+            }
+            raw = musical
+        }
+        return AudioSampleBank.normalizeKeyForPad(raw)
+    }
+
+    /// True when playback is active with Pad `LINK` enabled and the song has a valid musical key.
+    public var isPadKeyLockedToSong: Bool {
+        playbackState == .playing && isPadLinked && linkedSongPadKey != nil
+    }
+
     /// Toggles Pad Player LINK mode. When re-engaging LINK, crossfades from manual key back to currentSong's key.
     public func togglePadLink() {
         isPadLinked.toggle()
@@ -1346,9 +1477,7 @@ extension MultitrackAudioEngine {
     }
 
     public func syncActivePadToCurrentSongIfNeeded() {
-        guard isPadLinked else { return }
-        let candidateKey = currentSong.currentTransposedKey
-        let normalized = AudioSampleBank.normalizeKeyForPad(candidateKey)
+        guard isPadLinked, let normalized = linkedSongPadKey else { return }
         currentPadKey = normalized
         guard isPadActive else { return }
         let targetPackId = currentSong.padPresetId ?? PadLibraryManager.shared.activePackId
@@ -1376,15 +1505,30 @@ extension MultitrackAudioEngine {
     }
     
     public func startPadPlayer(key: String? = nil, packId: String? = nil) {
+        if isPadKeyLockedToSong, let lockedKey = linkedSongPadKey {
+            if let explicit = key {
+                let trimmed = explicit.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty && trimmed != "—" && trimmed != "--" {
+                    let normalizedExplicit = AudioSampleBank.normalizeKeyForPad(trimmed)
+                    if normalizedExplicit != lockedKey {
+                        return
+                    }
+                }
+            }
+        }
+
         let candidateKey: String
-        if let explicit = key, !explicit.isEmpty, explicit != "—" {
-            candidateKey = explicit
-        } else if !currentSong.currentTransposedKey.isEmpty && currentSong.currentTransposedKey != "—" {
-            candidateKey = currentSong.currentTransposedKey
-        } else if !currentSong.musicalKey.isEmpty && currentSong.musicalKey != "—" {
-            candidateKey = currentSong.musicalKey
+        if isPadKeyLockedToSong, let lockedKey = linkedSongPadKey {
+            candidateKey = lockedKey
+        } else if let explicit = key {
+            let trimmed = explicit.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty && trimmed != "—" && trimmed != "--" {
+                candidateKey = trimmed
+            } else {
+                candidateKey = linkedSongPadKey ?? "C"
+            }
         } else {
-            candidateKey = "C"
+            candidateKey = linkedSongPadKey ?? "C"
         }
         
         let targetPackId = packId ?? (padPlayer.isPlaying && playbackState != .playing ? padPlayer.activePackId : (manualPadPackId ?? currentSong.padPresetId))
@@ -1449,6 +1593,16 @@ extension MultitrackAudioEngine {
         if !currentSong.title.isEmpty && !currentSong.automationPoints.isEmpty {
             restoreAutomatedParametersToBaseMix(updateAudioMatrix: false)
         }
+        if !songEndBaseVolumes.isEmpty {
+            for track in tracks {
+                if let baseVol = songEndBaseVolumes[track.id] {
+                    track.setLiveVolume(baseVol, forceDisplay: true)
+                }
+            }
+            songEndBaseVolumes.removeAll()
+        }
+        resetTrackMeters(tracks)
+        resetClickMeters()
         // Save outgoing song state into cache
         if !currentSong.title.isEmpty {
             songWaveformCache[currentSong.id] = (masterWaveformPeaks, renderedWaveformImage)
@@ -1527,11 +1681,16 @@ extension MultitrackAudioEngine {
                 if self.currentSong.guideSource == .generated &&
                     ((self.generatedGuideBuffers[nextSong.id]?.frameLength ?? 0) <= 1 || self.generatedGuideLoopStates[nextSong.id] != expectedGuideState) {
                     self.regenerateGuideTrack()
+                } else if self.currentSong.guideSource == .uploaded &&
+                          self.currentSong.cueNextSongSection &&
+                          self.uploadedGuideBuffers[nextSong.id] != nil {
+                    self.applyGuideBuffer()
                 }
             }
             self.syncMixState()
         }
         
+        resetTrackMeters(newTracks)
         pristineMasterBuffers = newPristine
         channels = newChannels
         tracks = newTracks
@@ -1547,6 +1706,7 @@ extension MultitrackAudioEngine {
         
         if let cachedWf = songWaveformCache[nextSong.id], !cachedWf.peaks.isEmpty {
             masterWaveformPeaks = cachedWf.peaks
+            refreshSoloWaveformIfNeeded(forceRecompute: true, triggerArrangementUpdate: false)
             updateArrangementWaveform()
         } else {
             recalculateAggregateWaveform(samplesCount: 4000)
@@ -1628,14 +1788,17 @@ extension MultitrackAudioEngine {
             let beatsPerBar = max(1, endNum)
             let grid = song.effectiveBeatGrid(totalDuration: max(4.0, safeDur)).sorted { $0.time < $1.time }
             if let lastMarker = grid.last(where: { $0.time <= safeDur + 0.001 }) {
-                let endBPM = max(20.0, lastMarker.instantaneousBPM > 20.0 ? lastMarker.instantaneousBPM : song.bpm)
+                let rawEndBPM = !song.tempoEvents.isEmpty
+                    ? song.evaluateBPM(atSourceTime: endSourceSec)
+                    : lastMarker.instantaneousBPM
+                let endBPM = max(20.0, rawEndBPM > 20.0 ? rawEndBPM : song.bpm)
                 let secPerBeat = (60.0 / endBPM) * (4.0 / Double(max(1, endDen)))
                 let rawBarBeats = Double(max(1, lastMarker.beat) - 1) + ((safeDur - lastMarker.time) / max(0.05, secPerBeat))
                 var modBeats = rawBarBeats.truncatingRemainder(dividingBy: Double(beatsPerBar))
                 if modBeats < 0 { modBeats += Double(beatsPerBar) }
                 return (endBPM, endNum, endDen, modBeats / Double(beatsPerBar))
             } else {
-                let endBPM = max(20.0, song.bpm)
+                let endBPM = max(20.0, !song.tempoEvents.isEmpty ? song.evaluateBPM(atSourceTime: endSourceSec) : song.bpm)
                 let secPerBeat = (60.0 / endBPM) * (4.0 / Double(max(1, endDen)))
                 let barSec = Double(beatsPerBar) * secPerBeat
                 let remSec = max(0.0, safeDur.truncatingRemainder(dividingBy: max(0.05, barSec)))
@@ -1644,8 +1807,10 @@ extension MultitrackAudioEngine {
         case .cuedSongStart:
             let (startNum, startDen) = song.timeSignature(atSourceTime: 0.0)
             let startGrid = song.effectiveBeatGrid(totalDuration: max(4.0, song.totalDuration)).sorted { $0.time < $1.time }
-            let gridBPM = startGrid.first?.instantaneousBPM ?? song.bpm
-            let startBPM = max(20.0, gridBPM > 20.0 ? gridBPM : song.bpm)
+            let rawStartBPM = !song.tempoEvents.isEmpty
+                ? song.evaluateBPM(atSourceTime: 0.0)
+                : (startGrid.first?.instantaneousBPM ?? song.bpm)
+            let startBPM = max(20.0, rawStartBPM > 20.0 ? rawStartBPM : song.bpm)
             return (startBPM, startNum, startDen, 0.0)
         }
     }
@@ -2130,6 +2295,15 @@ extension MultitrackAudioEngine {
     
     // MARK: - Section Looping (L & I Hotkeys)
     
+    private func refreshGuideAfterLoopOrQueueChange() {
+        guard !currentSong.excludesClickAndGuide else { return }
+        if currentSong.guideSource == .generated {
+            regenerateGuideTrack()
+        } else if currentSong.cueNextSongSection {
+            applyGuideBuffer()
+        }
+    }
+
     public func toggleSingleLoop() {
         guard let targetSec = currentTargetSection() else { return }
         if loopMode == .single && loopedSection?.id == targetSec.id {
@@ -2144,7 +2318,7 @@ extension MultitrackAudioEngine {
             singleLoopRemaining = 1
         }
         syncMixState()
-        regenerateGuideTrack()
+        refreshGuideAfterLoopOrQueueChange()
         objectWillChange.send()
     }
     
@@ -2162,7 +2336,7 @@ extension MultitrackAudioEngine {
             singleLoopRemaining = 0
         }
         syncMixState()
-        regenerateGuideTrack()
+        refreshGuideAfterLoopOrQueueChange()
         objectWillChange.send()
     }
     
@@ -2180,7 +2354,7 @@ extension MultitrackAudioEngine {
             singleLoopRemaining = (mode == .single) ? 1 : 0
         }
         syncMixState()
-        regenerateGuideTrack()
+        refreshGuideAfterLoopOrQueueChange()
         objectWillChange.send()
     }
     
@@ -2205,7 +2379,7 @@ extension MultitrackAudioEngine {
             singleLoopRemaining = 1
         }
         syncMixState()
-        regenerateGuideTrack()
+        refreshGuideAfterLoopOrQueueChange()
         objectWillChange.send()
     }
     
@@ -2230,7 +2404,7 @@ extension MultitrackAudioEngine {
             let targetFrame = Int64(round(section.startTime * sr))
             mixState.setQueuedJump(boundaryFrame: boundaryFrame, targetFrame: targetFrame)
         }
-        regenerateGuideTrack()
+        refreshGuideAfterLoopOrQueueChange()
         objectWillChange.send()
     }
     

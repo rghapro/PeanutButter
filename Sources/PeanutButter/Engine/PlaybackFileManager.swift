@@ -128,6 +128,7 @@ public struct SongPackageMetadata: Codable, Sendable {
     public var tracks: [TrackFileMetadata]
     public var beatGrid: [BeatGridMarker] = []
     public var timeSignatureChanges: [TimeSignatureChange] = []
+    public var tempoEvents: [TempoChangeEvent] = []
     public var midiCues: [MIDICue] = []
     public var directionalCues: [DirectionalCue] = []
     public var automationPoints: [AutomationPoint] = []
@@ -141,7 +142,9 @@ public struct SongPackageMetadata: Codable, Sendable {
     public var transitionType: SongTransitionType = .cueNextSong
     public var continuePad: Bool = false
     public var continueClick: Bool = false
+    public var cueNextSongSection: Bool = false
     public var endFadeOutEnabled: Bool = false
+    public var fadeEndSectionEnabled: Bool = false
     public var startPadWithSong: Bool = false
     public var padPresetId: String? = nil
     public var padIntroOutroOnly: Bool = false
@@ -165,6 +168,12 @@ public struct SongPackageMetadata: Codable, Sendable {
     public var clickSixteenthVolume: Float? = nil
     public var guideCountInEnabled: Bool? = nil
     public var speakDirectionalCuesOnUploadedGuide: Bool? = nil
+    public var guideSectionsVolume: Float? = nil
+    public var guideSectionsEnabled: Bool? = nil
+    public var guideDirectionsVolume: Float? = nil
+    public var guideDirectionsEnabled: Bool? = nil
+    public var guideFallbackVolume: Float? = nil
+    public var guideFallbackEnabled: Bool? = nil
     public var autoInfiniteLoop: Bool? = nil
     public var excludesClickAndGuide: Bool? = nil
     
@@ -187,6 +196,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         tracks: [TrackFileMetadata] = [],
         beatGrid: [BeatGridMarker] = [],
         timeSignatureChanges: [TimeSignatureChange] = [],
+        tempoEvents: [TempoChangeEvent] = [],
         midiCues: [MIDICue] = [],
         directionalCues: [DirectionalCue] = [],
         automationPoints: [AutomationPoint] = [],
@@ -200,7 +210,9 @@ public struct SongPackageMetadata: Codable, Sendable {
         transitionType: SongTransitionType = .cueNextSong,
         continuePad: Bool = false,
         continueClick: Bool = false,
+        cueNextSongSection: Bool = false,
         endFadeOutEnabled: Bool = false,
+        fadeEndSectionEnabled: Bool = false,
         startPadWithSong: Bool = false,
         padPresetId: String? = nil,
         padIntroOutroOnly: Bool = false,
@@ -222,6 +234,12 @@ public struct SongPackageMetadata: Codable, Sendable {
         clickSixteenthVolume: Float? = nil,
         guideCountInEnabled: Bool? = nil,
         speakDirectionalCuesOnUploadedGuide: Bool? = nil,
+        guideSectionsVolume: Float? = nil,
+        guideSectionsEnabled: Bool? = nil,
+        guideDirectionsVolume: Float? = nil,
+        guideDirectionsEnabled: Bool? = nil,
+        guideFallbackVolume: Float? = nil,
+        guideFallbackEnabled: Bool? = nil,
         autoInfiniteLoop: Bool? = nil,
         excludesClickAndGuide: Bool? = nil
     ) {
@@ -243,6 +261,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.tracks = tracks
         self.beatGrid = beatGrid
         self.timeSignatureChanges = timeSignatureChanges
+        self.tempoEvents = tempoEvents
         self.midiCues = midiCues
         self.directionalCues = directionalCues
         self.automationPoints = automationPoints
@@ -256,7 +275,9 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.transitionType = transitionType
         self.continuePad = continuePad
         self.continueClick = continueClick
+        self.cueNextSongSection = cueNextSongSection
         self.endFadeOutEnabled = endFadeOutEnabled
+        self.fadeEndSectionEnabled = fadeEndSectionEnabled
         self.startPadWithSong = startPadWithSong
         self.padPresetId = padPresetId
         self.padIntroOutroOnly = padIntroOutroOnly
@@ -278,6 +299,12 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.clickSixteenthVolume = clickSixteenthVolume
         self.guideCountInEnabled = guideCountInEnabled
         self.speakDirectionalCuesOnUploadedGuide = speakDirectionalCuesOnUploadedGuide
+        self.guideSectionsVolume = guideSectionsVolume
+        self.guideSectionsEnabled = guideSectionsEnabled
+        self.guideDirectionsVolume = guideDirectionsVolume
+        self.guideDirectionsEnabled = guideDirectionsEnabled
+        self.guideFallbackVolume = guideFallbackVolume
+        self.guideFallbackEnabled = guideFallbackEnabled
         self.autoInfiniteLoop = autoInfiniteLoop
         self.excludesClickAndGuide = excludesClickAndGuide
     }
@@ -285,13 +312,13 @@ public struct SongPackageMetadata: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case version, id, title, artist, bpm, originalBPM, timeSignatureNumerator, timeSignatureDenominator
         case musicalKey, transposeSemitones, preserveVocalFormants, sections, defaultSections, savedArrangements, activeArrangementId, tracks
-        case beatGrid, timeSignatureChanges, midiCues, directionalCues, automationPoints, smpteCue
+        case beatGrid, timeSignatureChanges, tempoEvents, midiCues, directionalCues, automationPoints, smpteCue
         case defaultMidiCues, defaultDirectionalCues, defaultAutomationPoints, defaultSmpteCue
-        case proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, endFadeOutEnabled, startPadWithSong, padPresetId, padIntroOutroOnly, artworkData
+        case proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, cueNextSongSection, endFadeOutEnabled, fadeEndSectionEnabled, startPadWithSong, padPresetId, padIntroOutroOnly, artworkData
         case clickSource, guideSource, guideVoice, guideFallbackVoice, clickSound, usesDefaultClickSound, usesDefaultGuideVoice
         case clickAccentEnabled, clickQuarterEnabled, clickEighthEnabled, clickSixteenthEnabled
         case clickAccentVolume, clickQuarterVolume, clickEighthVolume, clickSixteenthVolume
-        case guideCountInEnabled, speakDirectionalCuesOnUploadedGuide, autoInfiniteLoop, excludesClickAndGuide
+        case guideCountInEnabled, speakDirectionalCuesOnUploadedGuide, guideSectionsVolume, guideSectionsEnabled, guideDirectionsVolume, guideDirectionsEnabled, guideFallbackVolume, guideFallbackEnabled, autoInfiniteLoop, excludesClickAndGuide
     }
     
     public init(from decoder: Decoder) throws {
@@ -316,6 +343,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.tracks = try container.decodeIfPresent([TrackFileMetadata].self, forKey: .tracks) ?? []
         self.beatGrid = try container.decodeIfPresent([BeatGridMarker].self, forKey: .beatGrid) ?? []
         self.timeSignatureChanges = try container.decodeIfPresent([TimeSignatureChange].self, forKey: .timeSignatureChanges) ?? []
+        self.tempoEvents = try container.decodeIfPresent([TempoChangeEvent].self, forKey: .tempoEvents) ?? []
         self.midiCues = try container.decodeIfPresent([MIDICue].self, forKey: .midiCues) ?? []
         self.directionalCues = try container.decodeIfPresent([DirectionalCue].self, forKey: .directionalCues) ?? []
         self.automationPoints = try container.decodeIfPresent([AutomationPoint].self, forKey: .automationPoints) ?? []
@@ -329,7 +357,9 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.transitionType = try container.decodeIfPresent(SongTransitionType.self, forKey: .transitionType) ?? .cueNextSong
         self.continuePad = try container.decodeIfPresent(Bool.self, forKey: .continuePad) ?? false
         self.continueClick = try container.decodeIfPresent(Bool.self, forKey: .continueClick) ?? false
+        self.cueNextSongSection = try container.decodeIfPresent(Bool.self, forKey: .cueNextSongSection) ?? false
         self.endFadeOutEnabled = try container.decodeIfPresent(Bool.self, forKey: .endFadeOutEnabled) ?? false
+        self.fadeEndSectionEnabled = try container.decodeIfPresent(Bool.self, forKey: .fadeEndSectionEnabled) ?? false
         self.startPadWithSong = try container.decodeIfPresent(Bool.self, forKey: .startPadWithSong) ?? false
         self.padPresetId = try container.decodeIfPresent(String.self, forKey: .padPresetId)
         self.padIntroOutroOnly = try container.decodeIfPresent(Bool.self, forKey: .padIntroOutroOnly) ?? false
@@ -351,6 +381,12 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.clickSixteenthVolume = try container.decodeIfPresent(Float.self, forKey: .clickSixteenthVolume)
         self.guideCountInEnabled = try container.decodeIfPresent(Bool.self, forKey: .guideCountInEnabled)
         self.speakDirectionalCuesOnUploadedGuide = try container.decodeIfPresent(Bool.self, forKey: .speakDirectionalCuesOnUploadedGuide)
+        self.guideSectionsVolume = try container.decodeIfPresent(Float.self, forKey: .guideSectionsVolume)
+        self.guideSectionsEnabled = try container.decodeIfPresent(Bool.self, forKey: .guideSectionsEnabled)
+        self.guideDirectionsVolume = try container.decodeIfPresent(Float.self, forKey: .guideDirectionsVolume)
+        self.guideDirectionsEnabled = try container.decodeIfPresent(Bool.self, forKey: .guideDirectionsEnabled)
+        self.guideFallbackVolume = try container.decodeIfPresent(Float.self, forKey: .guideFallbackVolume)
+        self.guideFallbackEnabled = try container.decodeIfPresent(Bool.self, forKey: .guideFallbackEnabled)
         self.autoInfiniteLoop = try container.decodeIfPresent(Bool.self, forKey: .autoInfiniteLoop)
         self.excludesClickAndGuide = try container.decodeIfPresent(Bool.self, forKey: .excludesClickAndGuide)
     }
@@ -3008,6 +3044,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 defaultSmpteCue: songEntry.defaultSmpteCue,
                 stemURLs: stemURLs,
                 timeSignatureChanges: songEntry.timeSignatureChanges,
+                tempoEvents: songEntry.tempoEvents,
                 beatGrid: songEntry.beatGrid,
                 midiCues: songEntry.midiCues,
                 directionalCues: songEntry.directionalCues,
@@ -3018,7 +3055,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 transitionType: songEntry.transitionType,
                 continuePad: songEntry.continuePad,
                 continueClick: songEntry.continueClick,
+                cueNextSongSection: songEntry.cueNextSongSection,
                 endFadeOutEnabled: songEntry.endFadeOutEnabled,
+                fadeEndSectionEnabled: songEntry.fadeEndSectionEnabled,
                 startPadWithSong: songEntry.startPadWithSong,
                 padPresetId: songEntry.padPresetId,
                 padIntroOutroOnly: songEntry.padIntroOutroOnly,
@@ -3040,10 +3079,17 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 clickSixteenthVolume: songEntry.clickSixteenthVolume ?? 0.0,
                 guideCountInEnabled: songEntry.guideCountInEnabled ?? true,
                 speakDirectionalCuesOnUploadedGuide: songEntry.speakDirectionalCuesOnUploadedGuide ?? true,
+                guideSectionsVolume: songEntry.guideSectionsVolume ?? 0.80,
+                guideSectionsEnabled: songEntry.guideSectionsEnabled ?? true,
+                guideDirectionsVolume: songEntry.guideDirectionsVolume ?? 0.80,
+                guideDirectionsEnabled: songEntry.guideDirectionsEnabled ?? true,
+                guideFallbackVolume: songEntry.guideFallbackVolume ?? 0.80,
+                guideFallbackEnabled: songEntry.guideFallbackEnabled ?? true,
                 autoInfiniteLoop: songEntry.autoInfiniteLoop ?? false,
                 excludesClickAndGuide: songEntry.excludesClickAndGuide ?? false
             )
             song.timeSignatureChanges = songEntry.timeSignatureChanges
+            song.tempoEvents = songEntry.tempoEvents
             
             restoredSongs.append(song)
             songsPlaceholderData.append((song: song, tracks: placeholderTracks))
@@ -3548,6 +3594,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             defaultSmpteCue: songEntry.defaultSmpteCue,
             stemURLs: stemURLs,
             timeSignatureChanges: songEntry.timeSignatureChanges,
+            tempoEvents: songEntry.tempoEvents,
             beatGrid: songEntry.beatGrid,
             midiCues: songEntry.midiCues,
             directionalCues: songEntry.directionalCues,
@@ -3558,7 +3605,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
             transitionType: songEntry.transitionType,
             continuePad: songEntry.continuePad,
             continueClick: songEntry.continueClick,
+            cueNextSongSection: songEntry.cueNextSongSection,
             endFadeOutEnabled: songEntry.endFadeOutEnabled,
+            fadeEndSectionEnabled: songEntry.fadeEndSectionEnabled,
             startPadWithSong: songEntry.startPadWithSong,
             padPresetId: songEntry.padPresetId,
             padIntroOutroOnly: songEntry.padIntroOutroOnly,
@@ -3580,6 +3629,12 @@ public final class PlaybackFileManager: @unchecked Sendable {
             clickSixteenthVolume: songEntry.clickSixteenthVolume ?? 0.0,
             guideCountInEnabled: songEntry.guideCountInEnabled ?? true,
             speakDirectionalCuesOnUploadedGuide: songEntry.speakDirectionalCuesOnUploadedGuide ?? true,
+            guideSectionsVolume: songEntry.guideSectionsVolume ?? 0.80,
+            guideSectionsEnabled: songEntry.guideSectionsEnabled ?? true,
+            guideDirectionsVolume: songEntry.guideDirectionsVolume ?? 0.80,
+            guideDirectionsEnabled: songEntry.guideDirectionsEnabled ?? true,
+            guideFallbackVolume: songEntry.guideFallbackVolume ?? 0.80,
+            guideFallbackEnabled: songEntry.guideFallbackEnabled ?? true,
             autoInfiniteLoop: songEntry.autoInfiniteLoop ?? false,
             excludesClickAndGuide: songEntry.excludesClickAndGuide ?? false
         )
@@ -3609,6 +3664,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             tracks: tracks,
             beatGrid: song.beatGrid,
             timeSignatureChanges: song.timeSignatureChanges,
+            tempoEvents: song.tempoEvents,
             midiCues: song.midiCues,
             directionalCues: song.directionalCues,
             automationPoints: song.automationPoints,
@@ -3622,7 +3678,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
             transitionType: song.transitionType,
             continuePad: song.continuePad,
             continueClick: song.continueClick,
+            cueNextSongSection: song.cueNextSongSection,
             endFadeOutEnabled: song.endFadeOutEnabled,
+            fadeEndSectionEnabled: song.fadeEndSectionEnabled,
             startPadWithSong: song.startPadWithSong,
             padPresetId: song.padPresetId,
             padIntroOutroOnly: song.padIntroOutroOnly,
@@ -3644,6 +3702,12 @@ public final class PlaybackFileManager: @unchecked Sendable {
             clickSixteenthVolume: song.clickSixteenthVolume,
             guideCountInEnabled: song.guideCountInEnabled,
             speakDirectionalCuesOnUploadedGuide: song.speakDirectionalCuesOnUploadedGuide,
+            guideSectionsVolume: song.guideSectionsVolume,
+            guideSectionsEnabled: song.guideSectionsEnabled,
+            guideDirectionsVolume: song.guideDirectionsVolume,
+            guideDirectionsEnabled: song.guideDirectionsEnabled,
+            guideFallbackVolume: song.guideFallbackVolume,
+            guideFallbackEnabled: song.guideFallbackEnabled,
             autoInfiniteLoop: song.autoInfiniteLoop,
             excludesClickAndGuide: song.excludesClickAndGuide ? true : nil
         )

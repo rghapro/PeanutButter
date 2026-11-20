@@ -254,7 +254,7 @@ extension MultitrackAudioEngine {
         
         var currentArrangementTime: TimeInterval = 0.0
         var currentMeasure = 1
-        let hasDynamicGrid = !currentSong.beatGrid.isEmpty || !currentSong.timeSignatureChanges.isEmpty
+        let hasDynamicGrid = !currentSong.beatGrid.isEmpty || !currentSong.timeSignatureChanges.isEmpty || !currentSong.tempoEvents.isEmpty
         let srcGrid = hasDynamicGrid ? currentSong.sourceBeatGrid() : []
         
         for i in 0..<currentSong.sections.count {
@@ -343,6 +343,9 @@ extension MultitrackAudioEngine {
         
         updateArrangementWaveform()
         syncMixState()
+        if currentSongIndex > 0, currentSetlist.songs.indices.contains(currentSongIndex - 1), currentSetlist.songs[currentSongIndex - 1].cueNextSongSection {
+            invalidateStaleNextSongSectionGuides()
+        }
         objectWillChange.send()
     }
     
@@ -883,14 +886,244 @@ extension MultitrackAudioEngine {
     }
     
     func syncTimeSignatureChangesToSetlist() {
+        currentSong.reconcileSectionMeasuresWithBeatGrid()
         if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {
             currentSetlist.songs[currentSongIndex].timeSignatureChanges = currentSong.timeSignatureChanges
+            currentSetlist.songs[currentSongIndex].sections = currentSong.sections
+            currentSetlist.songs[currentSongIndex].defaultSections = currentSong.defaultSections
+            currentSetlist.songs[currentSongIndex].savedArrangements = currentSong.savedArrangements
         }
         rebuildPrecomputedBeatGrid()
         updateTransportPosition(to: playbackOffsetSeconds)
         regenerateClickTrack()
         regenerateGuideTrack()
         markSessionChanged()
+        objectWillChange.send()
+    }
+
+    // MARK: - Mid-Song Tempo Changes & DAW Curve Automation (Phase 5.7)
+
+    public func openTempoCurveEditor() {
+        isEditDrawerOpen = true
+        selectEditDrawerItem(.songSections)
+        isEditingTempoCurve = true
+    }
+
+    public func setTempoCurveEditing(_ enabled: Bool) {
+        isEditingTempoCurve = enabled
+    }
+
+    public func addInstantTempoChange(atDisplayTime displayTime: TimeInterval, bpm: Double, snap: Bool = true) {
+        let targetDisp = snap ? snapTimeToBeatGrid(displayTime) : max(0.0, displayTime)
+        let sourceTime = max(0.0, audioTime(forArrangementTime: targetDisp))
+        let clampedBPM = max(20.0, min(300.0, bpm))
+
+        currentSong.tempoEvents.removeAll { abs($0.audioTime - sourceTime) < 0.05 }
+        currentSong.tempoEvents.append(
+            TempoChangeEvent(
+                audioTime: sourceTime,
+                targetBPM: clampedBPM,
+                isRamp: false
+            )
+        )
+        currentSong.tempoEvents.sort { $0.audioTime < $1.audioTime }
+        syncTempoEventsToSetlist(commit: true)
+    }
+
+    public func addTempoRamp(
+        atDisplayTime displayTime: TimeInterval,
+        targetBPM: Double,
+        spanMode: TempoRampSpanMode = .barsBeats,
+        rampBeats: Double? = nil,
+        endDisplayTime: TimeInterval? = nil,
+        lockBeatCount: Bool = true,
+        curve: TempoCurveType = .linear,
+        curveTension: Double = 0.0,
+        customPoints: [TempoCurvePoint] = [],
+        snap: Bool = true
+    ) {
+        let targetStartDisp = snap ? snapTimeToBeatGrid(displayTime) : max(0.0, displayTime)
+        let startSrc = max(0.0, audioTime(forArrangementTime: targetStartDisp))
+        let activeTS = currentSong.timeSignature(atSourceTime: startSrc)
+        let resolvedBeats = max(0.25, rampBeats ?? Double(max(1, activeTS.numerator) * 2))
+
+        let endSrc: TimeInterval? = {
+            guard spanMode == .audioAnchor || curve == .custom else { return nil }
+            if let explicitEndDisp = endDisplayTime {
+                let targetEndDisp = snap ? snapTimeToBeatGrid(explicitEndDisp) : explicitEndDisp
+                return max(startSrc + 0.1, audioTime(forArrangementTime: targetEndDisp))
+            }
+            let approxBPM = max(20.0, min(300.0, (currentSong.evaluateBPM(atSourceTime: startSrc) + targetBPM) * 0.5))
+            let beatDur = (60.0 / approxBPM) * (4.0 / Double(max(1, activeTS.denominator)))
+            return startSrc + max(0.25, resolvedBeats * beatDur)
+        }()
+
+        let resolvedSpanMode: TempoRampSpanMode = (curve == .custom) ? .audioAnchor : spanMode
+        currentSong.tempoEvents.removeAll { abs($0.audioTime - startSrc) < 0.05 }
+        currentSong.tempoEvents.append(
+            TempoChangeEvent(
+                audioTime: startSrc,
+                targetBPM: max(20.0, min(300.0, targetBPM)),
+                isRamp: true,
+                endAudioTime: endSrc,
+                spanMode: resolvedSpanMode,
+                rampBeats: resolvedBeats,
+                lockBeatCountToAudioEnd: (curve == .custom) ? false : lockBeatCount,
+                curve: curve,
+                curveTension: curveTension,
+                customPoints: customPoints
+            )
+        )
+        currentSong.tempoEvents.sort { $0.audioTime < $1.audioTime }
+        syncTempoEventsToSetlist(commit: true)
+    }
+
+    public func updateTempoChangeEvent(_ event: TempoChangeEvent, commit: Bool = true) {
+        guard let idx = currentSong.tempoEvents.firstIndex(where: { $0.id == event.id }) else { return }
+        var normalized = event
+        normalized.audioTime = max(0.0, normalized.audioTime)
+        normalized.targetBPM = max(20.0, min(300.0, normalized.targetBPM))
+        if let endT = normalized.endAudioTime {
+            normalized.endAudioTime = max(normalized.audioTime + 0.05, endT)
+        }
+        normalized.customPoints = normalized.customPoints.sorted { $0.normalizedTime < $1.normalizedTime }
+        currentSong.tempoEvents[idx] = normalized
+        currentSong.tempoEvents.sort { $0.audioTime < $1.audioTime }
+        syncTempoEventsToSetlist(commit: commit)
+    }
+
+    public func removeTempoChangeEvent(id: UUID) {
+        currentSong.tempoEvents.removeAll { $0.id == id }
+        syncTempoEventsToSetlist(commit: true)
+    }
+
+    public func clearAllTempoEvents() {
+        guard !currentSong.tempoEvents.isEmpty else { return }
+        currentSong.tempoEvents.removeAll()
+        syncTempoEventsToSetlist(commit: true)
+    }
+
+    /// Converts a drawn stroke of `(displayTime, bpm)` samples into a clean custom `.audioAnchor` tempo event.
+    public func applyDrawnTempoStroke(points: [(displayTime: TimeInterval, bpm: Double)]) {
+        guard points.count >= 2 else { return }
+        var sourceSamples: [(time: TimeInterval, bpm: Double)] = []
+        sourceSamples.reserveCapacity(points.count)
+        let converted = points
+            .map { (time: max(0.0, audioTime(forArrangementTime: $0.displayTime)), bpm: max(20.0, min(300.0, $0.bpm))) }
+            .sorted { $0.time < $1.time }
+
+        for sample in converted {
+            if let last = sourceSamples.last, abs(sample.time - last.time) < 0.015 {
+                sourceSamples[sourceSamples.count - 1].bpm = sample.bpm
+            } else {
+                sourceSamples.append(sample)
+            }
+        }
+        guard sourceSamples.count >= 2,
+              let firstSample = sourceSamples.first,
+              let lastSample = sourceSamples.last,
+              (lastSample.time - firstSample.time) >= 0.1 else {
+            return
+        }
+
+        let startSrc = firstSample.time
+        let endSrc = lastSample.time
+        let spanDur = max(0.1, endSrc - startSrc)
+        let minBPMVal = sourceSamples.map(\.bpm).min() ?? firstSample.bpm
+        let maxBPMVal = sourceSamples.map(\.bpm).max() ?? lastSample.bpm
+        let bpmSpan = max(20.0, maxBPMVal - minBPMVal)
+
+        let normPoints: [(x: Double, y: Double, time: TimeInterval, bpm: Double)] = sourceSamples.map {
+            (
+                x: ($0.time - startSrc) / spanDur,
+                y: ($0.bpm - minBPMVal) / bpmSpan,
+                time: $0.time,
+                bpm: $0.bpm
+            )
+        }
+
+        func perpendicularDistance(
+            _ pt: (x: Double, y: Double, time: TimeInterval, bpm: Double),
+            from start: (x: Double, y: Double, time: TimeInterval, bpm: Double),
+            to end: (x: Double, y: Double, time: TimeInterval, bpm: Double)
+        ) -> Double {
+            let dx = end.x - start.x
+            let dy = end.y - start.y
+            let mag = hypot(dx, dy)
+            if mag < 1e-9 { return hypot(pt.x - start.x, pt.y - start.y) }
+            return abs(dy * pt.x - dx * pt.y + end.x * start.y - end.y * start.x) / mag
+        }
+
+        func simplifyRDP(_ slice: ArraySlice<(x: Double, y: Double, time: TimeInterval, bpm: Double)>, epsilon: Double) -> [(x: Double, y: Double, time: TimeInterval, bpm: Double)] {
+            guard slice.count > 2, let first = slice.first, let last = slice.last else {
+                return Array(slice)
+            }
+            var maxDist = 0.0
+            var splitIdx = slice.startIndex
+            for i in (slice.startIndex + 1)..<(slice.endIndex - 1) {
+                let d = perpendicularDistance(slice[i], from: first, to: last)
+                if d > maxDist {
+                    maxDist = d
+                    splitIdx = i
+                }
+            }
+            if maxDist > epsilon {
+                let left = simplifyRDP(slice[slice.startIndex...splitIdx], epsilon: epsilon)
+                let right = simplifyRDP(slice[splitIdx..<slice.endIndex], epsilon: epsilon)
+                return Array(left.dropLast()) + right
+            } else {
+                return [first, last]
+            }
+        }
+
+        let simplified = simplifyRDP(ArraySlice(normPoints), epsilon: 0.028)
+        let baseStartBPM = currentSong.evaluateBPM(atSourceTime: max(0.0, startSrc - 0.01))
+
+        var interiorPoints: [TempoCurvePoint] = []
+        if abs(firstSample.bpm - baseStartBPM) >= 1.5 {
+            interiorPoints.append(TempoCurvePoint(normalizedTime: 0.001, bpm: firstSample.bpm))
+        }
+        if simplified.count > 2 {
+            for idx in 1..<(simplified.count - 1) {
+                let pt = simplified[idx]
+                let normT = max(0.005, min(0.995, pt.x))
+                interiorPoints.append(TempoCurvePoint(normalizedTime: normT, bpm: pt.bpm))
+            }
+        }
+
+        currentSong.tempoEvents.removeAll { $0.audioTime >= startSrc - 0.05 && $0.audioTime <= endSrc + 0.05 }
+        currentSong.tempoEvents.append(
+            TempoChangeEvent(
+                audioTime: startSrc,
+                targetBPM: lastSample.bpm,
+                isRamp: true,
+                endAudioTime: endSrc,
+                spanMode: .audioAnchor,
+                lockBeatCountToAudioEnd: false,
+                curve: .custom,
+                curveTension: 0.0,
+                customPoints: interiorPoints
+            )
+        )
+        currentSong.tempoEvents.sort { $0.audioTime < $1.audioTime }
+        syncTempoEventsToSetlist(commit: true)
+    }
+
+    func syncTempoEventsToSetlist(commit: Bool = true) {
+        currentSong.reconcileSectionMeasuresWithBeatGrid()
+        if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {
+            currentSetlist.songs[currentSongIndex].tempoEvents = currentSong.tempoEvents
+            currentSetlist.songs[currentSongIndex].sections = currentSong.sections
+            currentSetlist.songs[currentSongIndex].defaultSections = currentSong.defaultSections
+            currentSetlist.songs[currentSongIndex].savedArrangements = currentSong.savedArrangements
+        }
+        rebuildPrecomputedBeatGrid()
+        updateTransportPosition(to: playbackOffsetSeconds)
+        if commit {
+            regenerateClickTrack()
+            regenerateGuideTrack()
+            markSessionChanged()
+        }
         objectWillChange.send()
     }
     

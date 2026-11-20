@@ -68,6 +68,15 @@ extension MultitrackAudioEngine {
             if !currentSong.automationPoints.isEmpty {
                 restoreAutomatedParametersToBaseMix(updateAudioMatrix: false)
             }
+            if !songEndBaseVolumes.isEmpty {
+                for track in tracks {
+                    if let baseVol = songEndBaseVolumes[track.id] {
+                        track.setLiveVolume(baseVol, forceDisplay: true)
+                    }
+                }
+                songEndBaseVolumes.removeAll()
+            }
+            resetTrackMeters(tracks)
             songWaveformCache[currentSong.id] = (masterWaveformPeaks, renderedWaveformImage)
             if !tracks.isEmpty {
                 var currentBuffers: [(StemTrack, AVAudioPCMBuffer)] = []
@@ -103,14 +112,33 @@ extension MultitrackAudioEngine {
         }) ?? (song.sections.count >= 2 ? song.sections[1] : song.sections.first)
     }
 
-    static func defaultGuideLoopState(for song: Song) -> GeneratedGuideLoopState {
+    static func defaultGuideLoopState(
+        for song: Song,
+        nextCue: (section: SongSection, targetTime: TimeInterval)? = nil
+    ) -> GeneratedGuideLoopState {
+        let secVol = Int((song.guideSectionsVolume * 1000.0).rounded())
+        let dirVol = Int((song.guideDirectionsVolume * 1000.0).rounded())
+        let fbVol = Int((song.guideFallbackVolume * 1000.0).rounded())
         if let sec = resolvedAutoInfiniteLoopSection(for: song) {
             return GeneratedGuideLoopState(
                 isLoopActive: true,
                 loopedSectionId: sec.id,
                 loopMode: .infinite,
                 singleLoopRemaining: 0,
-                queuedNextSectionId: nil
+                queuedNextSectionId: nil,
+                nextSongCueSectionId: nextCue?.section.id,
+                nextSongCueSectionName: nextCue?.section.name,
+                nextSongCueIncludeNumber: nextCue?.section.includeNumberInGuide,
+                nextSongCuePlayGuide: nextCue?.section.playSectionGuideCue ?? false,
+                nextSongCuePlayCountIn: nextCue?.section.playSectionCountIn ?? false,
+                nextSongCueTargetTimeMs: nextCue.map { Int(round($0.targetTime * 1000.0)) } ?? -1,
+                sectionsVolPermille: secVol,
+                sectionsEnabled: song.guideSectionsEnabled,
+                directionsVolPermille: dirVol,
+                directionsEnabled: song.guideDirectionsEnabled,
+                fallbackVolPermille: fbVol,
+                fallbackEnabled: song.guideFallbackEnabled,
+                soloedSubChannels: []
             )
         }
         return GeneratedGuideLoopState(
@@ -118,17 +146,51 @@ extension MultitrackAudioEngine {
             loopedSectionId: nil,
             loopMode: .none,
             singleLoopRemaining: 0,
-            queuedNextSectionId: nil
+            queuedNextSectionId: nil,
+            nextSongCueSectionId: nextCue?.section.id,
+            nextSongCueSectionName: nextCue?.section.name,
+            nextSongCueIncludeNumber: nextCue?.section.includeNumberInGuide,
+            nextSongCuePlayGuide: nextCue?.section.playSectionGuideCue ?? false,
+            nextSongCuePlayCountIn: nextCue?.section.playSectionCountIn ?? false,
+            nextSongCueTargetTimeMs: nextCue.map { Int(round($0.targetTime * 1000.0)) } ?? -1,
+            sectionsVolPermille: secVol,
+            sectionsEnabled: song.guideSectionsEnabled,
+            directionsVolPermille: dirVol,
+            directionsEnabled: song.guideDirectionsEnabled,
+            fallbackVolPermille: fbVol,
+            fallbackEnabled: song.guideFallbackEnabled,
+            soloedSubChannels: []
         )
     }
 
+    func expectedDefaultGuideLoopState(forSongAt index: Int, song: Song, duration: TimeInterval? = nil) -> GeneratedGuideLoopState {
+        let resolvedDur = duration ?? songDurationForGuide(for: song)
+        let nextCue = resolvedNextSongSectionCue(forSongAt: index, song: song, duration: resolvedDur)
+        return Self.defaultGuideLoopState(for: song, nextCue: nextCue)
+    }
+
     func currentLiveGuideLoopState() -> GeneratedGuideLoopState {
-        GeneratedGuideLoopState(
+        let dur = songDurationForGuide(for: currentSong)
+        let nextCue = resolvedNextSongSectionCue(forSongAt: currentSongIndex, song: currentSong, duration: dur)
+        return GeneratedGuideLoopState(
             isLoopActive: isLoopActive,
             loopedSectionId: isLoopActive ? loopedSection?.id : nil,
             loopMode: isLoopActive ? loopMode : .none,
             singleLoopRemaining: (isLoopActive && loopMode == .single) ? singleLoopRemaining : 0,
-            queuedNextSectionId: queuedNextSection?.id
+            queuedNextSectionId: queuedNextSection?.id,
+            nextSongCueSectionId: nextCue?.section.id,
+            nextSongCueSectionName: nextCue?.section.name,
+            nextSongCueIncludeNumber: nextCue?.section.includeNumberInGuide,
+            nextSongCuePlayGuide: nextCue?.section.playSectionGuideCue ?? false,
+            nextSongCuePlayCountIn: nextCue?.section.playSectionCountIn ?? false,
+            nextSongCueTargetTimeMs: nextCue.map { Int(round($0.targetTime * 1000.0)) } ?? -1,
+            sectionsVolPermille: Int((currentSong.guideSectionsVolume * 1000.0).rounded()),
+            sectionsEnabled: currentSong.guideSectionsEnabled,
+            directionsVolPermille: Int((currentSong.guideDirectionsVolume * 1000.0).rounded()),
+            directionsEnabled: currentSong.guideDirectionsEnabled,
+            fallbackVolPermille: Int((currentSong.guideFallbackVolume * 1000.0).rounded()),
+            fallbackEnabled: currentSong.guideFallbackEnabled,
+            soloedSubChannels: guideSoloedSubChannels
         )
     }
 
@@ -145,6 +207,9 @@ extension MultitrackAudioEngine {
             restoreAutomatedParametersToBaseMix(updateAudioMatrix: false)
         }
         stop()
+        isEditingTempoCurve = false
+        guideSoloedSubChannels.removeAll()
+        resetGuideSubChannelMeters()
         manualPadPackId = nil
         activeManualFade = nil
         isFadedOut = false
@@ -335,6 +400,11 @@ extension MultitrackAudioEngine {
         }
         
         for (track, finalBuffer) in loadedItems {
+            track.peakLevelLeft = 0.0
+            track.peakLevelRight = 0.0
+            track.rawPeakL = 0.0
+            track.rawPeakR = 0.0
+            track.meter.reset()
             let cat = StemCategory.category(for: track.name, role: track.role)
             if cat == .click { track.role = .click }
             else if cat == .guide { track.role = .guide }
@@ -379,6 +449,7 @@ extension MultitrackAudioEngine {
         
         if let cachedWf = songWaveformCache[song.id], !cachedWf.peaks.isEmpty {
             masterWaveformPeaks = cachedWf.peaks
+            refreshSoloWaveformIfNeeded(forceRecompute: true, triggerArrangementUpdate: false)
             updateArrangementWaveform()
         } else {
             recalculateAggregateWaveform(samplesCount: 4000)
@@ -412,6 +483,10 @@ extension MultitrackAudioEngine {
                 } else {
                     regenerateGuideTrack()
                 }
+            } else if !currentSong.excludesClickAndGuide &&
+                      currentSong.guideSource == .uploaded &&
+                      uploadedGuideBuffers[song.id] != nil {
+                applyGuideBuffer()
             }
             preGenerateRemainingSetlistClickAndGuide()
             if song.transposeSemitones != 0 || song.isTempoShifted {
@@ -1004,6 +1079,16 @@ extension MultitrackAudioEngine {
         for i in song.timeSignatureChanges.indices {
             song.timeSignatureChanges[i].audioTime *= scale
         }
+        for i in song.tempoEvents.indices {
+            song.tempoEvents[i].audioTime *= scale
+            if let endT = song.tempoEvents[i].endAudioTime {
+                song.tempoEvents[i].endAudioTime = endT * scale
+            }
+            song.tempoEvents[i].targetBPM = max(20.0, min(300.0, song.tempoEvents[i].targetBPM / scale))
+            for j in song.tempoEvents[i].customPoints.indices {
+                song.tempoEvents[i].customPoints[j].bpm = max(20.0, min(300.0, song.tempoEvents[i].customPoints[j].bpm / scale))
+            }
+        }
         for i in song.beatGrid.indices {
             song.beatGrid[i].time *= scale
             song.beatGrid[i].instantaneousBPM /= scale
@@ -1113,11 +1198,13 @@ extension MultitrackAudioEngine {
                 guard sid != activeId else { continue }
                 guard let self = self else { return }
                 let needsRender = await MainActor.run { () -> Bool in
-                    guard let s = self.currentSetlist.songs.first(where: { $0.id == sid }),
-                          !s.excludesClickAndGuide else { return false }
+                    guard let sIdx = self.currentSetlist.songs.firstIndex(where: { $0.id == sid }) else { return false }
+                    let s = self.currentSetlist.songs[sIdx]
+                    guard !s.excludesClickAndGuide else { return false }
+                    let expectedState = self.expectedDefaultGuideLoopState(forSongAt: sIdx, song: s)
                     let needC = s.clickSource == .generated && (self.generatedClickBuffers[sid]?.frameLength ?? 0) <= 1
                     let needG = s.guideSource == .generated &&
-                        ((self.generatedGuideBuffers[sid]?.frameLength ?? 0) <= 1 || self.generatedGuideLoopStates[sid] != Self.defaultGuideLoopState(for: s))
+                        ((self.generatedGuideBuffers[sid]?.frameLength ?? 0) <= 1 || self.generatedGuideLoopStates[sid] != expectedState)
                     return needC || needG
                 }
                 if needsRender {
@@ -1158,9 +1245,10 @@ extension MultitrackAudioEngine {
         }
 
         let autoLoopSec = Self.resolvedAutoInfiniteLoopSection(for: song)
-        let targetGuideState = Self.defaultGuideLoopState(for: song)
+        let earlyNextCue = resolvedNextSongSectionCue(forSongAt: songIdx, song: song, duration: songDurationForGuide(for: song))
+        let earlyTargetGuideState = Self.defaultGuideLoopState(for: song, nextCue: earlyNextCue)
         let needsClick = song.clickSource == .generated && (force || (generatedClickBuffers[songId]?.frameLength ?? 0) <= 1)
-        let needsGuide = song.guideSource == .generated && (force || (generatedGuideBuffers[songId]?.frameLength ?? 0) <= 1 || generatedGuideLoopStates[songId] != targetGuideState)
+        let needsGuide = song.guideSource == .generated && (force || (generatedGuideBuffers[songId]?.frameLength ?? 0) <= 1 || generatedGuideLoopStates[songId] != earlyTargetGuideState)
 
         if !needsClick && !needsGuide {
             syncCachedClickAndGuideBuffers(forSongId: songId)
@@ -1184,6 +1272,8 @@ extension MultitrackAudioEngine {
             callbacks.forEach { $0() }
             return
         }
+        let nextCue = resolvedNextSongSectionCue(forSongAt: songIdx, song: song, duration: duration)
+        let targetGuideState = Self.defaultGuideLoopState(for: song, nextCue: nextCue)
 
         preGeneratingClickGuideSongIds.insert(songId)
 
@@ -1208,6 +1298,12 @@ extension MultitrackAudioEngine {
         let guideVoice = song.guideVoice
         let guideFallbackVoice = song.guideFallbackVoice
         let countInEnabled = song.guideCountInEnabled
+        let guideSectionsVol = song.guideSectionsVolume
+        let guideSectionsEnabled = song.guideSectionsEnabled
+        let guideDirectionsVol = song.guideDirectionsVolume
+        let guideDirectionsEnabled = song.guideDirectionsEnabled
+        let guideFallbackVol = song.guideFallbackVolume
+        let guideFallbackEnabled = song.guideFallbackEnabled
         let clickGen = self.clickGenerator
         let guideGen = self.guideAudioGenerator
 
@@ -1233,7 +1329,7 @@ extension MultitrackAudioEngine {
                 format: canonicalFormat
             ) : nil
 
-            let newGuideBuf: AVAudioPCMBuffer? = needsGuide ? guideGen.generateGuideBuffer(
+            let guideResult: (buffer: AVAudioPCMBuffer, meterEvents: [GuideCueMeterEvent])? = needsGuide ? guideGen.generateGuideBufferWithMeterEvents(
                 sections: sections,
                 directionalCues: activeDirectionalCues,
                 bpm: bpm,
@@ -1248,6 +1344,15 @@ extension MultitrackAudioEngine {
                 isLoopActive: targetGuideState.isLoopActive,
                 loopMode: targetGuideState.loopMode,
                 singleLoopRemaining: 0,
+                nextSongFirstSection: nextCue?.section,
+                nextSongCueTargetTime: nextCue?.targetTime,
+                sectionsVolume: guideSectionsVol,
+                sectionsEnabled: guideSectionsEnabled,
+                directionsVolume: guideDirectionsVol,
+                directionsEnabled: guideDirectionsEnabled,
+                fallbackVolume: guideFallbackVol,
+                fallbackEnabled: guideFallbackEnabled,
+                soloedSubChannels: [],
                 format: canonicalFormat
             ) : nil
 
@@ -1264,17 +1369,19 @@ extension MultitrackAudioEngine {
                     self.generatedClickBuffers[songId] = cBuf
                 }
                 var needsLiveActiveRegen = false
-                if let gBuf = newGuideBuf {
+                if let gRes = guideResult {
                     if songId == self.currentSong.id {
                         if self.currentLiveGuideLoopState() == targetGuideState {
-                            self.generatedGuideBuffers[songId] = gBuf
+                            self.generatedGuideBuffers[songId] = gRes.buffer
                             self.generatedGuideLoopStates[songId] = targetGuideState
+                            self.guideCueMeterEvents[songId] = gRes.meterEvents
                         } else {
                             needsLiveActiveRegen = true
                         }
                     } else {
-                        self.generatedGuideBuffers[songId] = gBuf
+                        self.generatedGuideBuffers[songId] = gRes.buffer
                         self.generatedGuideLoopStates[songId] = targetGuideState
+                        self.guideCueMeterEvents[songId] = gRes.meterEvents
                     }
                 }
 
@@ -1335,6 +1442,7 @@ extension MultitrackAudioEngine {
         if let activeId = activeSongId, let newIndex = currentSetlist.songs.firstIndex(where: { $0.id == activeId }) {
             currentSongIndex = newIndex
         }
+        invalidateStaleNextSongSectionGuides()
         syncMixState()
         markSessionChanged()
     }
@@ -1388,6 +1496,7 @@ extension MultitrackAudioEngine {
             let nextIdx = min(currentSongIndex, currentSetlist.songs.count - 1)
             currentSongIndex = max(0, nextIdx)
             loadSong(currentSetlist.songs[currentSongIndex])
+            invalidateStaleNextSongSectionGuides()
         }
         markSessionChanged()
     }
@@ -1558,6 +1667,7 @@ extension MultitrackAudioEngine {
         }
         currentSetlist.songs.append(mutableSong)
         selectSongInSetlist(at: currentSetlist.songs.count - 1, updateUndoBaseline: false)
+        invalidateStaleNextSongSectionGuides()
         markSessionChanged()
     }
     
@@ -1605,6 +1715,7 @@ extension MultitrackAudioEngine {
             transitionType: .stayInSong,
             continuePad: ambientPadEnabled,
             endFadeOutEnabled: false,
+            fadeEndSectionEnabled: false,
             startPadWithSong: ambientPadEnabled,
             padPresetId: padPresetId,
             artworkData: nil,
@@ -1762,7 +1873,9 @@ extension MultitrackAudioEngine {
             s.padPresetId = ov.padPresetId
             s.continuePad = ov.continuePad
             s.continueClick = ov.continueClick
+            s.cueNextSongSection = ov.cueNextSongSection
             s.endFadeOutEnabled = ov.endFadeOutEnabled
+            s.fadeEndSectionEnabled = ov.fadeEndSectionEnabled
             s.startPadWithSong = ov.startPadWithSong
             s.padIntroOutroOnly = ov.padIntroOutroOnly
             s.transitionType = ov.transitionType
@@ -2571,7 +2684,10 @@ extension MultitrackAudioEngine {
                     uploadedGuideBuffers[songId] = norm
                 }
                 if song.guideSource == .generated {
-                    let expectedState = isActiveSong ? currentLiveGuideLoopState() : Self.defaultGuideLoopState(for: song)
+                    let songIdx = currentSetlist.songs.firstIndex(where: { $0.id == songId })
+                    let expectedState = isActiveSong
+                        ? currentLiveGuideLoopState()
+                        : expectedDefaultGuideLoopState(forSongAt: songIdx ?? -1, song: song)
                     if let genGuide = generatedGuideBuffers[songId],
                        genGuide.frameLength > 1,
                        generatedGuideLoopStates[songId] == expectedState {
@@ -2822,7 +2938,8 @@ extension MultitrackAudioEngine {
         musicalKey: String? = nil,
         artworkData: Data? = nil,
         sections: [SongSection]? = nil,
-        isCreatingNewSong: Bool = false
+        isCreatingNewSong: Bool = false,
+        preserveExistingSectionTimings: Bool? = nil
     ) {
         let safeBPM = max(20.0, min(300.0, (bpm * 100.0).rounded() / 100.0))
         let safeNum = max(1, min(16, timeSignatureNumerator))
@@ -2831,6 +2948,8 @@ extension MultitrackAudioEngine {
         let bpmChanged = abs(safeBPM - currentSong.bpm) > 0.005
         let timeSigChanged = (safeNum != currentSong.timeSignatureNumerator || safeDen != currentSong.timeSignatureDenominator)
         let wasTempoShifted = currentSong.isTempoShifted
+        let hasAudioStems = tracks.contains { $0.role == .stem }
+        let shouldPreserveTimings = preserveExistingSectionTimings ?? (!isCreatingNewSong && hasAudioStems)
 
         if bpmChanged || timeSigChanged {
             currentSong.beatGrid.removeAll()
@@ -2858,46 +2977,83 @@ extension MultitrackAudioEngine {
 
         let targetSections = sections ?? currentSong.sections
         if !targetSections.isEmpty && (sections != nil || bpmChanged || timeSigChanged) {
-            let srcGrid = currentSong.sourceBeatGrid()
-            let downbeats = srcGrid.filter { $0.isDownbeat }
             let secPerBeat = (60.0 / safeBPM) * (4.0 / Double(safeDen))
             let secPerMeasure = secPerBeat * Double(safeNum)
 
-            var curTime: TimeInterval = 0.0
-            var curMeasure = 1
-            var recalculated: [SongSection] = []
-            recalculated.reserveCapacity(targetSections.count)
-
-            for var sec in targetSections {
-                let dur: TimeInterval
-                if !downbeats.isEmpty && curMeasure - 1 < downbeats.count {
-                    let startIdx = curMeasure - 1
-                    let endIdx = startIdx + sec.measureCount
-                    if endIdx < downbeats.count {
-                        dur = max(secPerBeat, downbeats[endIdx].time - downbeats[startIdx].time)
-                    } else {
-                        let tailBPM = downbeats[startIdx].instantaneousBPM > 20.0 ? downbeats[startIdx].instantaneousBPM : safeBPM
-                        let tailBarDur = (60.0 / tailBPM) * (4.0 / Double(safeDen)) * Double(safeNum)
-                        dur = Double(sec.measureCount) * tailBarDur
+            if shouldPreserveTimings {
+                let sectionListChanged: Bool = {
+                    guard let provided = sections else { return false }
+                    guard provided.count == currentSong.sections.count else { return true }
+                    for (a, b) in zip(provided, currentSong.sections) {
+                        if a.id != b.id || a.name != b.name || abs(a.duration - b.duration) > 0.05 {
+                            return true
+                        }
                     }
-                } else {
-                    dur = Double(sec.measureCount) * secPerMeasure
-                }
-                sec.startTime = curTime
-                sec.duration = dur
-                sec.startMeasure = curMeasure
-                if !sec.isTrimmed {
-                    sec.audioStartTime = curTime
-                    sec.originalAudioStartTime = curTime
-                    sec.originalDuration = dur
-                }
-                recalculated.append(sec)
-                curTime += dur
-                curMeasure += sec.measureCount
-            }
+                    return false
+                }()
 
-            currentSong.sections = recalculated
-            currentSong.defaultSections = recalculated
+                if sectionListChanged {
+                    var curTime: TimeInterval = 0.0
+                    var updated: [SongSection] = []
+                    updated.reserveCapacity(targetSections.count)
+                    for var sec in targetSections {
+                        let secDur = sec.duration > 0.05 ? sec.duration : (Double(max(1, sec.measureCount)) * secPerMeasure)
+                        sec.startTime = curTime
+                        sec.duration = secDur
+                        if !sec.isTrimmed && sec.audioStartTime == nil {
+                            sec.audioStartTime = curTime
+                            sec.originalAudioStartTime = curTime
+                            sec.originalDuration = secDur
+                        }
+                        updated.append(sec)
+                        curTime += secDur
+                    }
+                    currentSong.sections = updated
+                    if currentSong.activeArrangementId == nil {
+                        currentSong.defaultSections = updated
+                    }
+                }
+                currentSong.reconcileSectionMeasuresWithBeatGrid()
+            } else {
+                let srcGrid = currentSong.sourceBeatGrid()
+                let downbeats = srcGrid.filter { $0.isDownbeat }
+
+                var curTime: TimeInterval = 0.0
+                var curMeasure = 1
+                var recalculated: [SongSection] = []
+                recalculated.reserveCapacity(targetSections.count)
+
+                for var sec in targetSections {
+                    let dur: TimeInterval
+                    if !downbeats.isEmpty && curMeasure - 1 < downbeats.count {
+                        let startIdx = curMeasure - 1
+                        let endIdx = startIdx + sec.measureCount
+                        if endIdx < downbeats.count {
+                            dur = max(secPerBeat, downbeats[endIdx].time - downbeats[startIdx].time)
+                        } else {
+                            let tailBPM = downbeats[startIdx].instantaneousBPM > 20.0 ? downbeats[startIdx].instantaneousBPM : safeBPM
+                            let tailBarDur = (60.0 / tailBPM) * (4.0 / Double(safeDen)) * Double(safeNum)
+                            dur = Double(sec.measureCount) * tailBarDur
+                        }
+                    } else {
+                        dur = Double(sec.measureCount) * secPerMeasure
+                    }
+                    sec.startTime = curTime
+                    sec.duration = dur
+                    sec.startMeasure = curMeasure
+                    if !sec.isTrimmed {
+                        sec.audioStartTime = curTime
+                        sec.originalAudioStartTime = curTime
+                        sec.originalDuration = dur
+                    }
+                    recalculated.append(sec)
+                    curTime += dur
+                    curMeasure += sec.measureCount
+                }
+
+                currentSong.sections = recalculated
+                currentSong.defaultSections = recalculated
+            }
         }
 
         if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {

@@ -142,8 +142,11 @@ public struct WaveformTimelineView: View {
     @State private var isAddingAutomationAtPlayhead: Bool = false
     @State private var editingAutomationPoint: AutomationPoint? = nil
     
-    // Time Signature Change Badge Popover State
+    // Time Signature & Tempo Change Badge Popover + Curve Drawing State
     @State private var editingTimeSignatureChange: TimeSignatureChange? = nil
+    @State private var editingTempoEvent: TempoChangeEvent? = nil
+    @State private var tempoCurveTool: TempoCurveTool = .pointer
+    @State private var tempoCurveSnapToBeat: Bool = true
     
     // SMPTE Add / Edit Popover State
     @State private var isAddingSMPTECueAtPlayhead: Bool = false
@@ -240,6 +243,7 @@ public struct WaveformTimelineView: View {
         isAddingAutomationAtPlayhead ||
         editingAutomationPoint != nil ||
         editingTimeSignatureChange != nil ||
+        editingTempoEvent != nil ||
         isAddingSMPTECueAtPlayhead ||
         editingSMPTECue != nil
     }
@@ -304,7 +308,9 @@ public struct WaveformTimelineView: View {
                 secPerMeasure: secPerMeasure,
                 pixelsPerSecond: pixelsPerSecond,
                 beatsPerMeasure: timeSignatureNumerator,
+                timeSignatureDenominator: engine.currentSong.timeSignatureDenominator,
                 bpm: engine.currentSong.bpm,
+                beatGridVersion: engine.beatGridVersion,
                 beatGridCount: dynamicGrid.count,
                 firstMarkerTime: dynamicGrid.first?.time ?? -1.0,
                 lastMarkerTime: dynamicGrid.last?.time ?? -1.0
@@ -370,6 +376,8 @@ public struct WaveformTimelineView: View {
                     editingDirectionalCue: $editingDirectionalCue,
                     isAddingAutomationAtPlayhead: $isAddingAutomationAtPlayhead,
                     editingAutomationPoint: $editingAutomationPoint,
+                    editingTimeSignatureChange: $editingTimeSignatureChange,
+                    editingTempoEvent: $editingTempoEvent,
                     isAddingSMPTECueAtPlayhead: $isAddingSMPTECueAtPlayhead,
                     editingSMPTECue: $editingSMPTECue,
                     computePopoverRectWithScroll: { scrollX in
@@ -435,7 +443,7 @@ public struct WaveformTimelineView: View {
                         )
                     )
                     .simultaneousGesture(
-                        (engine.isEditingArrangement || isUserScrollBlocked || draggingCueId != nil || isDraggingSMPTECue) ? nil :
+                        (engine.isEditingArrangement || engine.isEditingTempoCurve || isUserScrollBlocked || draggingCueId != nil || isDraggingSMPTECue) ? nil :
                         DragGesture(minimumDistance: 3)
                             .onChanged { value in
                                 guard draggingCueId == nil && !isDraggingSMPTECue else { return }
@@ -493,6 +501,46 @@ public struct WaveformTimelineView: View {
                     isBlankSession: isBlankSession
                 )
                 .zIndex(100)
+
+                if !isBlankSession {
+                    if engine.isEditingTempoCurve {
+                        TempoCurveOverlayHUD(
+                            engine: engine,
+                            waveformHeight: waveformHeight,
+                            tool: $tempoCurveTool,
+                            snapToBeat: $tempoCurveSnapToBeat
+                        )
+                        .frame(width: geo.size.width, height: waveformHeight, alignment: .topLeading)
+                        .zIndex(150)
+                    } else if engine.isEditDrawerOpen && engine.selectedEditDrawerItem == .songSections {
+                        VStack {
+                            HStack {
+                                Spacer()
+                                Button(action: { engine.openTempoCurveEditor() }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "waveform.path")
+                                            .font(.system(size: 10, weight: .bold))
+                                        Text("Tempo Curve")
+                                            .font(.system(size: 10, weight: .bold))
+                                    }
+                                    .foregroundColor(.black)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color(red: 0.98, green: 0.68, blue: 0.18))
+                                    .cornerRadius(5)
+                                    .shadow(color: .black.opacity(0.55), radius: 3)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Draw or edit mid-song tempo changes and curves directly over the waveform")
+                            }
+                            .padding(.top, 8)
+                            .padding(.trailing, 10)
+                            Spacer()
+                        }
+                        .frame(width: geo.size.width, height: waveformHeight, alignment: .topTrailing)
+                        .zIndex(150)
+                    }
+                }
             }
             .coordinateSpace(name: "timelineViewport")
             .clipShape(RoundedRectangle(cornerRadius: 4))
@@ -782,26 +830,17 @@ public struct WaveformTimelineView: View {
                     }
                     .buttonStyle(.plain)
                     .position(x: badgeX, y: 34)
-                    .popover(item: Binding<TimeSignatureChange?>(
-                        get: { editingTimeSignatureChange?.id == tsChange.id ? editingTimeSignatureChange : nil },
-                        set: { if $0 == nil { editingTimeSignatureChange = nil } }
-                    )) { item in
-                        TimeSignatureChangeEditorPopover(
-                            change: item,
-                            onUpdate: { num, den in
-                                engine.updateTimeSignatureChange(id: item.id, numerator: num, denominator: den)
-                                editingTimeSignatureChange = nil
-                            },
-                            onDelete: {
-                                engine.removeTimeSignatureChange(id: item.id)
-                                editingTimeSignatureChange = nil
-                            }
-                        )
-                    }
                     .zIndex(50)
                 }
             }
             
+            // 2. Tempo Change Pills, Ramp Ribbons & Dimmed-Waveform DAW Curve Overlay
+            timelineTempoOverlayAndPills(
+                waveformWidth: waveformWidth,
+                waveformHeight: waveformHeight,
+                pixelsPerSecond: pixelsPerSecond
+            )
+
             // 3. Sections Map with Text & Badges (confined to upper window above cue lane)
             EquatableView(content: TimelineSectionsLayerView(
                 liveSections: liveSections,
@@ -833,6 +872,8 @@ public struct WaveformTimelineView: View {
                     autoSnapTimer = nil
                 }
             ))
+            .opacity(engine.isEditingTempoCurve ? 0.45 : 1.0)
+            .allowsHitTesting(!engine.isEditingTempoCurve)
             
             // 4. Section Edit Markers (Displayed in Setlist / Song Map mode while stopped and not trimming)
             if (engine.isEditSongMapMode || (engine.isEditDrawerOpen && engine.selectedEditDrawerItem == .setlistSongMap)) && engine.playbackState != .playing && engine.trimmingSection == nil {
@@ -919,6 +960,111 @@ public struct WaveformTimelineView: View {
                 viewportWidth: geo.size.width
             )
             .zIndex(200)
+        }
+    }
+
+    @ViewBuilder
+    private func timelineTempoOverlayAndPills(
+        waveformWidth: CGFloat,
+        waveformHeight: CGFloat,
+        pixelsPerSecond: CGFloat
+    ) -> some View {
+        let dispForSrc: (TimeInterval) -> TimeInterval = { srcT in
+            if let sec = engine.currentSong.sections.first(where: {
+                srcT >= $0.sourceAudioStartTime - 0.01 &&
+                srcT <= $0.sourceAudioStartTime + $0.duration + 0.01
+            }) {
+                return sec.startTime + (srcT - sec.sourceAudioStartTime)
+            }
+            return srcT
+        }
+        let accentAmber = Color(red: 0.98, green: 0.68, blue: 0.18)
+
+        if engine.isEditingTempoCurve {
+            TempoCurveScrollingOverlay(
+                engine: engine,
+                pixelsPerSecond: pixelsPerSecond,
+                waveformWidth: waveformWidth,
+                waveformHeight: waveformHeight,
+                tool: tempoCurveTool,
+                snapToBeat: tempoCurveSnapToBeat,
+                editingTempoEvent: $editingTempoEvent
+            )
+            .zIndex(85)
+        } else if !engine.currentSong.tempoEvents.isEmpty {
+            let spans = engine.currentSong.resolvedTempoSpans()
+            ForEach(spans, id: \.event.id) { span in
+                let startDisp = dispForSrc(span.startTime)
+                let endDisp = dispForSrc(span.endTime)
+                let startX = CGFloat(startDisp) * pixelsPerSecond
+                let endX = CGFloat(max(startDisp, endDisp)) * pixelsPerSecond
+                let anchorX = span.event.isRamp ? (startX + endX) * 0.5 : startX
+                let tsCollision = engine.currentSong.timeSignatureChanges.contains { ts in
+                    let tsX = CGFloat(dispForSrc(ts.audioTime)) * pixelsPerSecond
+                    return abs(tsX - anchorX) < 44.0
+                }
+                let pillY: CGFloat = tsCollision ? 56.0 : 34.0
+
+                if span.event.isRamp && endX > startX + 4.0 {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(accentAmber.opacity(0.14))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 3)
+                                .stroke(accentAmber.opacity(0.55), style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
+                        )
+                        .frame(width: max(4.0, endX - startX), height: max(20.0, waveformHeight - 28.0))
+                        .position(x: (startX + endX) * 0.5, y: waveformHeight * 0.5 + 10.0)
+                        .allowsHitTesting(false)
+                        .zIndex(45)
+
+                    if engine.isEditDrawerOpen && engine.selectedEditDrawerItem == .songSections {
+                        Circle()
+                            .fill(accentAmber)
+                            .frame(width: 9, height: 9)
+                            .overlay(Circle().stroke(Color.white, lineWidth: 1.2))
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                            .position(x: endX, y: pillY)
+                            .gesture(
+                                DragGesture(minimumDistance: 1)
+                                    .onChanged { value in
+                                        let rawDisp = max(0.0, TimeInterval(value.location.x / max(1.0, pixelsPerSecond)))
+                                        let snapped = NSEvent.modifierFlags.contains(.option) ? rawDisp : snapTimeToBeatGrid(rawDisp)
+                                        let endSrc = max(span.event.audioTime + 0.15, engine.audioTime(forArrangementTime: snapped))
+                                        var updated = span.event
+                                        updated.spanMode = .audioAnchor
+                                        updated.endAudioTime = endSrc
+                                        engine.updateTempoChangeEvent(updated, commit: false)
+                                    }
+                                    .onEnded { value in
+                                        let rawDisp = max(0.0, TimeInterval(value.location.x / max(1.0, pixelsPerSecond)))
+                                        let snapped = NSEvent.modifierFlags.contains(.option) ? rawDisp : snapTimeToBeatGrid(rawDisp)
+                                        let endSrc = max(span.event.audioTime + 0.15, engine.audioTime(forArrangementTime: snapped))
+                                        var updated = span.event
+                                        updated.spanMode = .audioAnchor
+                                        updated.endAudioTime = endSrc
+                                        engine.updateTempoChangeEvent(updated, commit: true)
+                                    }
+                            )
+                            .zIndex(52)
+                    }
+                }
+
+                Button(action: {
+                    editingTempoEvent = span.event
+                }) {
+                    Text(span.event.pillLabel(from: span.startBPM))
+                        .font(.system(size: 10, weight: .black))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(accentAmber)
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+                .position(x: anchorX, y: pillY)
+                .zIndex(51)
+            }
         }
     }
     
@@ -1738,6 +1884,7 @@ private struct TimelinePlayheadScrollContainer<StaticContent: View>: View {
                     firstTile: firstTile,
                     lastTile: lastTile
                 ))
+                .opacity(engine.isEditingTempoCurve ? 0.25 : 1.0)
             }
 
             scrollingStaticContent
@@ -2010,6 +2157,8 @@ private struct TimelinePopoverAnchorsOverlay: View {
     @Binding var editingDirectionalCue: DirectionalCue?
     @Binding var isAddingAutomationAtPlayhead: Bool
     @Binding var editingAutomationPoint: AutomationPoint?
+    @Binding var editingTimeSignatureChange: TimeSignatureChange?
+    @Binding var editingTempoEvent: TempoChangeEvent?
     @Binding var isAddingSMPTECueAtPlayhead: Bool
     @Binding var editingSMPTECue: SMPTECue?
 
@@ -2022,6 +2171,8 @@ private struct TimelinePopoverAnchorsOverlay: View {
             isAddingMIDICueAtPlayhead || editingMIDICue != nil ||
             isAddingDirectionalCueAtPlayhead || editingDirectionalCue != nil ||
             isAddingAutomationAtPlayhead || editingAutomationPoint != nil ||
+            editingTimeSignatureChange != nil ||
+            editingTempoEvent != nil ||
             isAddingSMPTECueAtPlayhead || editingSMPTECue != nil
 
         let scrollX: CGFloat = anyPopoverActive ? scrollXForTime(clock.position.currentTime) : 0.0
@@ -2068,6 +2219,52 @@ private struct TimelinePopoverAnchorsOverlay: View {
                 return NSRect(x: clampedCueX - 10, y: yPos - 10, width: 20, height: 20)
             }
             return nil
+        }()
+
+        let activeTimeSignatureTargetRect: NSRect? = {
+            guard let ts = editingTimeSignatureChange else { return nil }
+            let dispTime: TimeInterval = {
+                if let sec = engine.currentSong.sections.first(where: {
+                    ts.audioTime >= $0.sourceAudioStartTime - 0.01 &&
+                    ts.audioTime <= $0.sourceAudioStartTime + $0.duration + 0.01
+                }) {
+                    return sec.startTime + (ts.audioTime - sec.sourceAudioStartTime)
+                }
+                return ts.audioTime
+            }()
+            let rawX = CGFloat(dispTime) * pixelsPerSecond + scrollX
+            let clampedX = max(24.0, min(max(48.0, geoSize.width - 24.0), rawX))
+            return NSRect(x: clampedX - 18, y: 34 - 10, width: 36, height: 20)
+        }()
+
+        let activeTempoTargetRect: NSRect? = {
+            guard let ev = editingTempoEvent else { return nil }
+            let dispForSrc: (TimeInterval) -> TimeInterval = { srcT in
+                if let sec = engine.currentSong.sections.first(where: {
+                    srcT >= $0.sourceAudioStartTime - 0.01 &&
+                    srcT <= $0.sourceAudioStartTime + $0.duration + 0.01
+                }) {
+                    return sec.startTime + (srcT - sec.sourceAudioStartTime)
+                }
+                return srcT
+            }
+            let spans = engine.currentSong.resolvedTempoSpans()
+            let matchedSpan = spans.first(where: { $0.event.id == ev.id })
+            let targetSrcTime: TimeInterval = {
+                if let sp = matchedSpan, ev.isRamp {
+                    return engine.isEditingTempoCurve ? sp.endTime : (sp.startTime + sp.endTime) * 0.5
+                }
+                return ev.audioTime
+            }()
+            let dispTime = dispForSrc(targetSrcTime)
+            let rawX = CGFloat(dispTime) * pixelsPerSecond + scrollX
+            let clampedX = max(24.0, min(max(48.0, geoSize.width - 24.0), rawX))
+            let tsXCollision = engine.currentSong.timeSignatureChanges.contains { ts in
+                let tsX = CGFloat(dispForSrc(ts.audioTime)) * pixelsPerSecond + scrollX
+                return abs(tsX - rawX) < 44.0
+            }
+            let yPos: CGFloat = tsXCollision ? 56.0 : 34.0
+            return NSRect(x: clampedX - 24, y: yPos - 10, width: 48, height: 20)
         }()
 
         let activeSMPTETargetRect: NSRect? = {
@@ -2119,6 +2316,22 @@ private struct TimelinePopoverAnchorsOverlay: View {
             .frame(width: geoSize.width, height: geoSize.height)
             .allowsHitTesting(false)
 
+            TimeSignaturePopoverPresenter(
+                editingChange: $editingTimeSignatureChange,
+                targetRect: activeTimeSignatureTargetRect,
+                engine: engine
+            )
+            .frame(width: geoSize.width, height: geoSize.height)
+            .allowsHitTesting(false)
+
+            TempoChangePopoverPresenter(
+                editingEvent: $editingTempoEvent,
+                targetRect: activeTempoTargetRect,
+                engine: engine
+            )
+            .frame(width: geoSize.width, height: geoSize.height)
+            .allowsHitTesting(false)
+
             SMPTEPopoverPresenter(
                 isAddingAtPlayhead: $isAddingSMPTECueAtPlayhead,
                 editingCue: $editingSMPTECue,
@@ -2144,7 +2357,9 @@ fileprivate final class BeatGridTileCache {
         let secPerMeasure: Double
         let pixelsPerSecond: CGFloat
         let beatsPerMeasure: Int
+        let timeSignatureDenominator: Int
         let bpm: Double
+        let beatGridVersion: UInt64
         let beatGridCount: Int
         let firstMarkerTime: Double
         let lastMarkerTime: Double
@@ -2303,7 +2518,8 @@ fileprivate final class BeatGridTileCache {
                         numStr.draw(at: NSPoint(x: lx + 4, y: effectiveBottomY - 19))
                         
                         let roundedBarBPM = Int(round(marker.instantaneousBPM))
-                        if abs(roundedBarBPM - lastDisplayedBarBPM) >= 2 && abs(roundedBarBPM - Int(round(baseSongBPM))) >= 2 {
+                        let nearExplicitTempoEvent = engine.currentSong.tempoEvents.contains { abs($0.audioTime - marker.time) < 0.25 }
+                        if !nearExplicitTempoEvent && abs(roundedBarBPM - lastDisplayedBarBPM) >= 2 && abs(roundedBarBPM - Int(round(baseSongBPM))) >= 2 {
                             lastDisplayedBarBPM = roundedBarBPM
                             let bpmStr = NSAttributedString(string: "\(roundedBarBPM) BPM", attributes: bpmAttrs)
                             bpmStr.draw(at: NSPoint(x: lx + 4, y: effectiveBottomY - 30))
@@ -2952,8 +3168,9 @@ private struct TimeSignatureChangeEditorPopover: View {
             }
         }
         .padding(12)
-        .frame(width: 240)
-        .background(Color(red: 0.12, green: 0.13, blue: 0.15))
+        .frame(width: 240, alignment: .topLeading)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(Color(red: 0.12, green: 0.13, blue: 0.15).ignoresSafeArea())
     }
 }
 
@@ -4149,6 +4366,277 @@ struct SMPTEPopoverPresenter: NSViewRepresentable {
             guard !isProgrammaticClose else { return }
             popover = nil
             currentlyPresentedKey = nil
+            DispatchQueue.main.async { [weak self] in
+                self?.onClose?()
+            }
+        }
+    }
+}
+
+struct TimeSignaturePopoverPresenter: NSViewRepresentable {
+    @Binding var editingChange: TimeSignatureChange?
+    let targetRect: NSRect?
+    let engine: MultitrackAudioEngine
+
+    func makeNSView(context: Context) -> SongSectionPopoverPresenter.PopoverAnchorNSView {
+        let view = SongSectionPopoverPresenter.PopoverAnchorNSView()
+        context.coordinator.anchorView = view
+        return view
+    }
+
+    func updateNSView(_ nsView: SongSectionPopoverPresenter.PopoverAnchorNSView, context: Context) {
+        context.coordinator.anchorView = nsView
+        context.coordinator.update(
+            editingChange: editingChange,
+            targetRect: targetRect,
+            engine: engine
+        ) {
+            DispatchQueue.main.async {
+                self.editingChange = nil
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSPopoverDelegate {
+        weak var anchorView: SongSectionPopoverPresenter.PopoverAnchorNSView?
+        var popover: NSPopover?
+        var currentlyPresentedId: UUID?
+        var onClose: (() -> Void)?
+        private var isProgrammaticClose = false
+
+        func closeProgrammatically() {
+            guard let p = popover else {
+                currentlyPresentedId = nil
+                return
+            }
+            isProgrammaticClose = true
+            p.delegate = nil
+            p.close()
+            popover = nil
+            currentlyPresentedId = nil
+            isProgrammaticClose = false
+        }
+
+        func update(
+            editingChange: TimeSignatureChange?,
+            targetRect: NSRect?,
+            engine: MultitrackAudioEngine,
+            onClose: @escaping () -> Void
+        ) {
+            self.onClose = onClose
+
+            guard let change = editingChange, let rect = targetRect else {
+                closeProgrammatically()
+                return
+            }
+
+            if let p = popover, currentlyPresentedId == change.id {
+                if p.isShown {
+                    p.positioningRect = rect
+                }
+                return
+            }
+
+            closeProgrammatically()
+
+            guard let anchorView = anchorView else { return }
+            guard anchorView.window != nil else {
+                anchorView.onMoveToWindow = { [weak self] in
+                    self?.update(editingChange: editingChange, targetRect: targetRect, engine: engine, onClose: onClose)
+                }
+                return
+            }
+
+            let p = NSPopover()
+            p.appearance = NSAppearance(named: .darkAqua)
+            p.behavior = .transient
+            p.animates = true
+            p.delegate = self
+
+            let contentView = AnyView(TimeSignatureChangeEditorPopover(
+                change: change,
+                onUpdate: { [weak self] num, den in
+                    engine.updateTimeSignatureChange(id: change.id, numerator: num, denominator: den)
+                    self?.closeProgrammatically()
+                    self?.onClose?()
+                },
+                onDelete: { [weak self] in
+                    engine.removeTimeSignatureChange(id: change.id)
+                    self?.closeProgrammatically()
+                    self?.onClose?()
+                }
+            ))
+
+            let hostingController = NSHostingController(rootView: contentView)
+            hostingController.sizingOptions = .preferredContentSize
+            hostingController.view.wantsLayer = true
+            hostingController.view.layer?.backgroundColor = NSColor(red: 0.12, green: 0.13, blue: 0.15, alpha: 1.0).cgColor
+            let fittingSize = hostingController.sizeThatFits(in: NSSize(width: 240, height: 400))
+            let finalSize = NSSize(width: 240, height: max(ceil(fittingSize.height), 44))
+            hostingController.preferredContentSize = finalSize
+            p.contentSize = finalSize
+            p.contentViewController = hostingController
+            self.popover = p
+            self.currentlyPresentedId = change.id
+
+            p.show(relativeTo: rect, of: anchorView, preferredEdge: .maxY)
+        }
+
+        func popoverDidClose(_ notification: Notification) {
+            guard !isProgrammaticClose else { return }
+            popover = nil
+            currentlyPresentedId = nil
+            DispatchQueue.main.async { [weak self] in
+                self?.onClose?()
+            }
+        }
+    }
+}
+
+struct TempoChangePopoverPresenter: NSViewRepresentable {
+    @Binding var editingEvent: TempoChangeEvent?
+    let targetRect: NSRect?
+    let engine: MultitrackAudioEngine
+
+    func makeNSView(context: Context) -> SongSectionPopoverPresenter.PopoverAnchorNSView {
+        let view = SongSectionPopoverPresenter.PopoverAnchorNSView()
+        context.coordinator.anchorView = view
+        return view
+    }
+
+    func updateNSView(_ nsView: SongSectionPopoverPresenter.PopoverAnchorNSView, context: Context) {
+        context.coordinator.anchorView = nsView
+        context.coordinator.update(
+            editingEvent: editingEvent,
+            targetRect: targetRect,
+            engine: engine
+        ) {
+            DispatchQueue.main.async {
+                self.editingEvent = nil
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSPopoverDelegate {
+        weak var anchorView: SongSectionPopoverPresenter.PopoverAnchorNSView?
+        var popover: NSPopover?
+        var currentlyPresentedId: UUID?
+        var onClose: (() -> Void)?
+        private var isProgrammaticClose = false
+
+        func closeProgrammatically() {
+            guard let p = popover else {
+                currentlyPresentedId = nil
+                return
+            }
+            isProgrammaticClose = true
+            p.delegate = nil
+            p.close()
+            popover = nil
+            currentlyPresentedId = nil
+            isProgrammaticClose = false
+        }
+
+        func update(
+            editingEvent: TempoChangeEvent?,
+            targetRect: NSRect?,
+            engine: MultitrackAudioEngine,
+            onClose: @escaping () -> Void
+        ) {
+            self.onClose = onClose
+
+            guard let ev = editingEvent, let rect = targetRect else {
+                closeProgrammatically()
+                return
+            }
+
+            if let p = popover, currentlyPresentedId == ev.id {
+                if p.isShown {
+                    p.positioningRect = rect
+                }
+                return
+            }
+
+            closeProgrammatically()
+
+            guard let anchorView = anchorView else { return }
+            guard anchorView.window != nil else {
+                anchorView.onMoveToWindow = { [weak self] in
+                    self?.update(editingEvent: editingEvent, targetRect: targetRect, engine: engine, onClose: onClose)
+                }
+                return
+            }
+
+            let p = NSPopover()
+            p.appearance = NSAppearance(named: .darkAqua)
+            p.behavior = .transient
+            p.animates = true
+            p.delegate = self
+
+            let activeStartBPM = engine.currentSong.resolvedTempoSpans().first(where: { $0.event.id == ev.id })?.startBPM ?? engine.currentSong.bpm
+            let contentView = AnyView(TempoChangeEditorPopover(
+                event: ev,
+                activeStartBPM: activeStartBPM,
+                currentPlayheadDisplayTime: engine.playbackOffsetSeconds,
+                onSetEndAtPlayhead: {
+                    engine.audioTime(forArrangementTime: engine.playbackOffsetSeconds)
+                },
+                onOpenWaveformCurve: { [weak self] in
+                    engine.openTempoCurveEditor()
+                    self?.closeProgrammatically()
+                    self?.onClose?()
+                },
+                onUpdate: { [weak self] updated in
+                    engine.updateTempoChangeEvent(updated, commit: true)
+                    self?.closeProgrammatically()
+                    self?.onClose?()
+                },
+                onDelete: { [weak self] in
+                    engine.removeTempoChangeEvent(id: ev.id)
+                    self?.closeProgrammatically()
+                    self?.onClose?()
+                },
+                onContentHeightChange: { [weak self, weak p] newHeight in
+                    DispatchQueue.main.async {
+                        guard let self, let p, self.popover === p, let hc = p.contentViewController else { return }
+                        let nextSize = NSSize(width: 280, height: max(ceil(newHeight), 44))
+                        if abs(p.contentSize.height - nextSize.height) > 0.5 || abs(p.contentSize.width - nextSize.width) > 0.5 {
+                            hc.preferredContentSize = nextSize
+                            p.contentSize = nextSize
+                        }
+                    }
+                }
+            ))
+
+            let hostingController = NSHostingController(rootView: contentView)
+            hostingController.sizingOptions = .preferredContentSize
+            hostingController.view.wantsLayer = true
+            hostingController.view.layer?.backgroundColor = NSColor(red: 0.12, green: 0.13, blue: 0.15, alpha: 1.0).cgColor
+            let fittingSize = hostingController.sizeThatFits(in: NSSize(width: 280, height: 1000))
+            let finalSize = NSSize(width: 280, height: max(ceil(fittingSize.height), 44))
+            hostingController.preferredContentSize = finalSize
+            p.contentSize = finalSize
+            p.contentViewController = hostingController
+            self.popover = p
+            self.currentlyPresentedId = ev.id
+
+            p.show(relativeTo: rect, of: anchorView, preferredEdge: .maxY)
+        }
+
+        func popoverDidClose(_ notification: Notification) {
+            guard !isProgrammaticClose else { return }
+            popover = nil
+            currentlyPresentedId = nil
             DispatchQueue.main.async { [weak self] in
                 self?.onClose?()
             }

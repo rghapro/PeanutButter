@@ -168,7 +168,10 @@ public struct PadPlayerView: View {
     private func padKeyButton(key: String, width: CGFloat) -> some View {
         let isCurrentKey = (engine.currentPadKey == key)
         let isActive = engine.isPadActive && isCurrentKey
-        
+        let lockedSongKey = engine.linkedSongPadKey
+        let isKeyLockedOut = engine.isPadKeyLockedToSong && lockedSongKey != key
+        let isLockedSongKey = engine.isPadKeyLockedToSong && lockedSongKey == key
+
         return Button(action: {
             if engine.isPadActive && isCurrentKey {
                 engine.stopPadPlayer()
@@ -190,19 +193,29 @@ public struct PadPlayerView: View {
                 Text(key)
                     .font(.system(size: 15, weight: .bold))
                     .foregroundColor(isActive ? Color(red: 0.25, green: 0.95, blue: 0.50) : .white)
+
+                if isLockedSongKey {
+                    Image(systemName: "link")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(isActive ? Color(red: 0.25, green: 0.95, blue: 0.50) : Color(white: 0.65))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        .padding(6)
+                }
             }
             .frame(width: width, height: max(60, width * 0.72))
             .overlay(
                 RoundedRectangle(cornerRadius: 7)
                     .stroke(
-                        engine.isAutomationHighlightActive ? Color(red: 0.25, green: 0.88, blue: 0.45) : (isActive ? Color(red: 0.25, green: 0.90, blue: 0.45) : Color(white: 0.19)),
+                        engine.isAutomationHighlightActive ? Color(red: 0.25, green: 0.88, blue: 0.45) : (isActive ? Color(red: 0.25, green: 0.90, blue: 0.45) : (isLockedSongKey ? Color(red: 0.25, green: 0.90, blue: 0.45).opacity(0.45) : Color(white: 0.19))),
                         lineWidth: (engine.isAutomationHighlightActive || isActive) ? 1.4 : 1.0
                     )
             )
             .shadow(color: isActive ? Color.green.opacity(0.2) : Color.clear, radius: 4)
         }
         .buttonStyle(.plain)
-        .help("Play pad in key of \(key)")
+        .disabled(isKeyLockedOut)
+        .opacity(isKeyLockedOut ? 0.32 : 1.0)
+        .help(isKeyLockedOut ? "Locked to song key (\(lockedSongKey ?? "")) while playing with LINK enabled" : "Play pad in key of \(key)")
     }
     
     // MARK: - Left Channel Strip

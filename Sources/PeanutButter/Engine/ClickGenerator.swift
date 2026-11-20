@@ -48,13 +48,7 @@ public final class ClickGenerator: @unchecked Sendable {
         }
         
         // Find downbeat time of the section labeled "End" (or "Ending")
-        let endSection = sections.first(where: { sec in
-            let lowerName = sec.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let lowerAbbrev = sec.abbreviation.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return lowerName == "end" || lowerName == "ending" || lowerName == "the end" ||
-                   lowerName.starts(with: "end ") || lowerName.hasSuffix(" end") ||
-                   lowerAbbrev == "end" || (lowerAbbrev == "e" && lowerName.contains("end"))
-        })
+        let endSection = sections.first(where: { Song.isEndSection($0) })
         let endCutoffTime: TimeInterval? = suppressEndCutoff ? nil : endSection?.startTime
         
         let accentFreq: Double
@@ -140,6 +134,7 @@ public final class ClickGenerator: @unchecked Sendable {
         let sixteenthSample = soundType.isSampled ? AudioSampleBank.shared.getClickSample(sound: soundType, subdivision: .sixteenth, format: format) : nil
         
         let is68 = (timeSignatureNumerator == 6 && timeSignatureDenominator == 8)
+        let is34 = (timeSignatureNumerator == 3 && timeSignatureDenominator == 4)
         let beatScale = 4.0 / Double(max(1, timeSignatureDenominator))
 
         // If a dynamic beat grid is available, render pulses exactly at grid positions
@@ -155,8 +150,12 @@ public final class ClickGenerator: @unchecked Sendable {
                 }
                 
                 let isAccent = (marker.beat == 1)
+                let markerNum = marker.timeSignatureNumerator ?? timeSignatureNumerator
+                let markerDen = marker.timeSignatureDenominator ?? timeSignatureDenominator
+                let markerIs68 = (markerNum == 6 && markerDen == 8)
+                let markerIs34 = (markerNum == 3 && markerDen == 4)
                 
-                if is68 {
+                if markerIs68 {
                     // 6/8 Playback-style divisions:
                     // Beat 1 = Accent + 1/4 (when both enabled), Beat 4 = 1/4, Beats 2,3,5,6 = 1/8
                     if isAccent && effAccentVol > 0.001 {
@@ -187,6 +186,52 @@ public final class ClickGenerator: @unchecked Sendable {
                             totalFrames: totalFrames
                         )
                     } else if (marker.beat != 1 && marker.beat != 4) && effEighthVol > 0.001 {
+                        playClick(
+                            to: buffer,
+                            atTime: marker.time,
+                            sampleBuffer: eighthSample,
+                            soundType: soundType,
+                            frequency: eighthFreq,
+                            decay: quarterDecay + 20.0,
+                            amplitude: 0.70 * effEighthVol * studioGain,
+                            sampleRate: sampleRate,
+                            channelCount: channelCount,
+                            totalFrames: totalFrames
+                        )
+                    }
+                } else if markerIs34 {
+                    // 3/4 Playback-style divisions:
+                    // Beat 1 = Accent + 1/4 (when both enabled), Beats 2 & 3 = 1/8
+                    if isAccent && effAccentVol > 0.001 {
+                        playClick(
+                            to: buffer,
+                            atTime: marker.time,
+                            sampleBuffer: accentSample,
+                            soundType: soundType,
+                            frequency: accentFreq,
+                            decay: accentDecay,
+                            amplitude: 0.95 * effAccentVol * studioGain,
+                            sampleRate: sampleRate,
+                            channelCount: channelCount,
+                            totalFrames: totalFrames
+                        )
+                    }
+                    if marker.beat == 1 {
+                        if effQuarterVol > 0.001 {
+                            playClick(
+                                to: buffer,
+                                atTime: marker.time,
+                                sampleBuffer: quarterSample,
+                                soundType: soundType,
+                                frequency: quarterFreq,
+                                decay: quarterDecay,
+                                amplitude: 0.85 * effQuarterVol * studioGain,
+                                sampleRate: sampleRate,
+                                channelCount: channelCount,
+                                totalFrames: totalFrames
+                            )
+                        }
+                    } else if effEighthVol > 0.001 {
                         playClick(
                             to: buffer,
                             atTime: marker.time,
@@ -240,12 +285,13 @@ public final class ClickGenerator: @unchecked Sendable {
                 
                 // Subdivisions between this beat and next beat
                 let tailBPM = marker.instantaneousBPM > 20.0 ? marker.instantaneousBPM : bpm
-                let nextTime: TimeInterval = (i + 1 < sortedGrid.count) ? sortedGrid[i + 1].time : (marker.time + (60.0 / max(20.0, tailBPM)) * beatScale)
+                let markerBeatScale = 4.0 / Double(max(1, markerDen))
+                let nextTime: TimeInterval = (i + 1 < sortedGrid.count) ? sortedGrid[i + 1].time : (marker.time + (60.0 / max(20.0, tailBPM)) * markerBeatScale)
                 let beatDur = nextTime - marker.time
                 guard beatDur > 0.1 else { continue }
                 
-                if is68 {
-                    // 1/16 in 6/8 counts "1 & 2 & 3 & 4 & 5 & 6 &" (midpoint between each 8th-note beat)
+                if markerIs68 || markerIs34 {
+                    // 1/16 in 6/8 & 3/4 counts the midpoint "&" between beats without duplicating the 1/8 beat pulse
                     if effSixteenthVol > 0.001 {
                         let andTime = marker.time + (beatDur * 0.5)
                         if andTime < duration {
@@ -382,6 +428,52 @@ public final class ClickGenerator: @unchecked Sendable {
                         totalFrames: totalFrames
                     )
                 }
+            } else if is34 {
+                // 3/4 Playback-style divisions:
+                // Beat 1 = Accent + 1/4 (when both enabled), Beats 2 & 3 = 1/8
+                if isAccent && effAccentVol > 0.001 {
+                    playClick(
+                        to: buffer,
+                        atTime: currentTime,
+                        sampleBuffer: accentSample,
+                        soundType: soundType,
+                        frequency: accentFreq,
+                        decay: accentDecay,
+                        amplitude: 0.95 * effAccentVol * studioGain,
+                        sampleRate: sampleRate,
+                        channelCount: channelCount,
+                        totalFrames: totalFrames
+                    )
+                }
+                if beatInBar == 1 {
+                    if effQuarterVol > 0.001 {
+                        playClick(
+                            to: buffer,
+                            atTime: currentTime,
+                            sampleBuffer: quarterSample,
+                            soundType: soundType,
+                            frequency: quarterFreq,
+                            decay: quarterDecay,
+                            amplitude: 0.85 * effQuarterVol * studioGain,
+                            sampleRate: sampleRate,
+                            channelCount: channelCount,
+                            totalFrames: totalFrames
+                        )
+                    }
+                } else if effEighthVol > 0.001 {
+                    playClick(
+                        to: buffer,
+                        atTime: currentTime,
+                        sampleBuffer: eighthSample,
+                        soundType: soundType,
+                        frequency: eighthFreq,
+                        decay: quarterDecay + 20.0,
+                        amplitude: 0.70 * effEighthVol * studioGain,
+                        sampleRate: sampleRate,
+                        channelCount: channelCount,
+                        totalFrames: totalFrames
+                    )
+                }
             } else {
                 // Downbeat Accent (in addition to Quarter Note Beat when both enabled)
                 if isAccent && effAccentVol > 0.001 {
@@ -420,8 +512,8 @@ public final class ClickGenerator: @unchecked Sendable {
                 break
             }
             
-            if is68 {
-                // 1/16 in 6/8 counts "1 & 2 & 3 & 4 & 5 & 6 &"
+            if is68 || is34 {
+                // 1/16 in 6/8 & 3/4 counts the midpoint "&" between beats
                 if effSixteenthVol > 0.001 {
                     let andTime = currentTime + (secPerBeat * 0.5)
                     if andTime < duration {
@@ -530,10 +622,10 @@ public final class ClickGenerator: @unchecked Sendable {
         var twoBarGrid: [BeatGridMarker] = []
         twoBarGrid.reserveCapacity(beatsPerBar * 2)
         for b in 0..<beatsPerBar {
-            twoBarGrid.append(BeatGridMarker(time: Double(b) * exactBeatSec, bar: 1, beat: b + 1, instantaneousBPM: safeBPM))
+            twoBarGrid.append(BeatGridMarker(time: Double(b) * exactBeatSec, bar: 1, beat: b + 1, instantaneousBPM: safeBPM, timeSignatureNumerator: timeSignatureNumerator, timeSignatureDenominator: timeSignatureDenominator))
         }
         for b in 0..<beatsPerBar {
-            twoBarGrid.append(BeatGridMarker(time: barSec + Double(b) * exactBeatSec, bar: 2, beat: b + 1, instantaneousBPM: safeBPM))
+            twoBarGrid.append(BeatGridMarker(time: barSec + Double(b) * exactBeatSec, bar: 2, beat: b + 1, instantaneousBPM: safeBPM, timeSignatureNumerator: timeSignatureNumerator, timeSignatureDenominator: timeSignatureDenominator))
         }
 
         guard let rendered = generateClickBuffer(

@@ -13,15 +13,7 @@ public struct BusChannelStripView: View {
     private let capWidth: CGFloat = 42
     
     private var displayedBusName: String {
-        let lower = bus.name.lowercased()
-        if lower.contains("electric") {
-            return "EG"
-        } else if lower.contains("acoustic") {
-            return "AG"
-        } else if lower == "percussion" {
-            return "Perc"
-        }
-        return bus.name
+        bus.abbreviatedName
     }
     
     var isAutomationMode: Bool = false

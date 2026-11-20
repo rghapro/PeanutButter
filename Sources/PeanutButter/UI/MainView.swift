@@ -187,6 +187,18 @@ public struct MainView: View {
                                                             removal: .opacity.combined(with: .move(edge: .leading))
                                                         ))
                                                 }
+
+                                                // Guide Sub-Channels Drawer (Sections, Directions/Guide, Fallback)
+                                                let isGuideTrack = (track.role == .guide || StemCategory.category(for: track.name, role: track.role) == .guide)
+                                                if isGuideTrack && engine.isGuideSubChannelDrawerExpanded {
+                                                    ForEach(engine.visibleGuideSubChannels, id: \.self) { subChannel in
+                                                        GuideSubChannelStripView(channel: subChannel, engine: engine)
+                                                            .transition(.asymmetric(
+                                                                insertion: .opacity.combined(with: .move(edge: .leading)),
+                                                                removal: .opacity.combined(with: .move(edge: .leading))
+                                                            ))
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1590,6 +1602,7 @@ public struct MainView: View {
                             LiveBPMTimeSigView(
                                 clock: engine.transportDisplayClock,
                                 baseBPM: engine.currentSong.bpm,
+                                hasTempoEvents: !engine.currentSong.tempoEvents.isEmpty,
                                 timeSignatureNumerator: engine.currentSong.timeSignatureNumerator,
                                 timeSignatureDenominator: engine.currentSong.timeSignatureDenominator,
                                 isPlaying: engine.playbackState == .playing
@@ -2166,11 +2179,14 @@ public struct MainView: View {
                             
                             let isContinuePad = song.continuePad
                             let isContinueClick = song.continueClick
+                            let isCueNextSection = song.isCueNextSongSectionEffective(isLastSongInSetlist: isLastSong)
                             let greenColor = Color(red: 0.25, green: 0.88, blue: 0.45)
                             let clickBlueColor = Color(red: 0.25, green: 0.75, blue: 0.95)
+                            let cueAmberColor = Color(red: 0.98, green: 0.72, blue: 0.12)
                             let neutralFill = Color(red: 0.12, green: 0.13, blue: 0.15)
                             let padFill = Color(red: 0.08, green: 0.20, blue: 0.12)
                             let clickFill = Color(red: 0.08, green: 0.17, blue: 0.23)
+                            let cueAmberFill = Color(red: 0.22, green: 0.16, blue: 0.05)
 
                             Button(action: {
                                 activeTransitionSongIndex = index
@@ -2206,10 +2222,10 @@ public struct MainView: View {
                                                 )
                                             )
                                     } else {
-                                        let badgeFill = isContinuePad ? padFill : (isContinueClick ? clickFill : neutralFill)
-                                        let badgeAccent = isContinuePad ? greenColor : (isContinueClick ? clickBlueColor : Color.white.opacity(0.35))
-                                        let iconTint = isContinuePad ? greenColor : (isContinueClick ? clickBlueColor : Color.white.opacity(0.95))
-                                        let isHighlighted = isContinuePad || isContinueClick
+                                        let badgeFill = isContinuePad ? padFill : (isContinueClick ? clickFill : (isCueNextSection ? cueAmberFill : neutralFill))
+                                        let badgeAccent = isContinuePad ? greenColor : (isContinueClick ? clickBlueColor : (isCueNextSection ? cueAmberColor : Color.white.opacity(0.35)))
+                                        let iconTint = isContinuePad ? greenColor : (isContinueClick ? clickBlueColor : (isCueNextSection ? cueAmberColor : Color.white.opacity(0.95)))
+                                        let isHighlighted = isContinuePad || isContinueClick || isCueNextSection
                                         Circle()
                                             .fill(badgeFill)
                                             .frame(width: badgeSize, height: badgeSize)
@@ -2395,6 +2411,9 @@ public struct MainView: View {
         if lower == "click" {
             let clickTracks = engine.tracks.filter { $0.assignedBusName.lowercased() == "click" }
             return 4 + clickTracks.count
+        } else if lower == "guide" {
+            let guideTracks = engine.tracks.filter { $0.assignedBusName.lowercased() == "guide" }
+            return engine.visibleGuideSubChannels.count + guideTracks.count
         } else if lower == "pad" {
             let padTracks = engine.tracks.filter { $0.assignedBusName.lowercased() == "pad" }
             return 1 + padTracks.count
@@ -2466,6 +2485,30 @@ public struct MainView: View {
                 .transition(.asymmetric(insertion: .opacity.combined(with: .move(edge: .leading)), removal: .opacity.combined(with: .move(edge: .leading))))
             ClickSubdivisionChannelStripView(subdivision: .sixteenth, engine: engine)
                 .transition(.asymmetric(insertion: .opacity.combined(with: .move(edge: .leading)), removal: .opacity.combined(with: .move(edge: .leading))))
+        } else if busNameLower == "guide" {
+            let guideTracks = engine.tracks.filter { $0.assignedBusName.lowercased() == "guide" }
+            ForEach(Array(guideTracks.enumerated()), id: \.element.id) { index, track in
+                ChannelStripView(
+                    track: track,
+                    engine: engine,
+                    index: index + 1,
+                    isBeingDragged: false,
+                    isInTray: true,
+                    onParametersChanged: { engine.updateTrackParameters(track: track) },
+                    onDelete: { engine.removeTrack(id: track.id) }
+                )
+                .transition(.asymmetric(
+                    insertion: .opacity.combined(with: .move(edge: .leading)),
+                    removal: .opacity.combined(with: .move(edge: .leading))
+                ))
+            }
+            ForEach(engine.visibleGuideSubChannels, id: \.self) { subChannel in
+                GuideSubChannelStripView(channel: subChannel, engine: engine)
+                    .transition(.asymmetric(
+                        insertion: .opacity.combined(with: .move(edge: .leading)),
+                        removal: .opacity.combined(with: .move(edge: .leading))
+                    ))
+            }
         } else if busNameLower == "pad" {
             // Pad stem tracks + Pad Channel strip feeding into Pad Bus
             let padTracks = engine.tracks.filter { $0.assignedBusName.lowercased() == "pad" }
@@ -3108,6 +3151,7 @@ struct TrackDropDelegate: DropDelegate {
 private struct LiveBPMTimeSigView: View {
     @ObservedObject var clock: TransportDisplayClockModel
     let baseBPM: Double
+    let hasTempoEvents: Bool
     let timeSignatureNumerator: Int
     let timeSignatureDenominator: Int
     let isPlaying: Bool
@@ -3131,19 +3175,19 @@ private struct LiveBPMTimeSigView: View {
     
     var body: some View {
         let displayedBPM: Double = {
-            if isPlaying && clock.position.currentBPM > 20 {
+            if (isPlaying || hasTempoEvents) && clock.position.currentBPM > 20 {
                 return clock.position.currentBPM
             }
             return baseBPM
         }()
-        let isDynamicShift = isPlaying && abs(displayedBPM - baseBPM) >= 1.5
+        let isTempoEventShift = (isPlaying || hasTempoEvents) && abs(displayedBPM - baseBPM) >= 0.5
         let bpmStr = formattedBPM(displayedBPM)
         let fontSize: CGFloat = 17
         
         VStack(spacing: 2) {
             Text(bpmStr)
                 .font(.system(size: fontSize, weight: .bold))
-                .foregroundColor(isDynamicShift ? Color(red: 0.30, green: 0.88, blue: 0.98) : .white)
+                .foregroundColor(isTempoEventShift ? (hasTempoEvents ? Color(red: 0.98, green: 0.68, blue: 0.18) : Color(red: 0.30, green: 0.88, blue: 0.98)) : .white)
                 .minimumScaleFactor(0.85)
                 .lineLimit(1)
             

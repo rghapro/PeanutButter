@@ -32,6 +32,61 @@ public enum GuideSource: String, Codable, CaseIterable, Sendable {
     case generated = "App Generated"
 }
 
+/// Sub-channels exposed in the slide-out Guide Mixer Tray
+public enum GuideSubChannel: String, CaseIterable, Hashable, Sendable, Codable {
+    case sections
+    case directions
+    case fallback
+
+    public static func visibleChannels(for source: GuideSource) -> [GuideSubChannel] {
+        switch source {
+        case .generated:
+            return [.sections, .directions, .fallback]
+        case .uploaded:
+            return [.directions, .fallback]
+        }
+    }
+
+    public func displayTitle(for source: GuideSource) -> String {
+        switch self {
+        case .sections:
+            return "Sections"
+        case .directions:
+            return source == .uploaded ? "Guide" : "Directions"
+        case .fallback:
+            return "Fallback"
+        }
+    }
+
+    /// Matches StemTrack.linearGain: 0.0 = -inf, 0.80 = 0.0 dB (unity), 1.0 = +6.0 dB
+    public static func linearGain(forFaderVolume volume: Float) -> Float {
+        let clamped = max(0.0, min(1.0, volume))
+        if clamped <= 0.001 { return 0.0 }
+        if clamped >= 0.80 {
+            let db = ((clamped - 0.80) / 0.20) * 6.0
+            return pow(10.0, db / 20.0)
+        } else {
+            let norm = clamped / 0.80
+            return pow(norm, 2.0)
+        }
+    }
+}
+
+/// Time window metadata for a mixed phrase so per-sub-channel Guide VU meters track playback
+public struct GuideCueMeterEvent: Sendable, Equatable {
+    public let startTime: TimeInterval
+    public let endTime: TimeInterval
+    public let category: GuideSubChannel
+    public let usedFallback: Bool
+
+    public init(startTime: TimeInterval, endTime: TimeInterval, category: GuideSubChannel, usedFallback: Bool) {
+        self.startTime = startTime
+        self.endTime = endTime
+        self.category = category
+        self.usedFallback = usedFallback
+    }
+}
+
 /// Click / metronome sound type (built-in MultiTracks clicks, synthesized clicks, and user custom click packs)
 public struct ClickSoundType: RawRepresentable, Codable, Hashable, Sendable, Identifiable {
     public var rawValue: String

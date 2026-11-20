@@ -78,6 +78,11 @@ public final class AppUpdateManager: ObservableObject {
         return trimmed.isEmpty ? "1.0.0" : trimmed
     }
 
+    public var isDevBuild: Bool {
+        let lower = currentVersion.lowercased()
+        return lower.contains("-dev") || lower.contains("+dev")
+    }
+
     public var availableRelease: ReleaseInfo? {
         switch phase {
         case .available(let release),
@@ -130,8 +135,12 @@ public final class AppUpdateManager: ObservableObject {
             }
         }
 
-        // Equal numeric parts: a stable release is newer than a pre-release (`1.0.0` > `1.0.0-beta.1`)
-        if parsedCandidate.prerelease == nil && parsedCurrent.prerelease != nil {
+        // Equal numeric parts: a stable release is newer than a pre-release (`1.0.0` > `1.0.0-beta.1`),
+        // except local `-dev.*` builds which sit on top of that release (`1.1.1` is not newer than `1.1.1-dev.1`).
+        if parsedCandidate.prerelease == nil, let curPre = parsedCurrent.prerelease {
+            if curPre.lowercased().hasPrefix("dev") {
+                return false
+            }
             return true
         }
         return false

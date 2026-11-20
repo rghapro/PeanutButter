@@ -400,15 +400,14 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         return nil
     }
     
-    /// Synthesizes or retrieves a cached spoken audio buffer for a given phrase and voice.
-    /// When voice is Rita, queries pre-recorded audio from AudioSampleBank; if a phrase is missing (e.g. custom cue),
-    /// falls back to synthesizing via `fallbackVoice`.
-    public func getOrSynthesizePhrase(
+    /// Synthesizes or retrieves a cached spoken audio buffer for a given phrase and voice,
+    /// along with whether resolution fell back from the primary voice/pack to `fallbackVoice`.
+    public func resolvePhraseWithFallbackInfo(
         _ phrase: String,
         voice: GuideVoice,
         fallbackVoice: GuideVoice = .zoe,
         targetFormat: AVAudioFormat
-    ) -> SpokenPhraseData? {
+    ) -> (data: SpokenPhraseData, usedFallback: Bool)? {
         let cleanPhrase = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanPhrase.isEmpty else { return nil }
         
@@ -419,36 +418,46 @@ public final class GuideAudioGenerator: @unchecked Sendable {
                 packId: customPackId,
                 targetFormat: targetFormat
             ) {
-                return customSample
+                return (customSample, false)
             }
             if CustomSampleLibraryManager.shared.guidePack(forId: customPackId)?.isBundled == true,
                let userSample = CustomSampleLibraryManager.shared.getAnyUserCustomPhraseSample(
                    phrase: cleanPhrase,
                    targetFormat: targetFormat
                ) {
-                return userSample
+                return (userSample, false)
             }
-            return resolveFallbackPhrase(cleanPhrase, fallbackVoice: fallbackVoice, allowRita: true, targetFormat: targetFormat)
+            if let fb = resolveFallbackPhrase(cleanPhrase, fallbackVoice: fallbackVoice, allowRita: true, targetFormat: targetFormat) {
+                return (fb, true)
+            }
+            return nil
         }
         
         // 1. Pre-recorded Rita voice handler
         if voice == .rita || voice.rawValue.caseInsensitiveCompare("rita") == .orderedSame {
             if let ritaSample = AudioSampleBank.shared.getRitaPhraseSample(phrase: cleanPhrase, targetFormat: targetFormat) {
-                return ritaSample
+                return (ritaSample, false)
             }
             if let userSample = CustomSampleLibraryManager.shared.getAnyUserCustomPhraseSample(
                 phrase: cleanPhrase,
                 targetFormat: targetFormat
             ) {
-                return userSample
+                return (userSample, false)
             }
             let defVoice = CustomSampleLibraryManager.shared.defaultGuideVoice
             if defVoice != .rita && defVoice.rawValue.caseInsensitiveCompare("rita") != .orderedSame {
-                if let defSample = getOrSynthesizePhrase(cleanPhrase, voice: defVoice, fallbackVoice: fallbackVoice, targetFormat: targetFormat) {
-                    return defSample
+                if defVoice.customPackId != nil {
+                    if let defResolved = resolvePhraseWithFallbackInfo(cleanPhrase, voice: defVoice, fallbackVoice: fallbackVoice, targetFormat: targetFormat) {
+                        return defResolved
+                    }
+                } else if let defSample = resolvePhraseWithFallbackInfo(cleanPhrase, voice: defVoice, fallbackVoice: fallbackVoice, targetFormat: targetFormat)?.data {
+                    return (defSample, true)
                 }
             }
-            return resolveFallbackPhrase(cleanPhrase, fallbackVoice: fallbackVoice, allowRita: false, targetFormat: targetFormat)
+            if let fb = resolveFallbackPhrase(cleanPhrase, fallbackVoice: fallbackVoice, allowRita: false, targetFormat: targetFormat) {
+                return (fb, true)
+            }
+            return nil
         }
         
         let voiceId = systemVoiceIdentifier(for: voice)
@@ -457,7 +466,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         cacheLock.lock()
         if let cached = speechCache[cacheKey] {
             cacheLock.unlock()
-            return cached
+            return (cached, false)
         }
         cacheLock.unlock()
         
@@ -574,7 +583,62 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         speechCache[cacheKey] = phraseData
         cacheLock.unlock()
         
-        return phraseData
+        return (phraseData, false)
+    }
+
+    /// Synthesizes or retrieves a cached spoken audio buffer for a given phrase and voice.
+    /// When voice is Rita, queries pre-recorded audio from AudioSampleBank; if a phrase is missing (e.g. custom cue),
+    /// falls back to synthesizing via `fallbackVoice`.
+    public func getOrSynthesizePhrase(
+        _ phrase: String,
+        voice: GuideVoice,
+        fallbackVoice: GuideVoice = .zoe,
+        targetFormat: AVAudioFormat
+    ) -> SpokenPhraseData? {
+        return resolvePhraseWithFallbackInfo(
+            phrase,
+            voice: voice,
+            fallbackVoice: fallbackVoice,
+            targetFormat: targetFormat
+        )?.data
+    }
+
+    /// Computes effective linear mix gain (nominal 0.95 at unity 0.80) with stacked fallback trim and solo handling.
+    public static func effectiveMixGain(
+        category: GuideSubChannel,
+        usedFallback: Bool,
+        sectionsVolume: Float,
+        sectionsEnabled: Bool,
+        directionsVolume: Float,
+        directionsEnabled: Bool,
+        fallbackVolume: Float,
+        fallbackEnabled: Bool,
+        soloedSubChannels: Set<GuideSubChannel>
+    ) -> Float {
+        if !soloedSubChannels.isEmpty {
+            let allowed = soloedSubChannels.contains(category) || (usedFallback && soloedSubChannels.contains(.fallback))
+            if !allowed { return 0.0 }
+        }
+
+        var categoryGain: Float
+        switch category {
+        case .sections:
+            guard sectionsEnabled else { return 0.0 }
+            categoryGain = GuideSubChannel.linearGain(forFaderVolume: sectionsVolume)
+        case .directions:
+            guard directionsEnabled else { return 0.0 }
+            categoryGain = GuideSubChannel.linearGain(forFaderVolume: directionsVolume)
+        case .fallback:
+            guard fallbackEnabled else { return 0.0 }
+            categoryGain = GuideSubChannel.linearGain(forFaderVolume: fallbackVolume)
+        }
+
+        if usedFallback && category != .fallback {
+            guard fallbackEnabled else { return 0.0 }
+            categoryGain *= GuideSubChannel.linearGain(forFaderVolume: fallbackVolume)
+        }
+
+        return 0.95 * categoryGain
     }
     
     /// Trims leading and trailing digital silence (< 2% peak), compresses internal syllable pauses (> 25ms down to 18ms), and computes perceptual onset
@@ -675,6 +739,123 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         return (outBuf, onsetOffset)
     }
     
+    private func partitionedMeasures(from beatGrid: [BeatGridMarker]) -> (sortedGrid: [BeatGridMarker], gridMeasures: [[BeatGridMarker]]) {
+        let sortedGrid = beatGrid.sorted { $0.time < $1.time }
+        var gridMeasures: [[BeatGridMarker]] = []
+        for marker in sortedGrid {
+            if marker.beat == 1 || gridMeasures.isEmpty {
+                gridMeasures.append([marker])
+            } else {
+                gridMeasures[gridMeasures.count - 1].append(marker)
+            }
+        }
+        return (sortedGrid, gridMeasures)
+    }
+
+    /// Resolves exact timestamps for the 1-bar cue measure immediately preceding `targetTime`,
+    /// anchored to `beatGrid` (respecting ritardandos, tempo changes, mid-song meters, and arrangements).
+    public func cueMeasureTimestamps(
+        before targetTime: TimeInterval,
+        beatGrid: [BeatGridMarker],
+        bpm: Double,
+        timeSignatureNumerator: Int,
+        timeSignatureDenominator: Int
+    ) -> [TimeInterval] {
+        let (sortedGrid, gridMeasures) = partitionedMeasures(from: beatGrid)
+        return resolveCueMeasureTimestamps(
+            before: targetTime,
+            sortedGrid: sortedGrid,
+            gridMeasures: gridMeasures,
+            bpm: bpm,
+            timeSignatureNumerator: timeSignatureNumerator,
+            timeSignatureDenominator: timeSignatureDenominator
+        )
+    }
+
+    private func resolveCueMeasureTimestamps(
+        before targetTime: TimeInterval,
+        sortedGrid: [BeatGridMarker],
+        gridMeasures: [[BeatGridMarker]],
+        bpm: Double,
+        timeSignatureNumerator: Int,
+        timeSignatureDenominator: Int
+    ) -> [TimeInterval] {
+        let safeBpm = max(20.0, min(300.0, bpm))
+        let secPerBeat = (60.0 / safeBpm) * (4.0 / Double(max(1, timeSignatureDenominator)))
+        let beatsPerBar = max(1, timeSignatureNumerator)
+        let secPerBar = secPerBeat * Double(beatsPerBar)
+        let is68 = (timeSignatureNumerator == 6 && timeSignatureDenominator == 8)
+
+        if !gridMeasures.isEmpty {
+            // a. Match targetTime to its nearest measure downbeat
+            var bestMeasureIdx = 0
+            var bestDist = Double.greatestFiniteMagnitude
+            for (idx, measure) in gridMeasures.enumerated() {
+                guard let downbeat = measure.first else { continue }
+                let dist = abs(downbeat.time - targetTime)
+                if dist < bestDist {
+                    bestDist = dist
+                    bestMeasureIdx = idx
+                }
+            }
+            if bestDist <= 0.25 {
+                guard bestMeasureIdx > 0 else { return [] }
+                return gridMeasures[bestMeasureIdx - 1].map { $0.time }
+            }
+
+            // b. Target is after the final downbeat in the grid (e.g., final section loop/queued cue at section.endTime)
+            if let lastDownbeat = gridMeasures.last?.first, targetTime > lastDownbeat.time + 0.25 {
+                if let lastIdx = gridMeasures.lastIndex(where: { ($0.first?.time ?? .greatestFiniteMagnitude) < targetTime - 0.20 }) {
+                    var times = gridMeasures[lastIdx].map { $0.time }.filter { $0 < targetTime - 0.05 }
+                    let expectedBeats = max(gridMeasures[lastIdx].count, beatsPerBar)
+                    if times.count < expectedBeats, let lastT = times.last {
+                        let localBPM = max(20.0, gridMeasures[lastIdx].last?.instantaneousBPM ?? safeBpm)
+                        let localBeatDur = (60.0 / localBPM) * (4.0 / Double(max(1, timeSignatureDenominator)))
+                        var nextT = lastT + localBeatDur
+                        while times.count < expectedBeats && nextT < targetTime - 0.05 {
+                            times.append(nextT)
+                            nextT += localBeatDur
+                        }
+                    }
+                    if !times.isEmpty { return times }
+                }
+            }
+
+            // c. Mid-bar or unaligned boundary: look up beats immediately before `targetTime`
+            var closestBeatIdx = 0
+            var closestBeatDist = Double.greatestFiniteMagnitude
+            for (idx, marker) in sortedGrid.enumerated() {
+                let dist = abs(marker.time - targetTime)
+                if dist < closestBeatDist {
+                    closestBeatDist = dist
+                    closestBeatIdx = idx
+                }
+            }
+            if closestBeatDist <= 0.25 {
+                guard closestBeatIdx >= beatsPerBar else { return [] }
+                return sortedGrid[(closestBeatIdx - beatsPerBar)..<closestBeatIdx].map { $0.time }
+            }
+
+            let activeMarker = sortedGrid.last(where: { $0.time <= targetTime + 0.008 }) ?? sortedGrid.first
+            let activeGridMeasureCount = gridMeasures.last(where: { ($0.first?.time ?? .greatestFiniteMagnitude) <= targetTime + 0.008 })?.count
+            let localBPM = max(20.0, activeMarker?.instantaneousBPM ?? safeBpm)
+            let localBeatDur = (60.0 / localBPM) * (4.0 / Double(max(1, timeSignatureDenominator)))
+            let localBeatsPerBar = max(1, activeGridMeasureCount ?? beatsPerBar)
+            guard targetTime >= Double(localBeatsPerBar) * localBeatDur - 0.05 else { return [] }
+            return (0..<localBeatsPerBar).compactMap { k in
+                let t = targetTime - Double(localBeatsPerBar - k) * localBeatDur
+                return t >= -0.05 ? max(0.0, t) : nil
+            }
+        }
+
+        // Fixed-BPM path when no beatGrid is available
+        guard targetTime >= secPerBar - 0.05 else { return [] }
+        let cueCount = is68 ? 6 : beatsPerBar
+        return (0..<cueCount).map { k in
+            max(0.0, targetTime - Double(cueCount - k) * secPerBeat)
+        }
+    }
+
     /// Generates a complete Guide audio track buffer for a song
     public func generateGuideBuffer(
         sections: [SongSection],
@@ -692,8 +873,74 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         isLoopActive: Bool = false,
         loopMode: MultitrackAudioEngine.LoopMode = .none,
         singleLoopRemaining: Int = 0,
+        nextSongFirstSection: SongSection? = nil,
+        nextSongCueTargetTime: TimeInterval? = nil,
+        sectionsVolume: Float = 0.80,
+        sectionsEnabled: Bool = true,
+        directionsVolume: Float = 0.80,
+        directionsEnabled: Bool = true,
+        fallbackVolume: Float = 0.80,
+        fallbackEnabled: Bool = true,
+        soloedSubChannels: Set<GuideSubChannel> = [],
         format: AVAudioFormat
     ) -> AVAudioPCMBuffer? {
+        return generateGuideBufferWithMeterEvents(
+            sections: sections,
+            directionalCues: directionalCues,
+            bpm: bpm,
+            timeSignatureNumerator: timeSignatureNumerator,
+            timeSignatureDenominator: timeSignatureDenominator,
+            duration: duration,
+            beatGrid: beatGrid,
+            voice: voice,
+            fallbackVoice: fallbackVoice,
+            countInEnabled: countInEnabled,
+            queuedNextSection: queuedNextSection,
+            loopedSection: loopedSection,
+            isLoopActive: isLoopActive,
+            loopMode: loopMode,
+            singleLoopRemaining: singleLoopRemaining,
+            nextSongFirstSection: nextSongFirstSection,
+            nextSongCueTargetTime: nextSongCueTargetTime,
+            sectionsVolume: sectionsVolume,
+            sectionsEnabled: sectionsEnabled,
+            directionsVolume: directionsVolume,
+            directionsEnabled: directionsEnabled,
+            fallbackVolume: fallbackVolume,
+            fallbackEnabled: fallbackEnabled,
+            soloedSubChannels: soloedSubChannels,
+            format: format
+        )?.buffer
+    }
+
+    /// Generates a complete Guide audio track buffer along with cue timing metadata for sub-channel VU metering
+    public func generateGuideBufferWithMeterEvents(
+        sections: [SongSection],
+        directionalCues: [DirectionalCue] = [],
+        bpm: Double,
+        timeSignatureNumerator: Int = 4,
+        timeSignatureDenominator: Int = 4,
+        duration: TimeInterval,
+        beatGrid: [BeatGridMarker] = [],
+        voice: GuideVoice = .rita,
+        fallbackVoice: GuideVoice = .zoe,
+        countInEnabled: Bool = true,
+        queuedNextSection: SongSection? = nil,
+        loopedSection: SongSection? = nil,
+        isLoopActive: Bool = false,
+        loopMode: MultitrackAudioEngine.LoopMode = .none,
+        singleLoopRemaining: Int = 0,
+        nextSongFirstSection: SongSection? = nil,
+        nextSongCueTargetTime: TimeInterval? = nil,
+        sectionsVolume: Float = 0.80,
+        sectionsEnabled: Bool = true,
+        directionsVolume: Float = 0.80,
+        directionsEnabled: Bool = true,
+        fallbackVolume: Float = 0.80,
+        fallbackEnabled: Bool = true,
+        soloedSubChannels: Set<GuideSubChannel> = [],
+        format: AVAudioFormat
+    ) -> (buffer: AVAudioPCMBuffer, meterEvents: [GuideCueMeterEvent])? {
         guard duration > 0 else { return nil }
         
         let sampleRate = format.sampleRate
@@ -721,15 +968,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         let orderedSections = sections.sorted { $0.startTime < $1.startTime }
         
         // Partition beatGrid into ordered measures so count-ins and section cues follow mid-song tempo & meter changes
-        let sortedGrid = beatGrid.sorted { $0.time < $1.time }
-        var gridMeasures: [[BeatGridMarker]] = []
-        for marker in sortedGrid {
-            if marker.beat == 1 || gridMeasures.isEmpty {
-                gridMeasures.append([marker])
-            } else {
-                gridMeasures[gridMeasures.count - 1].append(marker)
-            }
-        }
+        let (sortedGrid, gridMeasures) = partitionedMeasures(from: beatGrid)
         let maxCueBeats = max(is68 ? 6 : beatsPerBar, gridMeasures.map(\.count).max() ?? beatsPerBar)
         
         // Pre-gather all distinct phrases needed and synthesize concurrently for near-instant rendering
@@ -740,7 +979,11 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             }
         }
         for sec in orderedSections {
-            let label = simplifySectionNameForSpeech(sec.name)
+            let label = simplifySectionNameForSpeech(sec.name, includeNumber: sec.includeNumberInGuide)
+            if !label.isEmpty { phrasesToWarm.insert(label) }
+        }
+        if let nextSec = nextSongFirstSection {
+            let label = simplifySectionNameForSpeech(nextSec.name, includeNumber: nextSec.includeNumberInGuide)
             if !label.isEmpty { phrasesToWarm.insert(label) }
         }
         for cue in directionalCues {
@@ -751,7 +994,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         let phraseList = Array(phrasesToWarm)
         DispatchQueue.concurrentPerform(iterations: phraseList.count) { idx in
             let p = phraseList[idx]
-            _ = self.getOrSynthesizePhrase(p, voice: voice, fallbackVoice: fallbackVoice, targetFormat: format)
+            _ = self.resolvePhraseWithFallbackInfo(p, voice: voice, fallbackVoice: fallbackVoice, targetFormat: format)
         }
         
         // Helper to determine the precise timestamp of a specific measure and beat (fallback for gridless songs)
@@ -767,78 +1010,40 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         // Resolves exact timestamps for the 1-bar cue measure immediately preceding `targetTime`,
         // anchored to `gridMeasures` (respecting ritardandos, tempo changes, mid-song meters, and arrangements).
         func cueMeasureTimestamps(before targetTime: TimeInterval) -> [TimeInterval] {
-            if !gridMeasures.isEmpty {
-                // a. Match targetTime to its nearest measure downbeat
-                var bestMeasureIdx = 0
-                var bestDist = Double.greatestFiniteMagnitude
-                for (idx, measure) in gridMeasures.enumerated() {
-                    guard let downbeat = measure.first else { continue }
-                    let dist = abs(downbeat.time - targetTime)
-                    if dist < bestDist {
-                        bestDist = dist
-                        bestMeasureIdx = idx
-                    }
-                }
-                if bestDist <= 0.25 {
-                    guard bestMeasureIdx > 0 else { return [] }
-                    return gridMeasures[bestMeasureIdx - 1].map { $0.time }
-                }
-                
-                // b. Target is after the final downbeat in the grid (e.g., final section loop/queued cue at section.endTime)
-                if let lastDownbeat = gridMeasures.last?.first, targetTime > lastDownbeat.time + 0.25 {
-                    if let lastIdx = gridMeasures.lastIndex(where: { ($0.first?.time ?? .greatestFiniteMagnitude) < targetTime - 0.20 }) {
-                        var times = gridMeasures[lastIdx].map { $0.time }.filter { $0 < targetTime - 0.05 }
-                        let expectedBeats = max(gridMeasures[lastIdx].count, beatsPerBar)
-                        if times.count < expectedBeats, let lastT = times.last {
-                            let localBPM = max(20.0, gridMeasures[lastIdx].last?.instantaneousBPM ?? safeBpm)
-                            let localBeatDur = (60.0 / localBPM) * (4.0 / Double(max(1, timeSignatureDenominator)))
-                            var nextT = lastT + localBeatDur
-                            while times.count < expectedBeats && nextT < targetTime - 0.05 {
-                                times.append(nextT)
-                                nextT += localBeatDur
-                            }
-                        }
-                        if !times.isEmpty { return times }
-                    }
-                }
-                
-                // c. Mid-bar or unaligned boundary: look up beats immediately before `targetTime`
-                var closestBeatIdx = 0
-                var closestBeatDist = Double.greatestFiniteMagnitude
-                for (idx, marker) in sortedGrid.enumerated() {
-                    let dist = abs(marker.time - targetTime)
-                    if dist < closestBeatDist {
-                        closestBeatDist = dist
-                        closestBeatIdx = idx
-                    }
-                }
-                if closestBeatDist <= 0.25 {
-                    guard closestBeatIdx >= beatsPerBar else { return [] }
-                    return sortedGrid[(closestBeatIdx - beatsPerBar)..<closestBeatIdx].map { $0.time }
-                }
-                
-                let activeMarker = sortedGrid.last(where: { $0.time <= targetTime + 0.008 }) ?? sortedGrid.first
-                let localBPM = max(20.0, activeMarker?.instantaneousBPM ?? safeBpm)
-                let localBeatDur = (60.0 / localBPM) * (4.0 / Double(max(1, timeSignatureDenominator)))
-                let localBeatsPerBar = max(1, activeMarker != nil ? timeSignatureNumerator : beatsPerBar)
-                guard targetTime >= Double(localBeatsPerBar) * localBeatDur - 0.05 else { return [] }
-                return (0..<localBeatsPerBar).compactMap { k in
-                    let t = targetTime - Double(localBeatsPerBar - k) * localBeatDur
-                    return t >= -0.05 ? max(0.0, t) : nil
-                }
-            }
-            
-            // Fixed-BPM path when no beatGrid is available
-            guard targetTime >= secPerBar - 0.05 else { return [] }
-            let cueCount = is68 ? 6 : beatsPerBar
-            return (0..<cueCount).map { k in
-                max(0.0, targetTime - Double(cueCount - k) * secPerBeat)
-            }
+            resolveCueMeasureTimestamps(
+                before: targetTime,
+                sortedGrid: sortedGrid,
+                gridMeasures: gridMeasures,
+                bpm: safeBpm,
+                timeSignatureNumerator: beatsPerBar,
+                timeSignatureDenominator: timeSignatureDenominator
+            )
         }
+
+        var meterEvents: [GuideCueMeterEvent] = []
         
-        // Helper to mix a phrase into guideBuffer at a specific timestamp
-        func speak(phrase: String, atTime time: TimeInterval) {
-            guard let phraseData = getOrSynthesizePhrase(phrase, voice: voice, fallbackVoice: fallbackVoice, targetFormat: format) else { return }
+        // Helper to mix a phrase into guideBuffer at a specific timestamp using per-category and fallback trim gains
+        func speak(phrase: String, atTime time: TimeInterval, category: GuideSubChannel) {
+            guard let resolved = resolvePhraseWithFallbackInfo(
+                phrase,
+                voice: voice,
+                fallbackVoice: fallbackVoice,
+                targetFormat: format
+            ) else { return }
+
+            let phraseData = resolved.data
+            let gain = Self.effectiveMixGain(
+                category: category,
+                usedFallback: resolved.usedFallback,
+                sectionsVolume: sectionsVolume,
+                sectionsEnabled: sectionsEnabled,
+                directionsVolume: directionsVolume,
+                directionsEnabled: directionsEnabled,
+                fallbackVolume: fallbackVolume,
+                fallbackEnabled: fallbackEnabled,
+                soloedSubChannels: soloedSubChannels
+            )
+            guard gain > 0.0001 else { return }
             
             // Advance audio start by the perceptual acoustic onset offset so the vowel hit lands dead-on the click downbeat
             let alignedTime = max(0.0, time - phraseData.onsetOffset)
@@ -855,10 +1060,17 @@ public final class GuideAudioGenerator: @unchecked Sendable {
                 
                 for f in 0..<framesToCopy {
                     let destIdx = startFrame + f
-                    let mixed = destPtr[destIdx] + srcPtr[f] * 0.95
+                    let mixed = destPtr[destIdx] + srcPtr[f] * gain
                     destPtr[destIdx] = max(-1.0, min(1.0, mixed))
                 }
             }
+
+            meterEvents.append(GuideCueMeterEvent(
+                startTime: alignedTime,
+                endTime: alignedTime + Double(framesToCopy) / sampleRate,
+                category: category,
+                usedFallback: resolved.usedFallback
+            ))
         }
         
         func speakSectionCue(for targetCueSec: SongSection, beatTimes: [TimeInterval]) {
@@ -866,13 +1078,13 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             let isUnlabeled = isSectionUnlabeled(targetCueSec.name)
             if !isUnlabeled && targetCueSec.playSectionGuideCue {
                 let spokenName = simplifySectionNameForSpeech(targetCueSec.name, includeNumber: targetCueSec.includeNumberInGuide)
-                speak(phrase: spokenName, atTime: firstBeat)
+                speak(phrase: spokenName, atTime: firstBeat, category: .sections)
             } else if countInEnabled && targetCueSec.playSectionCountIn {
-                speak(phrase: "1", atTime: firstBeat)
+                speak(phrase: "1", atTime: firstBeat, category: .sections)
             }
             if countInEnabled && targetCueSec.playSectionCountIn && beatTimes.count >= 2 {
                 for bIdx in 1..<beatTimes.count {
-                    speak(phrase: "\(bIdx + 1)", atTime: beatTimes[bIdx])
+                    speak(phrase: "\(bIdx + 1)", atTime: beatTimes[bIdx], category: .sections)
                 }
             }
         }
@@ -891,10 +1103,10 @@ public final class GuideAudioGenerator: @unchecked Sendable {
                   (prevBarTimes.last ?? 0.0) < cueStartTime - 0.05 else {
                 return
             }
-            speak(phrase: "1", atTime: prevBarTimes[0])
+            speak(phrase: "1", atTime: prevBarTimes[0], category: .sections)
             if let halfBeat = halfwayBeatTime(in: prevBarTimes),
                halfBeat < cueStartTime - 0.05 {
-                speak(phrase: "2", atTime: halfBeat)
+                speak(phrase: "2", atTime: halfBeat, category: .sections)
             }
         }
         
@@ -920,9 +1132,9 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             } else if firstSec.duration >= 2.0 * secPerBar - 0.1,
                       (fallbackBar2Times.last ?? 0.0) < firstSec.endTime - 0.02 {
                 if countInEnabled, let bar1Start = bar1Times.first {
-                    speak(phrase: "1", atTime: bar1Start)
+                    speak(phrase: "1", atTime: bar1Start, category: .sections)
                     if let halfBeat = halfwayBeatTime(in: bar1Times) {
-                        speak(phrase: "2", atTime: halfBeat)
+                        speak(phrase: "2", atTime: halfBeat, category: .sections)
                     }
                 }
                 speakSectionCue(for: firstSec, beatTimes: fallbackBar2Times)
@@ -939,13 +1151,13 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             }
         } else if countInEnabled {
             // No sections defined yet: count in 1..2 on bar 1 and 2..4 on bar 2 so the user hears the guide track immediately.
-            speak(phrase: "1", atTime: bar1Times.first ?? 0.0)
+            speak(phrase: "1", atTime: bar1Times.first ?? 0.0, category: .sections)
             if let halfBeat = halfwayBeatTime(in: bar1Times) {
-                speak(phrase: "2", atTime: halfBeat)
+                speak(phrase: "2", atTime: halfBeat, category: .sections)
             }
             if fallbackBar2Times.count >= 2 {
                 for bIdx in 1..<fallbackBar2Times.count {
-                    speak(phrase: "\(bIdx + 1)", atTime: fallbackBar2Times[bIdx])
+                    speak(phrase: "\(bIdx + 1)", atTime: fallbackBar2Times[bIdx], category: .sections)
                 }
             }
         }
@@ -985,7 +1197,8 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             }
         }
         
-        // Handle when the very last section of the song is looped or has a queued section
+        // Handle when the very last section of the song is looped, has a queued section,
+        // or hands off into the next song's opening section via "Cue Next Section".
         if let lastSec = orderedSections.last {
             let isLooped = isLoopActive && (loopedSection?.id == lastSec.id)
             let shouldLoopBack = isLooped && (loopMode == .infinite || (loopMode == .single && singleLoopRemaining > 0))
@@ -995,15 +1208,26 @@ public final class GuideAudioGenerator: @unchecked Sendable {
                     let targetCueSec = queuedNextSection ?? lastSec
                     speakSectionCue(for: targetCueSec, beatTimes: cueTimes)
                 }
+            } else if let nextSec = nextSongFirstSection {
+                let targetTime = nextSongCueTargetTime ?? lastSec.endTime
+                let cueTimes = cueMeasureTimestamps(before: targetTime)
+                if !cueTimes.isEmpty, (cueTimes.last ?? 0.0) < targetTime - 0.02 {
+                    speakSectionCue(for: nextSec, beatTimes: cueTimes)
+                }
+            }
+        } else if let nextSec = nextSongFirstSection, let targetTime = nextSongCueTargetTime {
+            let cueTimes = cueMeasureTimestamps(before: targetTime)
+            if !cueTimes.isEmpty, (cueTimes.last ?? 0.0) < targetTime - 0.02 {
+                speakSectionCue(for: nextSec, beatTimes: cueTimes)
             }
         }
         
         // MARK: - 3. Directional Cues
         for cue in directionalCues {
-            speak(phrase: cue.label, atTime: cue.time)
+            speak(phrase: cue.label, atTime: cue.time, category: .directions)
         }
         
-        return guideBuffer
+        return (guideBuffer, meterEvents)
     }
     
     /// Overlays directional cues speech on top of an existing base guide audio buffer (e.g. uploaded guide stem)
@@ -1011,51 +1235,207 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         onto baseBuffer: AVAudioPCMBuffer,
         directionalCues: [DirectionalCue],
         voice: GuideVoice,
-        fallbackVoice: GuideVoice = .zoe
+        fallbackVoice: GuideVoice = .zoe,
+        cueVolume: Float = 0.80,
+        cueEnabled: Bool = true,
+        fallbackVolume: Float = 0.80,
+        fallbackEnabled: Bool = true,
+        soloedSubChannels: Set<GuideSubChannel> = []
     ) -> AVAudioPCMBuffer {
-        guard !directionalCues.isEmpty else { return baseBuffer }
+        return overlayDirectionalCuesWithMeterEvents(
+            onto: baseBuffer,
+            directionalCues: directionalCues,
+            voice: voice,
+            fallbackVoice: fallbackVoice,
+            cueVolume: cueVolume,
+            cueEnabled: cueEnabled,
+            fallbackVolume: fallbackVolume,
+            fallbackEnabled: fallbackEnabled,
+            soloedSubChannels: soloedSubChannels
+        ).buffer
+    }
+
+    /// Overlays directional cues speech on top of an existing base guide audio buffer and returns cue meter events
+    public func overlayDirectionalCuesWithMeterEvents(
+        onto baseBuffer: AVAudioPCMBuffer,
+        directionalCues: [DirectionalCue],
+        voice: GuideVoice,
+        fallbackVoice: GuideVoice = .zoe,
+        cueVolume: Float = 0.80,
+        cueEnabled: Bool = true,
+        fallbackVolume: Float = 0.80,
+        fallbackEnabled: Bool = true,
+        soloedSubChannels: Set<GuideSubChannel> = []
+    ) -> (buffer: AVAudioPCMBuffer, meterEvents: [GuideCueMeterEvent]) {
+        guard !directionalCues.isEmpty else { return (baseBuffer, []) }
+        return mixPhrasesWithMeterEvents(
+            directionalCues.map { ($0.label, $0.time) },
+            onto: baseBuffer,
+            voice: voice,
+            fallbackVoice: fallbackVoice,
+            cueVolume: cueVolume,
+            cueEnabled: cueEnabled,
+            fallbackVolume: fallbackVolume,
+            fallbackEnabled: fallbackEnabled,
+            soloedSubChannels: soloedSubChannels
+        )
+    }
+
+    /// Overlays a section callout and count-in onto an existing uploaded guide buffer at `beatTimes`.
+    public func overlaySectionCue(
+        onto baseBuffer: AVAudioPCMBuffer,
+        targetSection: SongSection,
+        beatTimes: [TimeInterval],
+        voice: GuideVoice,
+        fallbackVoice: GuideVoice = .zoe,
+        countInEnabled: Bool = true,
+        cueVolume: Float = 0.80,
+        cueEnabled: Bool = true,
+        fallbackVolume: Float = 0.80,
+        fallbackEnabled: Bool = true,
+        soloedSubChannels: Set<GuideSubChannel> = []
+    ) -> AVAudioPCMBuffer {
+        return overlaySectionCueWithMeterEvents(
+            onto: baseBuffer,
+            targetSection: targetSection,
+            beatTimes: beatTimes,
+            voice: voice,
+            fallbackVoice: fallbackVoice,
+            countInEnabled: countInEnabled,
+            cueVolume: cueVolume,
+            cueEnabled: cueEnabled,
+            fallbackVolume: fallbackVolume,
+            fallbackEnabled: fallbackEnabled,
+            soloedSubChannels: soloedSubChannels
+        ).buffer
+    }
+
+    /// Overlays a section callout and count-in onto an existing uploaded guide buffer and returns cue meter events.
+    public func overlaySectionCueWithMeterEvents(
+        onto baseBuffer: AVAudioPCMBuffer,
+        targetSection: SongSection,
+        beatTimes: [TimeInterval],
+        voice: GuideVoice,
+        fallbackVoice: GuideVoice = .zoe,
+        countInEnabled: Bool = true,
+        cueVolume: Float = 0.80,
+        cueEnabled: Bool = true,
+        fallbackVolume: Float = 0.80,
+        fallbackEnabled: Bool = true,
+        soloedSubChannels: Set<GuideSubChannel> = []
+    ) -> (buffer: AVAudioPCMBuffer, meterEvents: [GuideCueMeterEvent]) {
+        guard let firstBeat = beatTimes.first else { return (baseBuffer, []) }
+        var phraseEvents: [(phrase: String, time: TimeInterval)] = []
+        let isUnlabeled = isSectionUnlabeled(targetSection.name)
+        if !isUnlabeled && targetSection.playSectionGuideCue {
+            let spokenName = simplifySectionNameForSpeech(targetSection.name, includeNumber: targetSection.includeNumberInGuide)
+            if !spokenName.isEmpty {
+                phraseEvents.append((spokenName, firstBeat))
+            }
+        } else if countInEnabled && targetSection.playSectionCountIn {
+            phraseEvents.append(("1", firstBeat))
+        }
+        if countInEnabled && targetSection.playSectionCountIn && beatTimes.count >= 2 {
+            for bIdx in 1..<beatTimes.count {
+                phraseEvents.append(("\(bIdx + 1)", beatTimes[bIdx]))
+            }
+        }
+        guard !phraseEvents.isEmpty else { return (baseBuffer, []) }
+        return mixPhrasesWithMeterEvents(
+            phraseEvents,
+            onto: baseBuffer,
+            voice: voice,
+            fallbackVoice: fallbackVoice,
+            cueVolume: cueVolume,
+            cueEnabled: cueEnabled,
+            fallbackVolume: fallbackVolume,
+            fallbackEnabled: fallbackEnabled,
+            soloedSubChannels: soloedSubChannels
+        )
+    }
+
+    private func mixPhrasesWithMeterEvents(
+        _ events: [(phrase: String, time: TimeInterval)],
+        onto baseBuffer: AVAudioPCMBuffer,
+        voice: GuideVoice,
+        fallbackVoice: GuideVoice,
+        cueVolume: Float,
+        cueEnabled: Bool,
+        fallbackVolume: Float,
+        fallbackEnabled: Bool,
+        soloedSubChannels: Set<GuideSubChannel>
+    ) -> (buffer: AVAudioPCMBuffer, meterEvents: [GuideCueMeterEvent]) {
+        guard !events.isEmpty else { return (baseBuffer, []) }
         let format = baseBuffer.format
         let totalFrames = baseBuffer.frameLength
+        guard totalFrames > 0 else { return (baseBuffer, []) }
         let sampleRate = format.sampleRate
         let channelCount = Int(format.channelCount)
-        let duration = Double(totalFrames) / sampleRate
-        
+        let duration = Double(totalFrames) / max(1.0, sampleRate)
+
         guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames) else {
-            return baseBuffer
+            return (baseBuffer, [])
         }
         output.frameLength = totalFrames
-        
-        // Copy base buffer data
+
+        // Copy base buffer data without mutating the caller's buffer
         for ch in 0..<channelCount {
             if let src = baseBuffer.floatChannelData?[ch], let dst = output.floatChannelData?[ch] {
                 memcpy(dst, src, Int(totalFrames) * MemoryLayout<Float>.size)
             }
         }
-        
-        // Mix in each directional cue
-        for cue in directionalCues {
-            guard let phraseData = getOrSynthesizePhrase(cue.label, voice: voice, fallbackVoice: fallbackVoice, targetFormat: format) else { continue }
-            let alignedTime = max(0.0, cue.time - phraseData.onsetOffset)
+
+        var meterEvents: [GuideCueMeterEvent] = []
+
+        for event in events {
+            guard let resolved = resolvePhraseWithFallbackInfo(
+                event.phrase,
+                voice: voice,
+                fallbackVoice: fallbackVoice,
+                targetFormat: format
+            ) else { continue }
+            let phraseData = resolved.data
+            let gain = Self.effectiveMixGain(
+                category: .directions,
+                usedFallback: resolved.usedFallback,
+                sectionsVolume: 0.80,
+                sectionsEnabled: true,
+                directionsVolume: cueVolume,
+                directionsEnabled: cueEnabled,
+                fallbackVolume: fallbackVolume,
+                fallbackEnabled: fallbackEnabled,
+                soloedSubChannels: soloedSubChannels
+            )
+            guard gain > 0.0001 else { continue }
+
+            let alignedTime = max(0.0, event.time - phraseData.onsetOffset)
             guard alignedTime < duration else { continue }
-            
+
             let startFrame = Int(alignedTime * sampleRate)
             let framesToCopy = min(Int(phraseData.buffer.frameLength), Int(totalFrames) - startFrame)
             guard framesToCopy > 0 else { continue }
-            
+
             for ch in 0..<channelCount {
                 guard let destPtr = output.floatChannelData?[ch] else { continue }
                 let srcCh = min(ch, Int(phraseData.buffer.format.channelCount) - 1)
                 guard let srcPtr = phraseData.buffer.floatChannelData?[srcCh] else { continue }
-                
+
                 for f in 0..<framesToCopy {
                     let destIdx = startFrame + f
-                    let mixed = destPtr[destIdx] + srcPtr[f] * 0.95
+                    let mixed = destPtr[destIdx] + srcPtr[f] * gain
                     destPtr[destIdx] = max(-1.0, min(1.0, mixed))
                 }
             }
+
+            meterEvents.append(GuideCueMeterEvent(
+                startTime: alignedTime,
+                endTime: alignedTime + Double(framesToCopy) / sampleRate,
+                category: .directions,
+                usedFallback: resolved.usedFallback
+            ))
         }
-        
-        return output
+
+        return (output, meterEvents)
     }
     
     // Checks whether a section is considered unlabeled

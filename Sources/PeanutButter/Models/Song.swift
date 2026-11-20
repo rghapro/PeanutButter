@@ -129,6 +129,8 @@ public struct BeatGridMarker: Identifiable, Hashable, Sendable, Codable {
     public var bar: Int
     public var beat: Int
     public var instantaneousBPM: Double
+    public var timeSignatureNumerator: Int?
+    public var timeSignatureDenominator: Int?
     
     public var isDownbeat: Bool { beat == 1 }
     
@@ -137,13 +139,17 @@ public struct BeatGridMarker: Identifiable, Hashable, Sendable, Codable {
         time: TimeInterval,
         bar: Int,
         beat: Int,
-        instantaneousBPM: Double
+        instantaneousBPM: Double,
+        timeSignatureNumerator: Int? = nil,
+        timeSignatureDenominator: Int? = nil
     ) {
         self.id = id
         self.time = time
         self.bar = bar
         self.beat = beat
         self.instantaneousBPM = instantaneousBPM
+        self.timeSignatureNumerator = timeSignatureNumerator
+        self.timeSignatureDenominator = timeSignatureDenominator
     }
 }
 
@@ -343,6 +349,115 @@ public struct TimeSignatureChange: Identifiable, Hashable, Sendable, Codable {
     }
 }
 
+/// Curve shape for gradual tempo changes (ritardando / accelerando / DAW-drawn custom curves)
+public enum TempoCurveType: String, Codable, CaseIterable, Hashable, Sendable {
+    case linear = "Linear"
+    case easeIn = "Ease In"
+    case easeOut = "Ease Out"
+    case sCurve = "S-Curve"
+    case custom = "Custom"
+}
+
+/// How the duration of a tempo ramp is anchored
+public enum TempoRampSpanMode: String, Codable, CaseIterable, Hashable, Sendable {
+    case barsBeats = "Bars / Beats"
+    case audioAnchor = "Audio End"
+}
+
+/// Interior control point inside a custom DAW-style tempo curve segment
+public struct TempoCurvePoint: Identifiable, Hashable, Sendable, Codable {
+    public let id: UUID
+    public var normalizedTime: Double
+    public var bpm: Double
+    public var curveTension: Double
+
+    public init(
+        id: UUID = UUID(),
+        normalizedTime: Double,
+        bpm: Double,
+        curveTension: Double = 0.0
+    ) {
+        self.id = id
+        self.normalizedTime = max(0.001, min(0.999, normalizedTime))
+        self.bpm = max(20.0, min(300.0, bpm))
+        self.curveTension = max(-1.0, min(1.0, curveTension))
+    }
+}
+
+/// A mid-song instant tempo change or gradual ramp stored in source audio timeline coordinates.
+public struct TempoChangeEvent: Identifiable, Hashable, Sendable, Codable {
+    public let id: UUID
+    public var audioTime: TimeInterval
+    public var targetBPM: Double
+    public var isRamp: Bool
+    public var endAudioTime: TimeInterval?
+    public var spanMode: TempoRampSpanMode
+    public var rampBeats: Double?
+    public var lockBeatCountToAudioEnd: Bool
+    public var curve: TempoCurveType
+    public var curveTension: Double
+    public var customPoints: [TempoCurvePoint]
+
+    public init(
+        id: UUID = UUID(),
+        audioTime: TimeInterval,
+        targetBPM: Double,
+        isRamp: Bool = false,
+        endAudioTime: TimeInterval? = nil,
+        spanMode: TempoRampSpanMode = .barsBeats,
+        rampBeats: Double? = nil,
+        lockBeatCountToAudioEnd: Bool = true,
+        curve: TempoCurveType = .linear,
+        curveTension: Double = 0.0,
+        customPoints: [TempoCurvePoint] = []
+    ) {
+        let safeAudioTime = max(0.0, audioTime)
+        self.id = id
+        self.audioTime = safeAudioTime
+        self.targetBPM = max(20.0, min(300.0, targetBPM))
+        self.isRamp = isRamp
+        self.endAudioTime = endAudioTime.map { max(safeAudioTime + 0.05, $0) }
+        self.spanMode = spanMode
+        self.rampBeats = rampBeats.map { max(0.25, $0) }
+        self.lockBeatCountToAudioEnd = lockBeatCountToAudioEnd
+        self.curve = curve
+        self.curveTension = max(-1.0, min(1.0, curveTension))
+        self.customPoints = customPoints.sorted { $0.normalizedTime < $1.normalizedTime }
+    }
+
+    public func pillLabel(from startBPM: Double) -> String {
+        let endStr = Song.formatBPM(targetBPM, decimals: Song.tempoDecimalPrecision(for: targetBPM))
+        guard isRamp else {
+            return "\(endStr) BPM"
+        }
+        let startStr = Song.formatBPM(startBPM, decimals: Song.tempoDecimalPrecision(for: startBPM))
+        return "\(startStr) → \(endStr)"
+    }
+}
+
+/// Evaluated concrete time/BPM bounds for a `TempoChangeEvent` in sequence
+public struct ResolvedTempoSpan: Equatable, Sendable {
+    public let event: TempoChangeEvent
+    public let startTime: TimeInterval
+    public let endTime: TimeInterval
+    public let startBPM: Double
+    public let endBPM: Double
+
+    public init(
+        event: TempoChangeEvent,
+        startTime: TimeInterval,
+        endTime: TimeInterval,
+        startBPM: Double,
+        endBPM: Double
+    ) {
+        self.event = event
+        self.startTime = startTime
+        self.endTime = endTime
+        self.startBPM = startBPM
+        self.endBPM = endBPM
+    }
+}
+
 public struct Song: Identifiable, Hashable, Sendable, Codable {
     public var id: UUID
     /// Original package ID when a song is added multiple times to a setlist so each instance has a unique `id`.
@@ -371,8 +486,12 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     public var continuePad: Bool = false
     /// Whether click and MIDI clock should continue running after this song ends
     public var continueClick: Bool = false
+    /// Whether the guide track should count in the opening section of the following song across an automatic transition
+    public var cueNextSongSection: Bool = false
     /// Whether the song should automatically fade out non-click/guide tracks over the final 5 seconds
     public var endFadeOutEnabled: Bool = false
+    /// Whether the song should automatically fade out non-click/guide tracks over the section labeled "End"
+    public var fadeEndSectionEnabled: Bool = false
     /// Whether the ambient Pad should automatically start when song playback begins
     public var startPadWithSong: Bool = false
     /// ID of the ambient Pad audio pack to use for this song (nil uses system default)
@@ -420,6 +539,12 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     public var clickSixteenthVolume: Float = 0.0
     public var guideCountInEnabled: Bool = true
     public var speakDirectionalCuesOnUploadedGuide: Bool = true
+    public var guideSectionsVolume: Float = 0.80
+    public var guideSectionsEnabled: Bool = true
+    public var guideDirectionsVolume: Float = 0.80
+    public var guideDirectionsEnabled: Bool = true
+    public var guideFallbackVolume: Float = 0.80
+    public var guideFallbackEnabled: Bool = true
     public var autoInfiniteLoop: Bool = false
     public var excludesClickAndGuide: Bool = false
     
@@ -509,6 +634,28 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         )
         return [countOffSection, clickSection, endingSection]
     }
+
+    /// Canonical predicate matching sections labeled "End" / "Ending" (shared by Click cutoff and Fade End).
+    public static func isEndSection(_ sec: SongSection) -> Bool {
+        let lowerName = sec.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lowerAbbrev = sec.abbreviation.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lowerName == "end" || lowerName == "ending" || lowerName == "the end" ||
+           lowerName.starts(with: "end ") || lowerName.hasSuffix(" end") ||
+           lowerName.starts(with: "ending ") || lowerName.hasSuffix(" ending") ||
+           lowerAbbrev == "end" {
+            return true
+        }
+        if lowerAbbrev == "e" {
+            let words = lowerName.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+            return words.contains("end") || words.contains("ending") || words == ["e"]
+        }
+        return false
+    }
+
+    /// Returns the final non-zero section labeled "End" / "Ending" for Fade End playback.
+    public var endSectionForFade: SongSection? {
+        sections.last(where: { Self.isEndSection($0) && $0.duration > 0.05 })
+    }
     
     /// Clean tempo bounds: intersection of `originalBPM ± 20` and `[originalBPM * 0.75, originalBPM * 1.50]`, clamped within `[20, 300]`.
     public static func allowedTempoRange(forOriginalBPM originalBPM: Double) -> ClosedRange<Double> {
@@ -547,6 +694,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     public var defaultSmpteCue: SMPTECue? = nil
     public var stemURLs: [URL]
     public var timeSignatureChanges: [TimeSignatureChange] = []
+    public var tempoEvents: [TempoChangeEvent] = []
     
     public var activeArrangementName: String {
         if let id = activeArrangementId,
@@ -564,9 +712,240 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         }
         return (timeSignatureNumerator, timeSignatureDenominator)
     }
+
+    /// Evaluates normalized curve factor `0...1` for preset curve shapes and tension (`-1.0...1.0`).
+    public static func evaluateCurveFactor(curve: TempoCurveType, tension: Double, u: Double) -> Double {
+        let clampedU = max(0.0, min(1.0, u))
+        let t = max(-1.0, min(1.0, tension))
+        switch curve {
+        case .linear, .custom:
+            if abs(t) < 0.001 { return clampedU }
+            if t > 0 {
+                return pow(clampedU, 1.0 + t * 2.0)
+            } else {
+                return 1.0 - pow(1.0 - clampedU, 1.0 - t * 2.0)
+            }
+        case .easeIn:
+            let exponent = max(1.1, 2.0 + t * 1.2)
+            return pow(clampedU, exponent)
+        case .easeOut:
+            let exponent = max(1.1, 2.0 - t * 1.2)
+            return 1.0 - pow(1.0 - clampedU, exponent)
+        case .sCurve:
+            let smooth = clampedU * clampedU * (3.0 - 2.0 * clampedU)
+            if abs(t) < 0.001 { return smooth }
+            if t > 0 {
+                return pow(smooth, 1.0 + t * 0.8)
+            } else {
+                return 1.0 - pow(1.0 - smooth, 1.0 - t * 0.8)
+            }
+        }
+    }
+
+    /// Evaluates the BPM at normalized progress `u` (`0...1`) inside a ramp event from `startBPM` to `endBPM`.
+    public static func evaluateRampBPM(
+        event: TempoChangeEvent,
+        startBPM: Double,
+        endBPM: Double,
+        u: Double
+    ) -> Double {
+        let clampedU = max(0.0, min(1.0, u))
+        let safeStart = max(20.0, min(300.0, startBPM))
+        let safeEnd = max(20.0, min(300.0, endBPM))
+
+        if event.curve == .custom && !event.customPoints.isEmpty {
+            let sortedPts = event.customPoints.sorted { $0.normalizedTime < $1.normalizedTime }
+            var waypoints: [(t: Double, bpm: Double, tension: Double)] = [(0.0, safeStart, event.curveTension)]
+            waypoints.reserveCapacity(sortedPts.count + 2)
+            for pt in sortedPts {
+                waypoints.append((max(0.001, min(0.999, pt.normalizedTime)), max(20.0, min(300.0, pt.bpm)), pt.curveTension))
+            }
+            waypoints.append((1.0, safeEnd, 0.0))
+
+            var segIdx = 0
+            for idx in 0..<(waypoints.count - 1) {
+                if clampedU >= waypoints[idx].t {
+                    segIdx = idx
+                }
+            }
+            let p0 = waypoints[segIdx]
+            let p1 = waypoints[min(waypoints.count - 1, segIdx + 1)]
+            let localU = (clampedU - p0.t) / max(1e-6, p1.t - p0.t)
+            let factor = evaluateCurveFactor(curve: .linear, tension: p0.tension, u: localU)
+            let val = p0.bpm + (p1.bpm - p0.bpm) * factor
+            return max(20.0, min(300.0, val))
+        }
+
+        let factor = evaluateCurveFactor(curve: event.curve, tension: event.curveTension, u: clampedU)
+        let val = safeStart + (safeEnd - safeStart) * factor
+        return max(20.0, min(300.0, val))
+    }
+
+    /// Resolves sequential concrete source-time bounds and start/end BPMs for all `tempoEvents`.
+    public func resolvedTempoSpans() -> [ResolvedTempoSpan] {
+        guard !tempoEvents.isEmpty else { return [] }
+        let sorted = tempoEvents.sorted { $0.audioTime < $1.audioTime }
+        var spans: [ResolvedTempoSpan] = []
+        spans.reserveCapacity(sorted.count)
+        var activeBPM = max(20.0, min(300.0, bpm))
+
+        for idx in sorted.indices {
+            let ev = sorted[idx]
+            let startT = max(0.0, ev.audioTime)
+            let startB = activeBPM
+            var endT = startT
+            var endB = max(20.0, min(300.0, ev.targetBPM))
+
+            if ev.isRamp {
+                let ts = timeSignature(atSourceTime: startT)
+                let den = max(1, ts.denominator)
+                if ev.spanMode == .barsBeats {
+                    let beats = max(0.5, ev.rampBeats ?? Double(max(1, ts.numerator) * 2))
+                    let steps = 64
+                    var bpmSum = 0.0
+                    for s in 0...steps {
+                        let u = Double(s) / Double(steps)
+                        let w = (s == 0 || s == steps) ? 0.5 : 1.0
+                        bpmSum += w * Self.evaluateRampBPM(event: ev, startBPM: startB, endBPM: endB, u: u)
+                    }
+                    let meanBPM = max(20.0, bpmSum / Double(steps))
+                    let dur = beats / ((Double(den) / 240.0) * meanBPM)
+                    endT = startT + max(0.05, dur)
+                } else {
+                    endT = max(startT + 0.05, ev.endAudioTime ?? (startT + 2.0))
+                    if ev.lockBeatCountToAudioEnd, ev.curve != .custom, let beats = ev.rampBeats, beats > 0.25 {
+                        let requiredMeanBPM = (beats * 240.0) / (Double(den) * max(0.05, endT - startT))
+                        let steps = 64
+                        var factorSum = 0.0
+                        for s in 0...steps {
+                            let u = Double(s) / Double(steps)
+                            let w = (s == 0 || s == steps) ? 0.5 : 1.0
+                            factorSum += w * Self.evaluateCurveFactor(curve: ev.curve, tension: ev.curveTension, u: u)
+                        }
+                        let curveMean = max(0.05, factorSum / Double(steps))
+                        let solvedEnd = startB + (requiredMeanBPM - startB) / curveMean
+                        endB = max(20.0, min(300.0, solvedEnd))
+                    }
+                }
+                if idx + 1 < sorted.count && sorted[idx + 1].audioTime > startT + 0.05 {
+                    endT = min(endT, sorted[idx + 1].audioTime)
+                }
+            }
+
+            spans.append(ResolvedTempoSpan(
+                event: ev,
+                startTime: startT,
+                endTime: endT,
+                startBPM: startB,
+                endBPM: endB
+            ))
+            activeBPM = endB
+        }
+
+        return spans
+    }
+
+    /// Evaluates continuous or stepped BPM at `sourceTime` across resolved `tempoEvents`.
+    public func evaluateBPM(atSourceTime sourceTime: TimeInterval) -> Double {
+        let spans = resolvedTempoSpans()
+        guard !spans.isEmpty else { return max(20.0, min(300.0, bpm)) }
+        var activeBPM = max(20.0, min(300.0, bpm))
+        for span in spans {
+            if sourceTime < span.startTime - 0.0005 {
+                break
+            }
+            if span.event.isRamp && sourceTime < span.endTime - 0.0005 {
+                let u = (sourceTime - span.startTime) / max(0.001, span.endTime - span.startTime)
+                return Self.evaluateRampBPM(event: span.event, startBPM: span.startBPM, endBPM: span.endBPM, u: u)
+            }
+            activeBPM = span.endBPM
+        }
+        return activeBPM
+    }
+
+    private func evaluateBPM(atSourceTime sourceTime: TimeInterval, spans: [ResolvedTempoSpan]) -> Double {
+        guard !spans.isEmpty else { return max(20.0, min(300.0, bpm)) }
+        var activeBPM = max(20.0, min(300.0, bpm))
+        for span in spans {
+            if sourceTime < span.startTime - 0.0005 {
+                break
+            }
+            if span.event.isRamp && sourceTime < span.endTime - 0.0005 {
+                let u = (sourceTime - span.startTime) / max(0.001, span.endTime - span.startTime)
+                return Self.evaluateRampBPM(event: span.event, startBPM: span.startBPM, endBPM: span.endBPM, u: u)
+            }
+            activeBPM = span.endBPM
+        }
+        return activeBPM
+    }
+
+    private func nextBeatTime(
+        from t: TimeInterval,
+        denominator: Int,
+        spans: [ResolvedTempoSpan],
+        nextTimeSigTime: TimeInterval?
+    ) -> TimeInterval {
+        let denFactor = Double(max(1, denominator)) / 240.0
+        let localBPM = evaluateBPM(atSourceTime: t, spans: spans)
+        let constDur = max(0.05, 1.0 / (denFactor * max(20.0, localBPM)))
+        let candidateEnd = t + constDur
+
+        let overlapsSpan = spans.contains { span in
+            if span.event.isRamp {
+                return candidateEnd > span.startTime - 0.001 && t < span.endTime + 0.001
+            } else {
+                return span.startTime > t + 0.0005 && span.startTime < candidateEnd - 0.0005
+            }
+        }
+        if !overlapsSpan {
+            return candidateEnd
+        }
+
+        let dt = 0.004
+        var curT = t
+        var phase = 0.0
+        let maxIter = 20_000
+        for _ in 0..<maxIter {
+            let stepEnd = curT + dt
+            if let tsBoundary = nextTimeSigTime, curT < tsBoundary - 0.0005 && stepEnd >= tsBoundary + 0.0005 {
+                let partialDt = max(0.0001, tsBoundary - curT)
+                let segBPM = evaluateBPM(atSourceTime: curT + 0.5 * partialDt, spans: spans)
+                phase += segBPM * denFactor * partialDt
+                if phase >= 1.0 {
+                    let excess = (phase - 1.0) / max(1e-9, segBPM * denFactor)
+                    return max(t + 0.02, tsBoundary - excess)
+                }
+                curT = tsBoundary
+                continue
+            }
+            let segBPM = evaluateBPM(atSourceTime: curT + 0.5 * dt, spans: spans)
+            let dPhase = segBPM * denFactor * dt
+            if phase + dPhase >= 1.0 {
+                let remain = max(0.0, 1.0 - phase)
+                let frac = remain / max(1e-9, dPhase)
+                var resultT = max(t + 0.02, curT + frac * dt)
+                for span in spans where span.event.isRamp && (span.event.spanMode == .barsBeats || span.event.lockBeatCountToAudioEnd) {
+                    if abs(resultT - span.endTime) <= 0.015 {
+                        resultT = span.endTime
+                        break
+                    }
+                }
+                return resultT
+            }
+            phase += dPhase
+            curT = stepEnd
+        }
+        return candidateEnd
+    }
     
-    /// Returns the instantaneous BPM from `beatGrid` at `sourceTime` (falling back to `bpm`).
+    /// Returns the instantaneous BPM from `tempoEvents` / `beatGrid` at `sourceTime` (falling back to `bpm`).
     public func instantaneousBPM(atSourceTime sourceTime: TimeInterval) -> Double {
+        if !tempoEvents.isEmpty {
+            let firstEventTime = tempoEvents.map(\.audioTime).min() ?? 0.0
+            if beatGrid.isEmpty || sourceTime + 0.008 >= firstEventTime {
+                return evaluateBPM(atSourceTime: sourceTime)
+            }
+        }
         guard !beatGrid.isEmpty else { return max(20.0, bpm) }
         let target = sourceTime + 0.008
         var low = 0
@@ -585,10 +964,11 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         return val > 20.0 ? val : max(20.0, bpm)
     }
     
-    /// Builds the source-timeline beat grid incorporating any mid-song `timeSignatureChanges`.
+    /// Builds the source-timeline beat grid incorporating any mid-song `timeSignatureChanges` and `tempoEvents`.
     public func sourceBeatGrid(upToDuration: TimeInterval? = nil) -> [BeatGridMarker] {
         let sortedChanges = timeSignatureChanges.sorted { $0.audioTime < $1.audioTime }
-        if sortedChanges.isEmpty {
+        let spans = resolvedTempoSpans()
+        if sortedChanges.isEmpty && spans.isEmpty {
             if beatGrid.count <= 1 { return beatGrid }
             var isSorted = true
             for i in 1..<beatGrid.count where beatGrid[i].time < beatGrid[i - 1].time {
@@ -597,8 +977,8 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
             }
             return isSorted ? beatGrid : beatGrid.sorted { $0.time < $1.time }
         }
-        
-        if !beatGrid.isEmpty {
+
+        if spans.isEmpty && !beatGrid.isEmpty {
             let orderedGrid: [BeatGridMarker] = {
                 var isSorted = true
                 for i in 1..<beatGrid.count where beatGrid[i].time < beatGrid[i - 1].time {
@@ -613,38 +993,152 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
             var beat = 1
             var changeIdx = 0
             var curNum = max(1, timeSignatureNumerator)
-            for (i, marker) in orderedGrid.enumerated() {
+            var curDen = max(1, timeSignatureDenominator)
+
+            var i = 0
+            while i < orderedGrid.count {
+                let marker = orderedGrid[i]
                 while changeIdx < sortedChanges.count && marker.time + 0.01 >= sortedChanges[changeIdx].audioTime {
                     curNum = max(1, sortedChanges[changeIdx].numerator)
-                    if i > 0 && beat != 1 {
+                    curDen = max(1, sortedChanges[changeIdx].denominator)
+                    if !result.isEmpty && beat != 1 {
                         bar += 1
                         beat = 1
                     }
                     changeIdx += 1
                 }
-                result.append(BeatGridMarker(time: marker.time, bar: bar, beat: beat, instantaneousBPM: marker.instantaneousBPM))
+                result.append(BeatGridMarker(time: marker.time, bar: bar, beat: beat, instantaneousBPM: marker.instantaneousBPM, timeSignatureNumerator: curNum, timeSignatureDenominator: curDen))
                 beat += 1
                 if beat > curNum {
                     beat = 1
                     bar += 1
                 }
+
+                if i + 1 < orderedGrid.count {
+                    let localBPM = max(20.0, marker.instantaneousBPM > 20.0 ? marker.instantaneousBPM : bpm)
+                    let expectedBeatDur = (60.0 / localBPM) * (4.0 / Double(curDen))
+                    let segDur = orderedGrid[i + 1].time - marker.time
+                    if segDur > 0.01 {
+                        if segDur / expectedBeatDur >= 1.65 {
+                            let subCount = max(2, min(8, Int((segDur / expectedBeatDur).rounded())))
+                            for sub in 1..<subCount {
+                                let subTime = marker.time + (Double(sub) / Double(subCount)) * segDur
+                                if changeIdx < sortedChanges.count && subTime + 0.01 >= sortedChanges[changeIdx].audioTime {
+                                    break
+                                }
+                                result.append(BeatGridMarker(time: subTime, bar: bar, beat: beat, instantaneousBPM: marker.instantaneousBPM, timeSignatureNumerator: curNum, timeSignatureDenominator: curDen))
+                                beat += 1
+                                if beat > curNum {
+                                    beat = 1
+                                    bar += 1
+                                }
+                            }
+                            i += 1
+                        } else if expectedBeatDur / segDur >= 1.65 {
+                            let strideCount = max(2, min(8, Int((expectedBeatDur / segDur).rounded())))
+                            var step = 1
+                            while step < strideCount && (i + step) < orderedGrid.count {
+                                let probeTime = orderedGrid[i + step].time
+                                if changeIdx < sortedChanges.count && probeTime + 0.01 >= sortedChanges[changeIdx].audioTime {
+                                    break
+                                }
+                                step += 1
+                            }
+                            i += step
+                        } else {
+                            i += 1
+                        }
+                    } else {
+                        i += 1
+                    }
+                } else {
+                    i += 1
+                }
             }
             return result
         }
-        
+
         let maxSectionSrcEnd = max(
             sections.map { $0.sourceAudioStartTime + $0.duration }.max() ?? 0.0,
             defaultSections.map { $0.sourceAudioStartTime + $0.duration }.max() ?? 0.0
         )
-        let dur = max(upToDuration ?? 0.0, maxSectionSrcEnd)
+        let maxSpanEnd = spans.map(\.endTime).max() ?? 0.0
+        let dur = max(upToDuration ?? 0.0, max(maxSectionSrcEnd, maxSpanEnd > 0 ? maxSpanEnd + 4.0 : 0.0))
         guard dur > 0.1 else { return [] }
+
         var markers: [BeatGridMarker] = []
-        var t: TimeInterval = 0.0
         var bar = 1
         var beat = 1
         var changeIdx = 0
         var curNum = max(1, timeSignatureNumerator)
         var curDen = max(1, timeSignatureDenominator)
+        var t: TimeInterval = 0.0
+
+        // Preserve any imported/detected beatGrid markers strictly before the first manual tempo event
+        if !beatGrid.isEmpty, let firstTempoTime = spans.first?.startTime, firstTempoTime > 0.02 {
+            let orderedGrid: [BeatGridMarker] = {
+                var isSorted = true
+                for i in 1..<beatGrid.count where beatGrid[i].time < beatGrid[i - 1].time {
+                    isSorted = false
+                    break
+                }
+                return isSorted ? beatGrid : beatGrid.sorted { $0.time < $1.time }
+            }()
+            var lastKeptMarker: BeatGridMarker? = nil
+            var i = 0
+            while i < orderedGrid.count && orderedGrid[i].time + 0.01 < firstTempoTime {
+                let marker = orderedGrid[i]
+                while changeIdx < sortedChanges.count && marker.time + 0.01 >= sortedChanges[changeIdx].audioTime {
+                    curNum = max(1, sortedChanges[changeIdx].numerator)
+                    curDen = max(1, sortedChanges[changeIdx].denominator)
+                    if !markers.isEmpty && beat != 1 {
+                        bar += 1
+                        beat = 1
+                    }
+                    changeIdx += 1
+                }
+                markers.append(BeatGridMarker(time: marker.time, bar: bar, beat: beat, instantaneousBPM: marker.instantaneousBPM, timeSignatureNumerator: curNum, timeSignatureDenominator: curDen))
+                lastKeptMarker = marker
+                beat += 1
+                if beat > curNum {
+                    beat = 1
+                    bar += 1
+                }
+
+                if i + 1 < orderedGrid.count && orderedGrid[i + 1].time + 0.01 < firstTempoTime {
+                    let localBPM = max(20.0, marker.instantaneousBPM > 20.0 ? marker.instantaneousBPM : bpm)
+                    let expectedBeatDur = (60.0 / localBPM) * (4.0 / Double(curDen))
+                    let segDur = orderedGrid[i + 1].time - marker.time
+                    if segDur > 0.01 && segDur / expectedBeatDur >= 1.65 {
+                        let subCount = max(2, min(8, Int((segDur / expectedBeatDur).rounded())))
+                        for sub in 1..<subCount {
+                            let subTime = marker.time + (Double(sub) / Double(subCount)) * segDur
+                            if subTime + 0.01 >= firstTempoTime { break }
+                            if changeIdx < sortedChanges.count && subTime + 0.01 >= sortedChanges[changeIdx].audioTime {
+                                break
+                            }
+                            markers.append(BeatGridMarker(time: subTime, bar: bar, beat: beat, instantaneousBPM: marker.instantaneousBPM, timeSignatureNumerator: curNum, timeSignatureDenominator: curDen))
+                            beat += 1
+                            if beat > curNum {
+                                beat = 1
+                                bar += 1
+                            }
+                        }
+                    }
+                }
+                i += 1
+            }
+
+            if let lastKept = lastKeptMarker {
+                let prevBPM = max(20.0, lastKept.instantaneousBPM > 20.0 ? lastKept.instantaneousBPM : bpm)
+                let prevBeatDur = (60.0 / prevBPM) * (4.0 / Double(curDen))
+                let nextExpected = lastKept.time + prevBeatDur
+                t = abs(nextExpected - firstTempoTime) <= 0.025 ? firstTempoTime : nextExpected
+            } else {
+                t = 0.0
+            }
+        }
+
         while t < dur - 0.01 && markers.count < 8000 {
             while changeIdx < sortedChanges.count && t + 0.01 >= sortedChanges[changeIdx].audioTime {
                 curNum = max(1, sortedChanges[changeIdx].numerator)
@@ -655,9 +1149,14 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
                 }
                 changeIdx += 1
             }
-            markers.append(BeatGridMarker(time: t, bar: bar, beat: beat, instantaneousBPM: bpm))
-            let beatDur = (60.0 / max(20.0, bpm)) * (4.0 / Double(curDen))
-            t += beatDur
+            let instBPM = spans.isEmpty ? max(20.0, bpm) : evaluateBPM(atSourceTime: t, spans: spans)
+            markers.append(BeatGridMarker(time: t, bar: bar, beat: beat, instantaneousBPM: instBPM, timeSignatureNumerator: curNum, timeSignatureDenominator: curDen))
+
+            let nextTS = (changeIdx < sortedChanges.count) ? sortedChanges[changeIdx].audioTime : nil
+            let tNext = spans.isEmpty
+                ? (t + (60.0 / max(20.0, bpm)) * (4.0 / Double(curDen)))
+                : nextBeatTime(from: t, denominator: curDen, spans: spans, nextTimeSigTime: nextTS)
+            t = max(t + 0.02, tNext)
             beat += 1
             if beat > curNum {
                 beat = 1
@@ -709,11 +1208,10 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     }
     
     /// Recomputes `measureCount` and `startMeasure` for `sections`, `defaultSections`, and `savedArrangements`
-    /// using `sourceBeatGrid()` whenever a dynamic tempo grid or mid-song meter changes exist.
+    /// using `sourceBeatGrid()` (or base `bpm` and time signature when no mid-song overrides exist).
     public mutating func reconcileSectionMeasuresWithBeatGrid() {
-        guard !beatGrid.isEmpty || !timeSignatureChanges.isEmpty else { return }
-        let srcGrid = sourceBeatGrid()
-        guard !srcGrid.isEmpty else { return }
+        let hasDynamicGrid = !beatGrid.isEmpty || !timeSignatureChanges.isEmpty || !tempoEvents.isEmpty
+        let srcGrid = hasDynamicGrid ? sourceBeatGrid() : []
         let fallbackBPM = bpm
         let baseNum = timeSignatureNumerator
         let baseDen = timeSignatureDenominator
@@ -726,7 +1224,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
                 let isBlankClick = sec.effectiveIsClickSection &&
                     (sec.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "click section" || sec.abbreviation == "CLK")
                 let bars: Int
-                if isBlankClick {
+                if isBlankClick || sec.duration <= 0.05 {
                     bars = max(1, sec.measureCount)
                 } else {
                     let srcStart = sec.sourceAudioStartTime
@@ -796,7 +1294,9 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
                             time: sec.startTime + beatOffset,
                             bar: currentBar,
                             beat: beatInBar,
-                            instantaneousBPM: instBPM
+                            instantaneousBPM: instBPM,
+                            timeSignatureNumerator: tsNum,
+                            timeSignatureDenominator: tsDen
                         ))
                     }
                 }
@@ -829,7 +1329,9 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
                         time: arrTime,
                         bar: max(1, currentBar),
                         beat: m.beat,
-                        instantaneousBPM: m.instantaneousBPM
+                        instantaneousBPM: m.instantaneousBPM,
+                        timeSignatureNumerator: m.timeSignatureNumerator,
+                        timeSignatureDenominator: m.timeSignatureDenominator
                     ))
                 }
             } else {
@@ -850,7 +1352,9 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
                         time: sec.startTime + t,
                         bar: max(1, currentBar),
                         beat: beatInBar,
-                        instantaneousBPM: localBPM
+                        instantaneousBPM: localBPM,
+                        timeSignatureNumerator: tsNum,
+                        timeSignatureDenominator: tsDen
                     ))
                     t += beatDur
                     beatInBar += 1
@@ -907,6 +1411,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         defaultSmpteCue: SMPTECue? = nil,
         stemURLs: [URL] = [],
         timeSignatureChanges: [TimeSignatureChange] = [],
+        tempoEvents: [TempoChangeEvent] = [],
         beatGrid: [BeatGridMarker] = [],
         midiCues: [MIDICue] = [],
         directionalCues: [DirectionalCue] = [],
@@ -917,7 +1422,9 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         transitionType: SongTransitionType = .cueNextSong,
         continuePad: Bool = false,
         continueClick: Bool = false,
+        cueNextSongSection: Bool = false,
         endFadeOutEnabled: Bool = false,
+        fadeEndSectionEnabled: Bool = false,
         startPadWithSong: Bool = false,
         padPresetId: String? = nil,
         padIntroOutroOnly: Bool = false,
@@ -939,6 +1446,12 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         clickSixteenthVolume: Float = 0.0,
         guideCountInEnabled: Bool = true,
         speakDirectionalCuesOnUploadedGuide: Bool = true,
+        guideSectionsVolume: Float = 0.80,
+        guideSectionsEnabled: Bool = true,
+        guideDirectionsVolume: Float = 0.80,
+        guideDirectionsEnabled: Bool = true,
+        guideFallbackVolume: Float = 0.80,
+        guideFallbackEnabled: Bool = true,
         autoInfiniteLoop: Bool = false,
         excludesClickAndGuide: Bool = false
     ) {
@@ -962,6 +1475,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.defaultSmpteCue = defaultSmpteCue ?? smpteCue
         self.stemURLs = stemURLs
         self.timeSignatureChanges = timeSignatureChanges.sorted { $0.audioTime < $1.audioTime }
+        self.tempoEvents = tempoEvents.sorted { $0.audioTime < $1.audioTime }
         self.beatGrid = beatGrid
         self.midiCues = midiCues
         self.directionalCues = directionalCues
@@ -972,7 +1486,9 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.transitionType = transitionType
         self.continuePad = continuePad
         self.continueClick = continueClick
+        self.cueNextSongSection = cueNextSongSection
         self.endFadeOutEnabled = endFadeOutEnabled
+        self.fadeEndSectionEnabled = fadeEndSectionEnabled
         self.startPadWithSong = startPadWithSong
         self.padPresetId = padPresetId
         self.padIntroOutroOnly = padIntroOutroOnly
@@ -994,17 +1510,23 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.clickSixteenthVolume = clickSixteenthVolume
         self.guideCountInEnabled = guideCountInEnabled
         self.speakDirectionalCuesOnUploadedGuide = speakDirectionalCuesOnUploadedGuide
+        self.guideSectionsVolume = guideSectionsVolume
+        self.guideSectionsEnabled = guideSectionsEnabled
+        self.guideDirectionsVolume = guideDirectionsVolume
+        self.guideDirectionsEnabled = guideDirectionsEnabled
+        self.guideFallbackVolume = guideFallbackVolume
+        self.guideFallbackEnabled = guideFallbackEnabled
         self.autoInfiniteLoop = autoInfiniteLoop
         self.excludesClickAndGuide = excludesClickAndGuide
         
-        if !self.beatGrid.isEmpty || !self.timeSignatureChanges.isEmpty {
+        if !self.beatGrid.isEmpty || !self.timeSignatureChanges.isEmpty || !self.tempoEvents.isEmpty {
             self.reconcileSectionMeasuresWithBeatGrid()
         }
     }
     
     enum CodingKeys: String, CodingKey {
-        case id, title, artist, bpm, originalBPM, timeSignatureNumerator, timeSignatureDenominator, timeSignatureChanges, musicalKey, transposeSemitones, preserveVocalFormants, sections, defaultSections, savedArrangements, activeArrangementId, defaultMidiCues, defaultDirectionalCues, defaultAutomationPoints, defaultSmpteCue, stemURLs, beatGrid, midiCues, directionalCues, automationPoints, smpteCue, proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, endFadeOutEnabled, startPadWithSong, padPresetId, padIntroOutroOnly
-        case clickSource, guideSource, guideVoice, guideFallbackVoice, clickSound, usesDefaultClickSound, usesDefaultGuideVoice, clickAccentEnabled, clickQuarterEnabled, clickEighthEnabled, clickSixteenthEnabled, clickAccentVolume, clickQuarterVolume, clickEighthVolume, clickSixteenthVolume, guideCountInEnabled, speakDirectionalCuesOnUploadedGuide, autoInfiniteLoop, excludesClickAndGuide
+        case id, title, artist, bpm, originalBPM, timeSignatureNumerator, timeSignatureDenominator, timeSignatureChanges, tempoEvents, musicalKey, transposeSemitones, preserveVocalFormants, sections, defaultSections, savedArrangements, activeArrangementId, defaultMidiCues, defaultDirectionalCues, defaultAutomationPoints, defaultSmpteCue, stemURLs, beatGrid, midiCues, directionalCues, automationPoints, smpteCue, proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, cueNextSongSection, endFadeOutEnabled, fadeEndSectionEnabled, startPadWithSong, padPresetId, padIntroOutroOnly
+        case clickSource, guideSource, guideVoice, guideFallbackVoice, clickSound, usesDefaultClickSound, usesDefaultGuideVoice, clickAccentEnabled, clickQuarterEnabled, clickEighthEnabled, clickSixteenthEnabled, clickAccentVolume, clickQuarterVolume, clickEighthVolume, clickSixteenthVolume, guideCountInEnabled, speakDirectionalCuesOnUploadedGuide, guideSectionsVolume, guideSectionsEnabled, guideDirectionsVolume, guideDirectionsEnabled, guideFallbackVolume, guideFallbackEnabled, autoInfiniteLoop, excludesClickAndGuide
     }
     
     public init(from decoder: Decoder) throws {
@@ -1026,6 +1548,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.activeArrangementId = try container.decodeIfPresent(UUID.self, forKey: .activeArrangementId)
         self.stemURLs = try container.decodeIfPresent([URL].self, forKey: .stemURLs) ?? []
         self.timeSignatureChanges = (try container.decodeIfPresent([TimeSignatureChange].self, forKey: .timeSignatureChanges) ?? []).sorted { $0.audioTime < $1.audioTime }
+        self.tempoEvents = (try container.decodeIfPresent([TempoChangeEvent].self, forKey: .tempoEvents) ?? []).sorted { $0.audioTime < $1.audioTime }
         self.beatGrid = try container.decodeIfPresent([BeatGridMarker].self, forKey: .beatGrid) ?? []
         self.midiCues = try container.decodeIfPresent([MIDICue].self, forKey: .midiCues) ?? []
         self.directionalCues = try container.decodeIfPresent([DirectionalCue].self, forKey: .directionalCues) ?? []
@@ -1040,7 +1563,9 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.transitionType = try container.decodeIfPresent(SongTransitionType.self, forKey: .transitionType) ?? .cueNextSong
         self.continuePad = try container.decodeIfPresent(Bool.self, forKey: .continuePad) ?? false
         self.continueClick = try container.decodeIfPresent(Bool.self, forKey: .continueClick) ?? false
+        self.cueNextSongSection = try container.decodeIfPresent(Bool.self, forKey: .cueNextSongSection) ?? false
         self.endFadeOutEnabled = try container.decodeIfPresent(Bool.self, forKey: .endFadeOutEnabled) ?? false
+        self.fadeEndSectionEnabled = try container.decodeIfPresent(Bool.self, forKey: .fadeEndSectionEnabled) ?? false
         self.startPadWithSong = try container.decodeIfPresent(Bool.self, forKey: .startPadWithSong) ?? false
         self.padPresetId = try container.decodeIfPresent(String.self, forKey: .padPresetId)
         self.padIntroOutroOnly = try container.decodeIfPresent(Bool.self, forKey: .padIntroOutroOnly) ?? false
@@ -1063,10 +1588,16 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.clickSixteenthVolume = try container.decodeIfPresent(Float.self, forKey: .clickSixteenthVolume) ?? 0.0
         self.guideCountInEnabled = try container.decodeIfPresent(Bool.self, forKey: .guideCountInEnabled) ?? true
         self.speakDirectionalCuesOnUploadedGuide = try container.decodeIfPresent(Bool.self, forKey: .speakDirectionalCuesOnUploadedGuide) ?? true
+        self.guideSectionsVolume = try container.decodeIfPresent(Float.self, forKey: .guideSectionsVolume) ?? 0.80
+        self.guideSectionsEnabled = try container.decodeIfPresent(Bool.self, forKey: .guideSectionsEnabled) ?? true
+        self.guideDirectionsVolume = try container.decodeIfPresent(Float.self, forKey: .guideDirectionsVolume) ?? 0.80
+        self.guideDirectionsEnabled = try container.decodeIfPresent(Bool.self, forKey: .guideDirectionsEnabled) ?? true
+        self.guideFallbackVolume = try container.decodeIfPresent(Float.self, forKey: .guideFallbackVolume) ?? 0.80
+        self.guideFallbackEnabled = try container.decodeIfPresent(Bool.self, forKey: .guideFallbackEnabled) ?? true
         self.autoInfiniteLoop = try container.decodeIfPresent(Bool.self, forKey: .autoInfiniteLoop) ?? false
         self.excludesClickAndGuide = try container.decodeIfPresent(Bool.self, forKey: .excludesClickAndGuide) ?? false
         
-        if !self.beatGrid.isEmpty || !self.timeSignatureChanges.isEmpty {
+        if !self.beatGrid.isEmpty || !self.timeSignatureChanges.isEmpty || !self.tempoEvents.isEmpty {
             self.reconcileSectionMeasuresWithBeatGrid()
         }
     }
@@ -1129,6 +1660,16 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         case .cueNextSong, .cueFirstSong, .stayInSong:
             return true
         case .autoLink, .overlap, .crossfade:
+            return false
+        }
+    }
+
+    public func isCueNextSongSectionEffective(isLastSongInSetlist: Bool) -> Bool {
+        guard cueNextSongSection && !excludesClickAndGuide && !isLastSongInSetlist else { return false }
+        switch transitionType {
+        case .autoLink, .overlap, .crossfade:
+            return true
+        case .cueNextSong, .stayInSong, .cueFirstSong:
             return false
         }
     }

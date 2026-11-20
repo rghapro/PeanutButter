@@ -481,6 +481,7 @@ extension MultitrackAudioEngine {
                 prevSong.timeSignatureNumerator != currentSong.timeSignatureNumerator ||
                 prevSong.timeSignatureDenominator != currentSong.timeSignatureDenominator ||
                 prevSong.timeSignatureChanges != currentSong.timeSignatureChanges ||
+                prevSong.tempoEvents != currentSong.tempoEvents ||
                 prevSong.sections != currentSong.sections ||
                 prevSong.beatGrid != currentSong.beatGrid
 
@@ -491,10 +492,17 @@ extension MultitrackAudioEngine {
                 prevSong.guideFallbackVoice != currentSong.guideFallbackVoice ||
                 prevSong.guideCountInEnabled != currentSong.guideCountInEnabled ||
                 prevSong.speakDirectionalCuesOnUploadedGuide != currentSong.speakDirectionalCuesOnUploadedGuide ||
+                prevSong.guideSectionsVolume != currentSong.guideSectionsVolume ||
+                prevSong.guideSectionsEnabled != currentSong.guideSectionsEnabled ||
+                prevSong.guideDirectionsVolume != currentSong.guideDirectionsVolume ||
+                prevSong.guideDirectionsEnabled != currentSong.guideDirectionsEnabled ||
+                prevSong.guideFallbackVolume != currentSong.guideFallbackVolume ||
+                prevSong.guideFallbackEnabled != currentSong.guideFallbackEnabled ||
                 prevSong.bpm != currentSong.bpm ||
                 prevSong.timeSignatureNumerator != currentSong.timeSignatureNumerator ||
                 prevSong.timeSignatureDenominator != currentSong.timeSignatureDenominator ||
                 prevSong.timeSignatureChanges != currentSong.timeSignatureChanges ||
+                prevSong.tempoEvents != currentSong.tempoEvents ||
                 prevSong.sections != currentSong.sections ||
                 prevSong.directionalCues != currentSong.directionalCues ||
                 prevSong.beatGrid != currentSong.beatGrid
@@ -758,7 +766,10 @@ extension MultitrackAudioEngine {
                         uploadedGuideBuffers[song.id] = norm
                     }
                     if song.guideSource == .generated {
-                        let expectedState = isActiveSong ? currentLiveGuideLoopState() : Self.defaultGuideLoopState(for: song)
+                        let songIdx = currentSetlist.songs.firstIndex(where: { $0.id == song.id })
+                        let expectedState = isActiveSong
+                            ? currentLiveGuideLoopState()
+                            : expectedDefaultGuideLoopState(forSongAt: songIdx ?? -1, song: song)
                         if let genGuide = generatedGuideBuffers[song.id],
                            genGuide.frameLength > 1,
                            generatedGuideLoopStates[song.id] == expectedState {
@@ -785,7 +796,10 @@ extension MultitrackAudioEngine {
                     rehydrated.append((track, stub))
                 }
             } else if cat == .guide && song.guideSource == .generated {
-                let expectedState = isActiveSong ? currentLiveGuideLoopState() : Self.defaultGuideLoopState(for: song)
+                let songIdx = currentSetlist.songs.firstIndex(where: { $0.id == song.id })
+                let expectedState = isActiveSong
+                    ? currentLiveGuideLoopState()
+                    : expectedDefaultGuideLoopState(forSongAt: songIdx ?? -1, song: song)
                 if let genGuide = generatedGuideBuffers[song.id],
                    genGuide.frameLength > 1,
                    generatedGuideLoopStates[song.id] == expectedState {
@@ -894,7 +908,10 @@ extension MultitrackAudioEngine {
                     uploadedGuideBuffers[song.id] = norm
                 }
                 if song.guideSource == .generated {
-                    let expectedState = isActiveSong ? currentLiveGuideLoopState() : Self.defaultGuideLoopState(for: song)
+                    let songIdx = currentSetlist.songs.firstIndex(where: { $0.id == song.id })
+                    let expectedState = isActiveSong
+                        ? currentLiveGuideLoopState()
+                        : expectedDefaultGuideLoopState(forSongAt: songIdx ?? -1, song: song)
                     if let genGuide = generatedGuideBuffers[song.id],
                        genGuide.frameLength > 1,
                        generatedGuideLoopStates[song.id] == expectedState {

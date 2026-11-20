@@ -12,6 +12,19 @@ public final class AudioBus: Identifiable, ObservableObject, @unchecked Sendable
     @Published public var isMono: Bool = false
     @Published public var physicalOutputChannel: String // e.g. "Out 1/2", "Out 3/4", "Out 1"
     @Published public var color: Color
+
+    /// Shortened bus display label matching Playback's narrow mixer strips (`EG`, `AG`, `Perc`).
+    public var abbreviatedName: String {
+        let lower = name.lowercased()
+        if lower.contains("electric") {
+            return "EG"
+        } else if lower.contains("acoustic") {
+            return "AG"
+        } else if lower == "percussion" {
+            return "Perc"
+        }
+        return name
+    }
     
     // Live VU Metering for Bus Channel Strip (isolated into `meter` so BusChannelStripView never re-evaluates on meter ticks)
     public let meter = StereoMeterModel()

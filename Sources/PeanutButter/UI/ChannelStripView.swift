@@ -477,7 +477,7 @@ public struct ChannelStripView: View {
                     .fill(Color(white: 0.16))
                     .frame(width: 1)
                 
-                // Click Subdivisions Drawer Toggle Arrow (matching Photo 1 & 2)
+                // Click Subdivisions & Guide Levels Drawer Toggle Arrows
                 if isClick {
                     Button(action: {
                         withAnimation(.easeInOut(duration: 0.20)) {
@@ -494,6 +494,22 @@ public struct ChannelStripView: View {
                     .buttonStyle(.plain)
                     .offset(x: 5)
                     .help(engine.isClickSubdivisionDrawerExpanded ? "Collapse Click Subdivisions" : "Expand Click Subdivisions")
+                } else if isGuide && !isInTray {
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.20)) {
+                            engine.isGuideSubChannelDrawerExpanded.toggle()
+                        }
+                    }) {
+                        Image(systemName: engine.isGuideSubChannelDrawerExpanded ? "chevron.left" : "chevron.right")
+                            .font(.system(size: 8, weight: .black))
+                            .foregroundColor(Color(white: 0.50))
+                            .frame(width: 12, height: 26)
+                            .background(Color(red: 0.10, green: 0.11, blue: 0.12).opacity(0.85))
+                            .cornerRadius(2)
+                    }
+                    .buttonStyle(.plain)
+                    .offset(x: 5)
+                    .help(engine.isGuideSubChannelDrawerExpanded ? "Collapse Guide Levels" : "Expand Guide Levels")
                 }
             },
             alignment: .trailing

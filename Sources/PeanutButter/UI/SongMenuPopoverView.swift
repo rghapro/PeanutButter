@@ -782,7 +782,7 @@ public struct SongMenuPopoverView: View {
                 .cornerRadius(10)
             }
             
-            // 5. 5-SECOND FADE OUT SECTION
+            // 5. SONG END FADE OPTIONS SECTION
             VStack(alignment: .leading, spacing: 5) {
                 sectionHeader("SONG END")
                 
@@ -804,8 +804,54 @@ public struct SongMenuPopoverView: View {
                             set: { newValue in
                                 if isPreAddMode {
                                     stagedSong?.endFadeOutEnabled = newValue
+                                    if newValue {
+                                        stagedSong?.fadeEndSectionEnabled = false
+                                    }
                                 } else {
                                     engine.updateSongEndFadeOut(at: effectiveSongIndex, enabled: newValue)
+                                }
+                            }
+                        ))
+                        .toggleStyle(SwitchToggleStyle(tint: Color(red: 0.20, green: 0.85, blue: 0.65)))
+                        .labelsHidden()
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+
+                    rowDivider
+
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Fade End")
+                                .font(.system(size: 13, weight: .regular))
+                                .foregroundColor(.white)
+                            if let endSec = targetSong.endSectionForFade {
+                                Text(String(format: "Fades music stems over End section (%.1fs)", endSec.duration))
+                                    .font(.system(size: 9.5))
+                                    .foregroundColor(Color(white: 0.45))
+                            } else if targetSong.fadeEndSectionEnabled {
+                                Text("No section labeled \"End\" found in song")
+                                    .font(.system(size: 9.5))
+                                    .foregroundColor(Color(red: 0.98, green: 0.68, blue: 0.18).opacity(0.85))
+                            } else {
+                                Text("Fades music stems over the section labeled End")
+                                    .font(.system(size: 9.5))
+                                    .foregroundColor(Color(white: 0.45))
+                            }
+                        }
+
+                        Spacer()
+
+                        Toggle("", isOn: Binding(
+                            get: { targetSong.fadeEndSectionEnabled },
+                            set: { newValue in
+                                if isPreAddMode {
+                                    stagedSong?.fadeEndSectionEnabled = newValue
+                                    if newValue {
+                                        stagedSong?.endFadeOutEnabled = false
+                                    }
+                                } else {
+                                    engine.updateSongFadeEndSection(at: effectiveSongIndex, enabled: newValue)
                                 }
                             }
                         ))

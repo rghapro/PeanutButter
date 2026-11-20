@@ -30,6 +30,10 @@ public struct SongTransitionPopoverView: View {
             return currentTransition == .cueNextSong || currentTransition == .stayInSong
         }
     }
+
+    private var isAutoTransitionAvailable: Bool {
+        !isLastSong && (currentTransition == .autoLink || currentTransition == .overlap || currentTransition == .crossfade)
+    }
     
     private var continuePadBinding: Binding<Bool> {
         Binding(
@@ -53,6 +57,19 @@ public struct SongTransitionPopoverView: View {
             set: { newValue in
                 guard isContinuePadAvailable else { return }
                 engine.updateSongContinueClick(at: songIndex, continueClick: newValue)
+            }
+        )
+    }
+
+    private var cueNextSectionBinding: Binding<Bool> {
+        Binding(
+            get: {
+                if !isAutoTransitionAvailable { return false }
+                return currentSong?.cueNextSongSection ?? false
+            },
+            set: { newValue in
+                guard isAutoTransitionAvailable else { return }
+                engine.updateSongCueNextSongSection(at: songIndex, enabled: newValue)
             }
         )
     }
@@ -155,10 +172,16 @@ public struct SongTransitionPopoverView: View {
                     engine.updateSongContinueClick(at: songIndex, continueClick: false)
                     onDismiss()
                 }
+
+                Divider()
+                    .background(Color.white.opacity(0.12))
+                    .padding(.vertical, 4)
+
+                cueNextSectionRow
             }
         }
         .padding(8)
-        .frame(width: 215)
+        .frame(width: 228)
         .background(Color(red: 0.12, green: 0.13, blue: 0.15))
     }
     
@@ -254,5 +277,29 @@ public struct SongTransitionPopoverView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .opacity(isContinuePadAvailable ? 1.0 : 0.45)
+    }
+
+    private var cueNextSectionRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "megaphone")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(isAutoTransitionAvailable ? Color(red: 0.98, green: 0.72, blue: 0.12) : Color.white.opacity(0.25))
+                .frame(width: 18, alignment: .center)
+
+            Text("Cue Next Section")
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundColor(isAutoTransitionAvailable ? .white : .white.opacity(0.35))
+
+            Spacer()
+
+            Toggle("", isOn: cueNextSectionBinding)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .scaleEffect(0.75)
+                .disabled(!isAutoTransitionAvailable)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .opacity(isAutoTransitionAvailable ? 1.0 : 0.45)
     }
 }

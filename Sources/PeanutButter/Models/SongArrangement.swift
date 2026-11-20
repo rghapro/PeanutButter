@@ -204,14 +204,13 @@ public struct SongSection: Identifiable, Hashable, Sendable, Codable {
         return digits.isEmpty ? prefixLetters : "\(prefixLetters)\(digits)"
     }
     
-    /// Exact per-section color matching MultiTracks Playback (sections-en.json)
-    public var color: Color {
+    private var colorRGB: (r: Int, g: Int, b: Int) {
         let lower = name.lowercased()
         let abbr = abbreviation.lowercased()
         
         // 1. Click / Count Off / Pad (160, 160, 160)
         if lower.contains("count") || lower.contains("click") || lower == "pad" || abbr == "co" || abbr == "cl" || abbr == "p" {
-            return Color(red: 160.0 / 255.0, green: 160.0 / 255.0, blue: 160.0 / 255.0)
+            return (160, 160, 160)
         }
         
         // 2. Specific Vamp variants (Vamp on 1, Vamp on 4, Vamp Bridge, Vamp Chorus, etc.) (0, 150, 255)
@@ -220,55 +219,67 @@ public struct SongSection: Identifiable, Hashable, Sendable, Codable {
            abbr == "vb" || abbr == "vc" || abbr == "e1" || abbr == "e4" ||
            abbr == "v1" && lower.contains("vamp") || abbr == "vs" || abbr == "v4" && lower.contains("vamp") ||
            abbr == "vp" && lower.contains("pre") || abbr == "vv" {
-            return Color(red: 0.0 / 255.0, green: 150.0 / 255.0, blue: 255.0 / 255.0)
+            return (0, 150, 255)
         }
         
         // 3. Pre-Chorus (254, 186, 0) - evaluated before Chorus
         if lower.contains("pre-chorus") || lower.contains("pre chorus") || lower.contains("prechorus") ||
            lower.starts(with: "pre") || abbr.starts(with: "pr") || abbr.starts(with: "pc") {
-            return Color(red: 254.0 / 255.0, green: 186.0 / 255.0, blue: 0.0 / 255.0)
+            return (254, 186, 0)
         }
         
         // 4. Post-Chorus / Acapella / Breakdown / Refrain (67, 168, 115) - evaluated before Chorus and Bridge
         if lower.contains("post-chorus") || lower.contains("post chorus") || lower.contains("postchorus") ||
            lower.contains("acapella") || lower.contains("breakdown") || lower.contains("refrain") ||
            abbr.starts(with: "po") || abbr == "ac" || abbr == "bd" || abbr.starts(with: "rf") || abbr == "r" {
-            return Color(red: 67.0 / 255.0, green: 168.0 / 255.0, blue: 115.0 / 255.0)
+            return (67, 168, 115)
         }
         
         // 5. Chorus / Tag (252, 98, 15)
         if lower.contains("chorus") || lower.contains("tag") || abbr.starts(with: "c") && abbr != "cn" || abbr.starts(with: "tg") || abbr == "t" {
-            return Color(red: 252.0 / 255.0, green: 98.0 / 255.0, blue: 15.0 / 255.0)
+            return (252, 98, 15)
         }
         
         // 6. Bridge / Rap (229, 94, 115)
         if lower.contains("bridge") || lower.contains("rap") || abbr.starts(with: "b") || abbr == "rp" {
-            return Color(red: 229.0 / 255.0, green: 94.0 / 255.0, blue: 115.0 / 255.0)
+            return (229, 94, 115)
         }
         
         // 7. Verse / Exhortation (117, 102, 255)
         if lower.contains("verse") || lower.contains("exhortation") || abbr.starts(with: "v") && abbr != "vp" || abbr == "ex" {
-            return Color(red: 117.0 / 255.0, green: 102.0 / 255.0, blue: 255.0 / 255.0)
+            return (117, 102, 255)
         }
         
         // 8. Instrumental / Turnaround (120, 203, 31)
         if lower.contains("instrumental") || lower.contains("turnaround") || abbr == "is" || abbr.starts(with: "ta") {
-            return Color(red: 120.0 / 255.0, green: 203.0 / 255.0, blue: 31.0 / 255.0)
+            return (120, 203, 31)
         }
         
         // 9. Channel / Interlude / Vamp (219, 68, 57)
         if lower.contains("channel") || lower.contains("interlude") || lower.contains("vamp") || lower.contains("passage") ||
            abbr == "cn" || abbr == "it" || abbr == "vp" || abbr == "in" || abbr == "pa" {
-            return Color(red: 219.0 / 255.0, green: 68.0 / 255.0, blue: 57.0 / 255.0)
+            return (219, 68, 57)
         }
         
         // 10. Intro / Outro / Ending / Solo (42, 181, 189)
         if lower.contains("intro") || lower.contains("outro") || lower.contains("ending") || lower.contains("solo") ||
            abbr == "i" || abbr.starts(with: "o") || abbr.starts(with: "e") || abbr == "s" {
-            return Color(red: 42.0 / 255.0, green: 181.0 / 255.0, blue: 189.0 / 255.0)
+            return (42, 181, 189)
         }
         
-        return Color(red: 160.0 / 255.0, green: 160.0 / 255.0, blue: 160.0 / 255.0)
+        return (160, 160, 160)
+    }
+
+    /// Exact per-section color matching MultiTracks Playback (sections-en.json)
+    public var color: Color {
+        let rgb = colorRGB
+        return Color(red: Double(rgb.r) / 255.0, green: Double(rgb.g) / 255.0, blue: Double(rgb.b) / 255.0)
+    }
+
+    /// Hex string representation (`#rrggbb`) of this section's color for web/Remote rendering.
+    public var colorHex: String {
+        let rgb = colorRGB
+        return String(format: "#%02x%02x%02x", rgb.r, rgb.g, rgb.b)
     }
 }
 

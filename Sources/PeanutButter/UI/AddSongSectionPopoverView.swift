@@ -15,6 +15,18 @@ public struct AddSongSectionPopoverView: View {
     @State private var isChoosingTimeSignature: Bool = false
     @State private var selectedNumerator: Int = 4
     @State private var selectedDenominator: Int = 4
+    @State private var isChoosingTempo: Bool = false
+    @State private var tempoIsRamp: Bool = false
+    @State private var tempoTargetBPMText: String = "120"
+    @State private var tempoTargetBPM: Double = 120.0
+    @State private var rampSpanMode: TempoRampSpanMode = .barsBeats
+    @State private var rampBars: Int = 2
+    @State private var rampBeats: Double = 8.0
+    @State private var rampUseBeatsUnit: Bool = false
+    @State private var rampAudioSeconds: Double = 4.0
+    @State private var rampLockBeatCount: Bool = true
+    @State private var rampCurve: TempoCurveType = .easeIn
+    @State private var activeSourceStartBPM: Double = 120.0
     
     public init(
         engine: MultitrackAudioEngine,
@@ -68,6 +80,8 @@ public struct AddSongSectionPopoverView: View {
             
             if isChoosingTimeSignature {
                 timeSignaturePickerView
+            } else if isChoosingTempo {
+                tempoPickerView
             } else {
                 let isSongSectionsMode = insertAfterIndex == nil && !(engine.isEditDrawerOpen && engine.selectedEditDrawerItem == .setlistSongMap)
                 if isSongSectionsMode {
@@ -132,6 +146,41 @@ public struct AddSongSectionPopoverView: View {
                     }
                     .buttonStyle(.plain)
                     
+                    Divider()
+                        .background(Color(white: 0.18))
+
+                    Button(action: {
+                        let targetTime = atTime ?? engine.playbackOffsetSeconds
+                        let srcTime = engine.audioTime(forArrangementTime: targetTime)
+                        let curTS = engine.currentSong.timeSignature(atSourceTime: srcTime)
+                        let curBPM = engine.currentSong.evaluateBPM(atSourceTime: srcTime)
+                        activeSourceStartBPM = curBPM
+                        tempoTargetBPM = curBPM
+                        tempoTargetBPMText = Song.formatBPM(curBPM, decimals: Song.tempoDecimalPrecision(for: curBPM))
+                        rampBars = 2
+                        rampBeats = Double(max(1, curTS.numerator) * 2)
+                        isChoosingTempo = true
+                    }) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "speedometer")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(Color(red: 0.98, green: 0.68, blue: 0.18))
+                                .frame(width: 22)
+                            Text("Change Tempo...")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(Color(red: 0.98, green: 0.68, blue: 0.18))
+                                .lineLimit(1)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(Color(white: 0.45))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
                     Divider()
                         .background(Color(white: 0.18))
                 }
@@ -204,7 +253,7 @@ public struct AddSongSectionPopoverView: View {
             }
             .buttonStyle(.plain)
         }
-        .frame(width: 250, height: 390)
+        .frame(width: 266, height: 420)
         .background(Color(red: 0.11, green: 0.12, blue: 0.13))
         .cornerRadius(8)
     }
@@ -398,6 +447,299 @@ public struct AddSongSectionPopoverView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private var tempoPickerView: some View {
+        let amber = Color(red: 0.98, green: 0.68, blue: 0.18)
+        let targetTime = atTime ?? engine.playbackOffsetSeconds
+        let srcTime = engine.audioTime(forArrangementTime: targetTime)
+        let curTS = engine.currentSong.timeSignature(atSourceTime: srcTime)
+
+        return ScrollView(.vertical, showsIndicators: false) {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack {
+                Button(action: { isChoosingTempo = false }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left")
+                        Text("Back")
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Color(red: 0.25, green: 0.65, blue: 1.0))
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Text("Tempo")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(.white)
+                Spacer()
+                Text("Back")
+                    .font(.system(size: 12))
+                    .opacity(0)
+            }
+
+            // Instant vs Ramp switcher
+            HStack(spacing: 6) {
+                Button(action: { tempoIsRamp = false }) {
+                    Text("Instant")
+                        .font(.system(size: 11.5, weight: .bold))
+                        .foregroundColor(!tempoIsRamp ? .black : .white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(!tempoIsRamp ? amber : Color(white: 0.18))
+                        .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+
+                Button(action: { tempoIsRamp = true }) {
+                    Text("Ramp (Rit / Acc)")
+                        .font(.system(size: 11.5, weight: .bold))
+                        .foregroundColor(tempoIsRamp ? .black : .white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(tempoIsRamp ? amber : Color(white: 0.18))
+                        .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+            }
+
+            // Active BPM -> Target BPM row
+            HStack(spacing: 6) {
+                if tempoIsRamp {
+                    Text("From \(Song.formatBPM(activeSourceStartBPM, decimals: 1)) →")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundColor(Color(white: 0.65))
+                } else {
+                    Text("Target BPM")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Color(white: 0.70))
+                }
+                Spacer()
+                TextField("BPM", text: $tempoTargetBPMText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                    .foregroundColor(amber)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 58)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                    .background(Color(white: 0.18))
+                    .cornerRadius(4)
+                    .onChange(of: tempoTargetBPMText) { newVal in
+                        if let parsed = Double(newVal), parsed >= 20.0, parsed <= 300.0 {
+                            tempoTargetBPM = parsed
+                        }
+                    }
+                Stepper("", value: Binding(
+                    get: { tempoTargetBPM },
+                    set: { val in
+                        let c = max(20.0, min(300.0, val))
+                        tempoTargetBPM = c
+                        tempoTargetBPMText = Song.formatBPM(c, decimals: Song.tempoDecimalPrecision(for: c))
+                    }
+                ), in: 20...300, step: 1)
+                .labelsHidden()
+            }
+
+            if !tempoIsRamp {
+                HStack(spacing: 6) {
+                    Button("Half-Time (1/2x)") {
+                        let next = max(20.0, (tempoTargetBPM * 0.5 * 10.0).rounded() / 10.0)
+                        tempoTargetBPM = next
+                        tempoTargetBPMText = Song.formatBPM(next, decimals: Song.tempoDecimalPrecision(for: next))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button("Double (2x)") {
+                        let next = min(300.0, (tempoTargetBPM * 2.0 * 10.0).rounded() / 10.0)
+                        tempoTargetBPM = next
+                        tempoTargetBPMText = Song.formatBPM(next, decimals: Song.tempoDecimalPrecision(for: next))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            } else {
+                // Ramp span mode
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Span")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(Color(white: 0.55))
+
+                    HStack(spacing: 6) {
+                        Button(action: {
+                            rampSpanMode = .barsBeats
+                            if rampCurve == .custom { rampCurve = .easeIn }
+                        }) {
+                            Text("Bars / Beats")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor((rampSpanMode == .barsBeats && rampCurve != .custom) ? .black : .white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 5)
+                                .background((rampSpanMode == .barsBeats && rampCurve != .custom) ? amber : Color(white: 0.18))
+                                .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
+
+                        Button(action: { rampSpanMode = .audioAnchor }) {
+                            Text("Audio End")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor((rampSpanMode == .audioAnchor || rampCurve == .custom) ? .black : .white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 5)
+                                .background((rampSpanMode == .audioAnchor || rampCurve == .custom) ? amber : Color(white: 0.18))
+                                .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    if rampSpanMode == .barsBeats && rampCurve != .custom {
+                        HStack {
+                            Button(rampUseBeatsUnit ? "Beats" : "Bars") {
+                                rampUseBeatsUnit.toggle()
+                                if rampUseBeatsUnit {
+                                    rampBeats = Double(rampBars * max(1, curTS.numerator))
+                                } else {
+                                    rampBars = max(1, Int((rampBeats / Double(max(1, curTS.numerator))).rounded()))
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+
+                            Spacer()
+
+                            if rampUseBeatsUnit {
+                                Stepper("\(Int(rampBeats.rounded())) beats", value: $rampBeats, in: 1...64, step: 1)
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            } else {
+                                Stepper("\(rampBars) bar\(rampBars == 1 ? "" : "s")", value: $rampBars, in: 1...16, step: 1)
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            }
+                        }
+                    } else {
+                        HStack {
+                            Text(String(format: "Span %.1fs", rampAudioSeconds))
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            Spacer()
+                            Stepper("", value: $rampAudioSeconds, in: 0.5...30.0, step: 0.5)
+                                .labelsHidden()
+                        }
+                        if rampCurve != .custom {
+                            Toggle("Lock Beats to Audio End", isOn: $rampLockBeatCount)
+                                .toggleStyle(SwitchToggleStyle(tint: amber))
+                                .font(.system(size: 10.5, weight: .medium))
+                            if rampLockBeatCount {
+                                HStack {
+                                    Text("Beats")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundColor(Color(white: 0.75))
+                                    Spacer()
+                                    Stepper("\(Int(rampBeats.rounded())) beats", value: $rampBeats, in: 1...64, step: 1)
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Curve picker
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Curve")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(Color(white: 0.55))
+                    VStack(spacing: 5) {
+                        HStack(spacing: 5) {
+                            tempoCurveOptionButton(.linear, amber: amber)
+                            tempoCurveOptionButton(.easeIn, amber: amber)
+                            tempoCurveOptionButton(.easeOut, amber: amber)
+                        }
+                        HStack(spacing: 5) {
+                            tempoCurveOptionButton(.sCurve, amber: amber)
+                            tempoCurveOptionButton(.custom, amber: amber)
+                        }
+                    }
+                }
+            }
+
+            Button(action: {
+                let resolvedTarget = max(20.0, min(300.0, Double(tempoTargetBPMText) ?? tempoTargetBPM))
+                if !tempoIsRamp {
+                    engine.addInstantTempoChange(atDisplayTime: targetTime, bpm: resolvedTarget)
+                } else {
+                    let finalBeats = rampUseBeatsUnit ? rampBeats : Double(rampBars * max(1, curTS.numerator))
+                    let effectiveMode: TempoRampSpanMode = (rampCurve == .custom) ? .audioAnchor : rampSpanMode
+                    let endDisp: TimeInterval? = (effectiveMode == .audioAnchor) ? (targetTime + rampAudioSeconds) : nil
+                    engine.addTempoRamp(
+                        atDisplayTime: targetTime,
+                        targetBPM: resolvedTarget,
+                        spanMode: effectiveMode,
+                        rampBeats: finalBeats,
+                        endDisplayTime: endDisp,
+                        lockBeatCount: rampLockBeatCount,
+                        curve: rampCurve
+                    )
+                    if rampCurve == .custom {
+                        engine.openTempoCurveEditor()
+                    }
+                }
+                onClose()
+            }) {
+                let label = tempoIsRamp
+                    ? "Apply \(Song.formatBPM(activeSourceStartBPM, decimals: 1)) → \(Song.formatBPM(tempoTargetBPM, decimals: 1)) BPM"
+                    : "Apply \(Song.formatBPM(tempoTargetBPM, decimals: 1)) BPM"
+                Text(label)
+                    .font(.system(size: 12.5, weight: .bold))
+                    .foregroundColor(.black)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(amber)
+                    .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+
+            Divider()
+                .background(Color(white: 0.22))
+
+            Button(action: {
+                engine.openTempoCurveEditor()
+                onClose()
+            }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform.path")
+                        .font(.system(size: 11, weight: .bold))
+                    Text("Draw Tempo Curve on Waveform")
+                        .font(.system(size: 11.5, weight: .bold))
+                }
+                .foregroundColor(amber)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 7)
+                .background(amber.opacity(0.14))
+                .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(14)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private func tempoCurveOptionButton(_ curveOption: TempoCurveType, amber: Color) -> some View {
+        let selected = rampCurve == curveOption
+        return Button(action: {
+            rampCurve = curveOption
+            if curveOption == .custom {
+                rampSpanMode = .audioAnchor
+                rampLockBeatCount = false
+            }
+        }) {
+            Text(curveOption.rawValue)
+                .font(.system(size: 10.5, weight: .bold))
+                .foregroundColor(selected ? .black : .white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+                .background(selected ? amber : Color(white: 0.18))
+                .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
     }
 
     private func submitCustomSection() {

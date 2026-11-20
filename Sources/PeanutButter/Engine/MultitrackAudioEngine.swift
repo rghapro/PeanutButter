@@ -28,6 +28,8 @@ public final class MultitrackAudioEngine: ObservableObject {
     @Published public internal(set) var renderedWaveformImage: NSImage?
     @Published public internal(set) var waveformVersion: UInt64 = 0
     public internal(set) var masterWaveformPeaks: [Float] = []
+    public internal(set) var soloWaveformPeaks: [Float]? = nil
+    private var lastSoloWaveformTrackIds: [UUID] = []
     
     // Master Volume & Busses
     var liveInteractiveMasterVolume: Float? = nil
@@ -66,7 +68,8 @@ public final class MultitrackAudioEngine: ObservableObject {
     var lastPlaybackClockTickTimestamp: CFTimeInterval = 0
     var playbackActivityToken: NSObjectProtocol?
     var memoryPressureSource: DispatchSourceMemoryPressure?
-    public internal(set) var cachedEffectiveBeatGrid: [BeatGridMarker] = []
+    @Published public internal(set) var cachedEffectiveBeatGrid: [BeatGridMarker] = []
+    @Published public internal(set) var beatGridVersion: UInt64 = 0
     public internal(set) var precomputedDownbeatMarkers: [BeatGridMarker] = []
     public internal(set) var precomputedSubdivisionMarkers: [BeatGridMarker] = []
     var cachedActiveAutomation: [(point: AutomationPoint, startSec: TimeInterval)] = []
@@ -99,6 +102,14 @@ public final class MultitrackAudioEngine: ObservableObject {
     // Click Subdivisions Drawer & Solo Controls
     @Published public var isClickSubdivisionDrawerExpanded: Bool = false
     @Published public var clickSoloedSubdivisions: Set<ClickSubdivision> = []
+
+    // Guide Sub-Channels Drawer & Solo Controls
+    @Published public var isGuideSubChannelDrawerExpanded: Bool = false
+    @Published public var guideSoloedSubChannels: Set<GuideSubChannel> = []
+
+    public var visibleGuideSubChannels: [GuideSubChannel] {
+        GuideSubChannel.visibleChannels(for: currentSong.guideSource)
+    }
     
     // Bottom-Right Edit Drawer & Active Edit Mode (MultiTracks Playback Style)
     public enum EditDrawerItem: String, CaseIterable, Sendable {
@@ -117,6 +128,7 @@ public final class MultitrackAudioEngine: ObservableObject {
     
     // Song Section Edit Mode (Non-destructive Add/Remove Sections)
     @Published public var isEditSectionsMode: Bool = false
+    @Published public var isEditingTempoCurve: Bool = false
     
     // Song Map Edit Mode (Adding / Labeling Sections at Playhead)
     @Published public var isEditSongMapMode: Bool = false
@@ -367,9 +379,10 @@ public final class MultitrackAudioEngine: ObservableObject {
     var cachedDisplaySectionsValue: [SongSection] = []
 
     public func closeEditMode() {
-        if isEditDrawerOpen || isEditSectionsMode || isEditSongMapMode || isEditMIDICuesMode || isEditDirectionalCuesMode || isEditAutomationMode || isEditMIDIMappingMode || isEditKeyboardMappingMode || isEditSMPTEMode || trimmingSection != nil {
+        if isEditDrawerOpen || isEditingTempoCurve || isEditSectionsMode || isEditSongMapMode || isEditMIDICuesMode || isEditDirectionalCuesMode || isEditAutomationMode || isEditMIDIMappingMode || isEditKeyboardMappingMode || isEditSMPTEMode || trimmingSection != nil {
             isEditDrawerOpen = false
             isEditDrawerCollapsed = false
+            isEditingTempoCurve = false
             isEditSectionsMode = false
             isEditSongMapMode = false
             isEditMIDICuesMode = false
@@ -434,8 +447,12 @@ public final class MultitrackAudioEngine: ObservableObject {
         KeyboardMappingManager.shared.selectedTargetId = nil
         
         guard isEditDrawerOpen else {
+            isEditingTempoCurve = false
             updateArrangementWaveform()
             return
+        }
+        if selectedEditDrawerItem != .songSections {
+            isEditingTempoCurve = false
         }
         
         switch selectedEditDrawerItem {
@@ -494,7 +511,10 @@ public final class MultitrackAudioEngine: ObservableObject {
             if currentSong.id != oldValue.id ||
                currentSong.beatGrid.count != oldValue.beatGrid.count ||
                currentSong.bpm != oldValue.bpm ||
+               currentSong.timeSignatureNumerator != oldValue.timeSignatureNumerator ||
+               currentSong.timeSignatureDenominator != oldValue.timeSignatureDenominator ||
                currentSong.timeSignatureChanges != oldValue.timeSignatureChanges ||
+               currentSong.tempoEvents != oldValue.tempoEvents ||
                currentSong.sections != oldValue.sections ||
                (precomputedDownbeatMarkers.isEmpty && !currentSong.beatGrid.isEmpty) {
                 rebuildPrecomputedBeatGrid()
@@ -599,6 +619,12 @@ public final class MultitrackAudioEngine: ObservableObject {
     public let clickQuarterMeter = StereoMeterModel()
     public let clickEighthMeter = StereoMeterModel()
     public let clickSixteenthMeter = StereoMeterModel()
+
+    // Dedicated per-sub-channel Guide VU meters
+    public let guideSectionsMeter = StereoMeterModel()
+    public let guideDirectionsMeter = StereoMeterModel()
+    public let guideFallbackMeter = StereoMeterModel()
+    var guideCueMeterEvents: [UUID: [GuideCueMeterEvent]] = [:]
     
     // Click & Guide Audio Generation State & Progress
     @Published public var isGeneratingClick: Bool = false
@@ -706,6 +732,97 @@ public final class MultitrackAudioEngine: ObservableObject {
         let loopMode: LoopMode
         let singleLoopRemaining: Int
         let queuedNextSectionId: UUID?
+        let nextSongCueSectionId: UUID?
+        let nextSongCueSectionName: String?
+        let nextSongCueIncludeNumber: Bool?
+        let nextSongCuePlayGuide: Bool
+        let nextSongCuePlayCountIn: Bool
+        let nextSongCueTargetTimeMs: Int
+        let sectionsVolPermille: Int
+        let sectionsEnabled: Bool
+        let directionsVolPermille: Int
+        let directionsEnabled: Bool
+        let fallbackVolPermille: Int
+        let fallbackEnabled: Bool
+        let soloedSubChannels: Set<GuideSubChannel>
+    }
+
+    func songDurationForGuide(for song: Song) -> TimeInterval {
+        if song.id == currentSong.id {
+            if !song.sections.isEmpty {
+                return song.sections.map { $0.endTime }.max() ?? currentSongDuration
+            }
+            return currentSongDuration > 0 ? currentSongDuration : (tracks.map { $0.duration }.max() ?? 240.0)
+        }
+        let cachedItems = songBuffersCache[song.id] ?? []
+        let maxAudioDur = cachedItems
+            .filter { !Self.isClickOrGuideTrack($0.track) }
+            .map { Double($0.buffer.frameLength) / max(1.0, $0.buffer.format.sampleRate) }
+            .max() ?? 0.0
+        return max(maxAudioDur, song.totalDuration)
+    }
+
+    func resolvedNextSongSectionCue(forSongAt songIndex: Int, song: Song, duration: TimeInterval) -> (section: SongSection, targetTime: TimeInterval)? {
+        guard songIndex >= 0, songIndex + 1 < currentSetlist.songs.count else { return nil }
+        guard song.isCueNextSongSectionEffective(isLastSongInSetlist: false) else { return nil }
+        let nextSong = currentSetlist.songs[songIndex + 1]
+        let nextOrdered = nextSong.sections.sorted { $0.startTime < $1.startTime }
+        guard let nextFirst = nextOrdered.first else { return nil }
+        let lowerFirst = nextFirst.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if nextFirst.abbreviation == "Co" || lowerFirst.contains("count") {
+            return nil
+        }
+
+        let targetTime: TimeInterval
+        switch song.transitionType {
+        case .autoLink:
+            let ordered = song.sections.sorted { $0.startTime < $1.startTime }
+            targetTime = ordered.last?.endTime ?? duration
+        case .overlap:
+            targetTime = Self.overlapTransitionStartTime(from: song, currentDuration: duration, to: nextSong)
+        case .crossfade:
+            let nextBPM = max(20.0, nextSong.bpm)
+            let beatsPerBar = Double(max(1, nextSong.timeSignatureNumerator))
+            let secPerBar = (60.0 / nextBPM) * (4.0 / Double(max(1, nextSong.timeSignatureDenominator))) * beatsPerBar
+            let fadeSec = min(duration, max(0.5, secPerBar * 2.0))
+            targetTime = max(0.0, duration - fadeSec)
+        case .cueNextSong, .stayInSong, .cueFirstSong:
+            return nil
+        }
+        guard targetTime > 0 else { return nil }
+        return (nextFirst, targetTime)
+    }
+
+    func invalidateStaleNextSongSectionGuides() {
+        var didTouchActiveSong = false
+        for (idx, song) in currentSetlist.songs.enumerated() where song.cueNextSongSection {
+            let sid = song.id
+            if sid == currentSong.id {
+                let dur = songDurationForGuide(for: currentSong)
+                let expected = expectedDefaultGuideLoopState(forSongAt: idx, song: currentSong, duration: dur)
+                let cachedMatches = generatedGuideLoopStates[sid]?.nextSongCueSectionId == expected.nextSongCueSectionId &&
+                    generatedGuideLoopStates[sid]?.nextSongCueSectionName == expected.nextSongCueSectionName &&
+                    generatedGuideLoopStates[sid]?.nextSongCueTargetTimeMs == expected.nextSongCueTargetTimeMs
+                if !cachedMatches || currentSong.guideSource == .uploaded {
+                    generatedGuideBuffers.removeValue(forKey: sid)
+                    generatedGuideLoopStates.removeValue(forKey: sid)
+                    didTouchActiveSong = true
+                }
+            } else {
+                let expected = expectedDefaultGuideLoopState(forSongAt: idx, song: song)
+                if generatedGuideLoopStates[sid] != expected {
+                    generatedGuideBuffers.removeValue(forKey: sid)
+                    generatedGuideLoopStates.removeValue(forKey: sid)
+                }
+            }
+        }
+        if didTouchActiveSong && !currentSong.excludesClickAndGuide {
+            if currentSong.guideSource == .generated {
+                regenerateGuideTrack()
+            } else {
+                applyGuideBuffer()
+            }
+        }
     }
     var generatedGuideLoopStates: [UUID: GeneratedGuideLoopState] = [:]
     var guideRegenerationGeneration: UInt64 = 0
@@ -1385,11 +1502,18 @@ public final class MultitrackAudioEngine: ObservableObject {
         ensureUIDisplayLinkRunning()
     }
     
+    func resetGuideSubChannelMeters() {
+        guideSectionsMeter.reset()
+        guideDirectionsMeter.reset()
+        guideFallbackMeter.reset()
+    }
+
     func resetClickMeters() {
         clickAccentMeter.reset()
         clickQuarterMeter.reset()
         clickEighthMeter.reset()
         clickSixteenthMeter.reset()
+        resetGuideSubChannelMeters()
         for track in tracks where track.isClickTrackCached {
             track.rawPeakL = 0.0
             track.rawPeakR = 0.0
@@ -1432,9 +1556,13 @@ public final class MultitrackAudioEngine: ObservableObject {
                 updatePostSongClickMeters(dt: dt)
             } else {
                 resetClickMeters()
-                if !padNeedsUpdate && activeManualFade == nil {
-                    stopUIDisplayLink()
-                }
+            }
+            let busNeedsUpdate = isPostSongClickActive || padNeedsUpdate || busses.contains { $0.peakLevelLeft > 0.0 || $0.peakLevelRight > 0.0 || $0.meter.left > 0.0 || $0.meter.right > 0.0 }
+            if busNeedsUpdate && (mixerMode == .busses || remoteServer.connectedClientCount > 0) {
+                updateBusMeters(dt: dt)
+            }
+            if !isPostSongClickActive && !padNeedsUpdate && !busNeedsUpdate && activeManualFade == nil {
+                stopUIDisplayLink()
             }
             return
         }
@@ -1442,7 +1570,6 @@ public final class MultitrackAudioEngine: ObservableObject {
         let frames60 = Float(max(0.25, min(4.0, dt * 60.0)))
         let trackAttack = 1.0 - powf(0.20, frames60)
         let trackDecay = powf(0.82, frames60)
-        let busDecay = powf(0.85, frames60)
         let masterAttack = 1.0 - powf(0.22, frames60)
         let masterDecay = powf(0.86, frames60)
 
@@ -1454,7 +1581,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                 continue
             }
             let (rawL, rawR) = trackPeaks[track.id] ?? (0.0, 0.0)
-            if rawL == 0.0 && rawR == 0.0 && track.peakLevelLeft == 0.0 && track.peakLevelRight == 0.0 {
+            if rawL == 0.0 && rawR == 0.0 && track.peakLevelLeft == 0.0 && track.peakLevelRight == 0.0 && track.meter.left == 0.0 && track.meter.right == 0.0 {
                 continue
             }
             
@@ -1476,30 +1603,10 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
         
         updateFlashingClickMeters(dt: dt)
+        updateGuideSubChannelMeters(dt: dt)
 
-        if mixerMode == .busses {
-            var busPeaks: [String: (left: Float, right: Float)] = [:]
-            for track in tracks {
-                let busName = track.assignedBusName
-                let cur = busPeaks[busName] ?? (0.0, 0.0)
-                busPeaks[busName] = (max(cur.left, track.peakLevelLeft), max(cur.right, track.peakLevelRight))
-            }
-            for bus in busses {
-                if let peaks = busPeaks[bus.name] {
-                    if bus.isMono {
-                        let monoPeak = max(peaks.left, peaks.right)
-                        bus.peakLevelLeft = max(monoPeak, bus.peakLevelLeft * busDecay)
-                        bus.peakLevelRight = bus.peakLevelLeft
-                    } else {
-                        bus.peakLevelLeft = max(peaks.left, bus.peakLevelLeft * busDecay)
-                        bus.peakLevelRight = max(peaks.right, bus.peakLevelRight * busDecay)
-                    }
-                } else {
-                    bus.peakLevelLeft = bus.peakLevelLeft < 0.003 ? 0.0 : bus.peakLevelLeft * busDecay
-                    bus.peakLevelRight = bus.peakLevelRight < 0.003 ? 0.0 : bus.peakLevelRight * busDecay
-                }
-                bus.meter.update(left: bus.peakLevelLeft, right: bus.peakLevelRight, dt: dt)
-            }
+        if mixerMode == .busses || remoteServer.connectedClientCount > 0 {
+            updateBusMeters(dt: dt)
         }
         
         let (rawMasterL, rawMasterR) = mixState.consumeMasterPeaks()
@@ -1521,6 +1628,72 @@ public final class MultitrackAudioEngine: ObservableObject {
     /// Refreshes Click channel and subdivision VU meters for the current playhead position.
     public func refreshClickMetersForCurrentPosition(dt: TimeInterval = 1.0 / 60.0) {
         updateFlashingClickMeters(dt: dt)
+    }
+
+    func updateGuideSubChannelMeters(dt: TimeInterval = 1.0 / 60.0) {
+        guard !currentSong.excludesClickAndGuide, playbackState == .playing else {
+            guideSectionsMeter.update(left: 0.0, right: 0.0, dt: dt)
+            guideDirectionsMeter.update(left: 0.0, right: 0.0, dt: dt)
+            guideFallbackMeter.update(left: 0.0, right: 0.0, dt: dt)
+            return
+        }
+        let guideTrack = tracks.first(where: { $0.isGuideTrackCached })
+        let guideL = guideTrack?.peakLevelLeft ?? 0.0
+        let guideR = guideTrack?.peakLevelRight ?? 0.0
+        let nowSec = (currentSong.guideSource == .generated)
+            ? playbackOffsetSeconds
+            : audioTime(forArrangementTime: playbackOffsetSeconds)
+        let events = guideCueMeterEvents[currentSong.id] ?? []
+
+        var sectionsActive = false
+        var directionsActive = false
+        var fallbackActive = false
+        for event in events where event.startTime <= nowSec && nowSec <= event.endTime + 0.03 {
+            if event.category == .sections { sectionsActive = true }
+            if event.category == .directions { directionsActive = true }
+            if event.usedFallback { fallbackActive = true }
+        }
+
+        guideSectionsMeter.update(left: sectionsActive ? guideL : 0.0, right: sectionsActive ? guideR : 0.0, dt: dt)
+        guideDirectionsMeter.update(left: directionsActive ? guideL : 0.0, right: directionsActive ? guideR : 0.0, dt: dt)
+        guideFallbackMeter.update(left: fallbackActive ? guideL : 0.0, right: fallbackActive ? guideR : 0.0, dt: dt)
+    }
+
+    func updateBusMeters(dt: TimeInterval = 1.0 / 60.0) {
+        let frames60 = Float(max(0.25, min(4.0, dt * 60.0)))
+        let busDecay = powf(0.85, frames60)
+
+        var busPeaks: [String: (left: Float, right: Float)] = [:]
+        for track in tracks {
+            let busKey = track.assignedBusName.lowercased()
+            let cur = busPeaks[busKey] ?? (0.0, 0.0)
+            busPeaks[busKey] = (max(cur.left, track.peakLevelLeft), max(cur.right, track.peakLevelRight))
+        }
+        if padMeterPeakL > 0.0 || padMeterPeakR > 0.0 {
+            let cur = busPeaks["pad"] ?? (0.0, 0.0)
+            busPeaks["pad"] = (max(cur.left, padMeterPeakL), max(cur.right, padMeterPeakR))
+        }
+
+        for bus in busses {
+            let busKey = bus.name.lowercased()
+            if let peaks = busPeaks[busKey] {
+                if bus.isMono {
+                    let monoPeak = max(peaks.left, peaks.right)
+                    let decayed = bus.peakLevelLeft * busDecay
+                    bus.peakLevelLeft = max(monoPeak, decayed < 0.003 ? 0.0 : decayed)
+                    bus.peakLevelRight = bus.peakLevelLeft
+                } else {
+                    let decayedL = bus.peakLevelLeft * busDecay
+                    let decayedR = bus.peakLevelRight * busDecay
+                    bus.peakLevelLeft = max(peaks.left, decayedL < 0.003 ? 0.0 : decayedL)
+                    bus.peakLevelRight = max(peaks.right, decayedR < 0.003 ? 0.0 : decayedR)
+                }
+            } else {
+                bus.peakLevelLeft = bus.peakLevelLeft < 0.003 ? 0.0 : bus.peakLevelLeft * busDecay
+                bus.peakLevelRight = bus.peakLevelRight < 0.003 ? 0.0 : bus.peakLevelRight * busDecay
+            }
+            bus.meter.update(left: bus.peakLevelLeft, right: bus.peakLevelRight, dt: dt)
+        }
     }
 
     func updateFlashingClickMeters(dt: TimeInterval = 1.0 / 60.0) {
@@ -1941,6 +2114,8 @@ public final class MultitrackAudioEngine: ObservableObject {
         tracks.removeAll()
         aggregateWaveform.removeAll()
         masterWaveformPeaks.removeAll()
+        soloWaveformPeaks = nil
+        lastSoloWaveformTrackIds = []
         renderedWaveformImage = nil
         waveformVersion &+= 1
         currentSongDuration = 0.0
@@ -1960,30 +2135,108 @@ public final class MultitrackAudioEngine: ObservableObject {
         syncMixState()
     }
     
-    // MARK: - Aggregate Waveform Calculation & Pre-Rendering (Excludes Click & Guide)
-    
-    public func recalculateAggregateWaveform(samplesCount: Int = 4000) {
-        // Exclude tracks that have includeInWaveform == false (Click, Guide, Tick, etc.)
-        let musicalStems = tracks.filter { $0.includeInWaveform }
-        guard !musicalStems.isEmpty else {
-            masterWaveformPeaks = []
-            aggregateWaveform = []
-            renderedWaveformImage = nil
-            waveformVersion &+= 1
+    // MARK: - Solo Waveform & Clear Solos
+
+    public var hasAnySolo: Bool {
+        tracks.contains(where: { $0.isSoloed }) ||
+        busses.contains(where: { $0.isSoloed }) ||
+        padChannelSoloed
+    }
+
+    public func clearAllSolos() {
+        guard hasAnySolo else { return }
+        for track in tracks where track.isSoloed {
+            track.isSoloed = false
+        }
+        for bus in busses where bus.isSoloed {
+            bus.isSoloed = false
+        }
+        if padChannelSoloed {
+            padChannelSoloed = false
+        }
+        markSessionChanged()
+        updateMatrix()
+    }
+
+    private func resolvedBusForWaveform(track: StemTrack) -> AudioBus? {
+        if let direct = busses.first(where: { $0.name.lowercased() == track.assignedBusName.lowercased() }) {
+            return direct
+        }
+        let autoBusName = StemTrack.autoAssignBus(for: track.name)
+        return busses.first(where: { $0.name.lowercased() == autoBusName.lowercased() })
+    }
+
+    func soloedMusicalWaveformTracks() -> [StemTrack] {
+        let eligible = tracks.filter { $0.includeInWaveform && !Self.isClickOrGuideTrack($0) }
+        guard !eligible.isEmpty else { return [] }
+
+        let directSoloed = eligible.filter { $0.isSoloed }
+        let soloedBusNames = Set(busses.filter { $0.isSoloed }.map { $0.name.lowercased() })
+        let busSoloed: [StemTrack] = soloedBusNames.isEmpty ? [] : eligible.filter { track in
+            guard let bus = resolvedBusForWaveform(track: track) else { return false }
+            return soloedBusNames.contains(bus.name.lowercased())
+        }
+
+        if !directSoloed.isEmpty && !busSoloed.isEmpty {
+            let directIds = Set(directSoloed.map { $0.id })
+            let intersection = busSoloed.filter { directIds.contains($0.id) }
+            if !intersection.isEmpty {
+                return intersection
+            }
+            let busIds = Set(busSoloed.map { $0.id })
+            return eligible.filter { directIds.contains($0.id) || busIds.contains($0.id) }
+        } else if !directSoloed.isEmpty {
+            return directSoloed
+        } else if !busSoloed.isEmpty {
+            return busSoloed
+        }
+        return []
+    }
+
+    public func refreshSoloWaveformIfNeeded(forceRecompute: Bool = false, triggerArrangementUpdate: Bool = true) {
+        let soloedStems = soloedMusicalWaveformTracks()
+        for stem in soloedStems where stem.waveformPeaks.isEmpty {
+            if let buf = pristineMasterBuffers[stem.id] ?? channels[stem.id]?.buffer, buf.frameLength > 100 {
+                stem.waveformPeaks = extractWaveformPeaks(from: buf, samplesCount: 4000)
+            }
+        }
+        let stemsWithPeaks = soloedStems.filter { !$0.waveformPeaks.isEmpty }
+        let targetIds = stemsWithPeaks.map { $0.id }
+
+        if !forceRecompute && targetIds == lastSoloWaveformTrackIds {
             return
         }
-        
-        let musicalMaxDuration = musicalStems.map { $0.duration }.max() ?? 0.0
+        lastSoloWaveformTrackIds = targetIds
+
+        if stemsWithPeaks.isEmpty {
+            let wasShowingSolo = (soloWaveformPeaks != nil)
+            soloWaveformPeaks = nil
+            if triggerArrangementUpdate && (wasShowingSolo || forceRecompute) {
+                updateArrangementWaveform()
+            }
+            return
+        }
+
+        let musicalMaxDuration = tracks.filter { $0.includeInWaveform && !Self.isClickOrGuideTrack($0) }.map { $0.duration }.max() ?? 0.0
         let fallbackDuration = tracks.map { $0.duration }.max() ?? currentSongDuration
         let masterDuration = max(0.01, musicalMaxDuration > 0.01 ? musicalMaxDuration : fallbackDuration)
+        soloWaveformPeaks = combineWaveformPeaks(for: stemsWithPeaks, masterDuration: masterDuration, samplesCount: 4000)
+        if triggerArrangementUpdate {
+            updateArrangementWaveform()
+        }
+    }
+
+    private func combineWaveformPeaks(for stems: [StemTrack], masterDuration: TimeInterval, samplesCount: Int = 4000) -> [Float] {
+        guard !stems.isEmpty, samplesCount > 0 else { return [] }
+        let safeMasterDuration = max(0.01, masterDuration)
         var combined = Array(repeating: Float(0.0), count: samplesCount)
-        for stem in musicalStems {
+        for stem in stems {
             let peaks = stem.waveformPeaks
             guard !peaks.isEmpty else { continue }
-            let stemDuration = stem.duration > 0 ? stem.duration : masterDuration
-            let durationRatio = masterDuration / max(0.01, stemDuration)
+            let stemDuration = stem.duration > 0 ? stem.duration : safeMasterDuration
+            let durationRatio = safeMasterDuration / max(0.01, stemDuration)
             let maxPeakIndex = peaks.count - 1
-            
+
             for i in 0..<samplesCount {
                 let songProgress = Double(i) / Double(max(1, samplesCount - 1))
                 let stemProgress = songProgress * durationRatio
@@ -1993,19 +2246,41 @@ public final class MultitrackAudioEngine: ObservableObject {
                 }
             }
         }
-        
+
         let maxVal = combined.max() ?? 1.0
-        let normPeaks: [Float]
         if maxVal > 0.01 {
-            normPeaks = combined.map { peak in
+            return combined.map { peak in
                 let norm = peak / maxVal
                 return min(1.0, pow(norm, 0.72))
             }
         } else {
-            normPeaks = combined
+            return combined
+        }
+    }
+
+    // MARK: - Aggregate Waveform Calculation & Pre-Rendering (Excludes Click & Guide)
+    
+    public func recalculateAggregateWaveform(samplesCount: Int = 4000) {
+        // Exclude tracks that have includeInWaveform == false (Click, Guide, Tick, etc.)
+        let musicalStems = tracks.filter { $0.includeInWaveform }
+        guard !musicalStems.isEmpty else {
+            masterWaveformPeaks = []
+            soloWaveformPeaks = nil
+            lastSoloWaveformTrackIds = []
+            aggregateWaveform = []
+            renderedWaveformImage = nil
+            waveformVersion &+= 1
+            return
         }
         
-        masterWaveformPeaks = normPeaks
+        let musicalMaxDuration = musicalStems.map { $0.duration }.max() ?? 0.0
+        let fallbackDuration = tracks.map { $0.duration }.max() ?? currentSongDuration
+        let masterDuration = max(0.01, musicalMaxDuration > 0.01 ? musicalMaxDuration : fallbackDuration)
+        masterWaveformPeaks = combineWaveformPeaks(for: musicalStems, masterDuration: masterDuration, samplesCount: samplesCount)
+        if !masterWaveformPeaks.isEmpty {
+            songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+        }
+        refreshSoloWaveformIfNeeded(forceRecompute: true, triggerArrangementUpdate: false)
         updateArrangementWaveform()
     }
     
@@ -2013,7 +2288,9 @@ public final class MultitrackAudioEngine: ObservableObject {
     
     /// Re-renders the aggregate waveform reflecting the current active arrangement
     public func updateArrangementWaveform() {
-        guard !masterWaveformPeaks.isEmpty else {
+        let isShowingSoloWaveform = (soloWaveformPeaks != nil)
+        let sourcePeaks = soloWaveformPeaks ?? masterWaveformPeaks
+        guard !sourcePeaks.isEmpty else {
             renderedWaveformImage = nil
             aggregateWaveform = []
             waveformVersion &+= 1
@@ -2024,7 +2301,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         let fallbackDuration = tracks.map { $0.duration }.max() ?? currentSongDuration
         let masterDuration = musicalMaxDuration > 0.01 ? musicalMaxDuration : fallbackDuration
         guard masterDuration > 0 else {
-            aggregateWaveform = masterWaveformPeaks
+            aggregateWaveform = sourcePeaks
             renderedWaveformImage = nil
             waveformVersion &+= 1
             return
@@ -2041,9 +2318,11 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         // Fast zero-drift path when in edit mode with linear sequence (so full waveform is displayed!)
         if inEditMode && isLinearSequence && abs(fullDuration - masterDuration) < 0.05 {
-            aggregateWaveform = masterWaveformPeaks
+            aggregateWaveform = sourcePeaks
             renderedWaveformImage = nil
-            songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+            if !isShowingSoloWaveform && !masterWaveformPeaks.isEmpty {
+                songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+            }
             waveformVersion &+= 1
             return
         }
@@ -2053,14 +2332,16 @@ public final class MultitrackAudioEngine: ObservableObject {
         
         // Fast zero-drift path when sections have not been non-destructively rearranged or trimmed
         if !inEditMode && isLinearUnmodifiedArrangement {
-            aggregateWaveform = masterWaveformPeaks
+            aggregateWaveform = sourcePeaks
             renderedWaveformImage = nil
-            songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+            if !isShowingSoloWaveform && !masterWaveformPeaks.isEmpty {
+                songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+            }
             waveformVersion &+= 1
             return
         }
         
-        let masterCount = masterWaveformPeaks.count
+        let masterCount = sourcePeaks.count
         guard masterCount > 1, fullDuration > 0 else { return }
         
         let targetSamples = 4000
@@ -2075,7 +2356,9 @@ public final class MultitrackAudioEngine: ObservableObject {
         for i in 0..<targetSamples {
             let arrTime = (Double(i) / Double(max(1, targetSamples - 1))) * fullDuration
             if let clickSec = sorted.first(where: { $0.effectiveIsClickSection && arrTime >= $0.startTime && arrTime < $0.endTime }) {
-                if !clickPeaks.isEmpty && clickPeakMax > 0.02 {
+                if isShowingSoloWaveform {
+                    arrangedPeaks[i] = 0.0
+                } else if !clickPeaks.isEmpty && clickPeakMax > 0.02 {
                     let cFrac = max(0.0, min(1.0, arrTime / max(0.01, masterDuration)))
                     let cIdx = min(clickPeaks.count - 1, max(0, Int(round(cFrac * Double(clickPeaks.count - 1)))))
                     arrangedPeaks[i] = min(1.0, (clickPeaks[cIdx] / clickPeakMax) * 0.72)
@@ -2099,14 +2382,16 @@ public final class MultitrackAudioEngine: ObservableObject {
             let lowIdx = Int(floor(masterPos))
             let highIdx = min(masterCount - 1, lowIdx + 1)
             let frac = Float(masterPos - Double(lowIdx))
-            let p0 = masterWaveformPeaks[max(0, min(masterCount - 1, lowIdx))]
-            let p1 = masterWaveformPeaks[highIdx]
+            let p0 = sourcePeaks[max(0, min(masterCount - 1, lowIdx))]
+            let p1 = sourcePeaks[highIdx]
             arrangedPeaks[i] = p0 * (1.0 - frac) + p1 * frac
         }
         
         aggregateWaveform = arrangedPeaks
         renderedWaveformImage = nil
-        songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+        if !isShowingSoloWaveform && !masterWaveformPeaks.isEmpty {
+            songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+        }
         waveformVersion &+= 1
     }
     
@@ -2483,6 +2768,7 @@ public final class MultitrackAudioEngine: ObservableObject {
             syncMixState()
         }
         saveBusRouting(for: deviceManager.selectedDevice)
+        refreshSoloWaveformIfNeeded()
         objectWillChange.send()
     }
     
@@ -2580,17 +2866,21 @@ public final class MultitrackAudioEngine: ObservableObject {
         if let timelineMarker = matchedMarker {
             bar = timelineMarker.bar
             beat = timelineMarker.beat
-            liveBPM = currentSong.activeMarker(at: sourceSec)?.instantaneousBPM ?? timelineMarker.instantaneousBPM
+            liveBPM = !currentSong.tempoEvents.isEmpty
+                ? currentSong.evaluateBPM(atSourceTime: sourceSec)
+                : (currentSong.activeMarker(at: sourceSec)?.instantaneousBPM ?? timelineMarker.instantaneousBPM)
         } else if let timelineMarker = currentSong.activeMarker(at: seconds) {
             bar = timelineMarker.bar
             beat = timelineMarker.beat
-            liveBPM = currentSong.activeMarker(at: sourceSec)?.instantaneousBPM ?? timelineMarker.instantaneousBPM
+            liveBPM = !currentSong.tempoEvents.isEmpty
+                ? currentSong.evaluateBPM(atSourceTime: sourceSec)
+                : (currentSong.activeMarker(at: sourceSec)?.instantaneousBPM ?? timelineMarker.instantaneousBPM)
         } else {
             let secondsPerBeat = (60.0 / max(20.0, bpm)) * (4.0 / Double(max(1, tsDen)))
             let totalBeats = Int(seconds / secondsPerBeat)
             bar = (totalBeats / max(1, tsNum)) + 1
             beat = (totalBeats % max(1, tsNum)) + 1
-            liveBPM = bpm
+            liveBPM = !currentSong.tempoEvents.isEmpty ? currentSong.evaluateBPM(atSourceTime: sourceSec) : bpm
         }
         
         let secIdx = currentSong.sections.firstIndex(where: { seconds >= $0.startTime && seconds < $0.endTime }) ?? 0
@@ -2610,14 +2900,18 @@ public final class MultitrackAudioEngine: ObservableObject {
         transportDisplayClock.update(with: updated)
     }
     
-    func resetPeakLevels() {
-        for track in tracks {
+    func resetTrackMeters(_ targetTracks: [StemTrack]) {
+        for track in targetTracks {
             track.peakLevelLeft = 0.0
             track.peakLevelRight = 0.0
             track.rawPeakL = 0.0
             track.rawPeakR = 0.0
             track.meter.reset()
         }
+    }
+
+    func resetPeakLevels() {
+        resetTrackMeters(tracks)
         for bus in busses {
             bus.peakLevelLeft = 0.0
             bus.peakLevelRight = 0.0

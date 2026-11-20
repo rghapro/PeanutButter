@@ -753,13 +753,25 @@ public struct SongBuilderView: View {
         let gridDownbeats = hasDynamicGrid ? srcGrid.filter { $0.isDownbeat } : []
         let secPerBeat = (60.0 / activeBPM) * (4.0 / Double(max(1, timeSigDen)))
         let secPerMeasure = secPerBeat * Double(timeSigNum)
+        let preserveStemTimings = !isCreatingNewSong && engine.tracks.contains(where: { $0.role == .stem })
         var currentTime: TimeInterval = 0.0
         var currentMeasure = 1
         
         var updated: [SongSection] = []
         for sec in sections {
+            var newSec = sec
             let dur: TimeInterval
-            if !gridDownbeats.isEmpty && currentMeasure - 1 < gridDownbeats.count {
+            if preserveStemTimings {
+                dur = sec.duration > 0.05 ? sec.duration : (Double(max(1, sec.measureCount)) * secPerMeasure)
+                newSec.measureCount = Song.measureCount(
+                    inSourceGrid: srcGrid,
+                    audioStart: sec.sourceAudioStartTime,
+                    duration: dur,
+                    fallbackBPM: activeBPM,
+                    timeSignatureNumerator: timeSigNum,
+                    timeSignatureDenominator: timeSigDen
+                )
+            } else if !gridDownbeats.isEmpty && currentMeasure - 1 < gridDownbeats.count {
                 let startDbIdx = currentMeasure - 1
                 let endDbIdx = startDbIdx + sec.measureCount
                 if endDbIdx < gridDownbeats.count {
@@ -772,13 +784,12 @@ public struct SongBuilderView: View {
             } else {
                 dur = Double(sec.measureCount) * secPerMeasure
             }
-            var newSec = sec
             newSec.startTime = currentTime
             newSec.duration = dur
             newSec.startMeasure = currentMeasure
             updated.append(newSec)
             currentTime += dur
-            currentMeasure += sec.measureCount
+            currentMeasure += newSec.measureCount
         }
         self.sections = updated
     }
@@ -928,6 +939,7 @@ public struct SongBuilderView: View {
                 musicalKey: musicalKey,
                 sections: sections,
                 timeSignatureChanges: engine.currentSong.timeSignatureChanges,
+                tempoEvents: engine.currentSong.tempoEvents,
                 beatGrid: [],
                 startPadWithSong: engine.isGlobalStartPadWithSongEnabled,
                 padPresetId: PadLibraryManager.shared.activePackId,

@@ -31,6 +31,7 @@ extension MultitrackAudioEngine {
             precomputedDownbeatMarkers = downbeats
             precomputedSubdivisionMarkers = subs
         }
+        beatGridVersion &+= 1
     }
 
     public func rebuildCachedActiveAutomation() {
@@ -1513,6 +1514,9 @@ extension MultitrackAudioEngine {
     }
     
     public func setGuideSource(_ source: GuideSource) {
+        if currentSong.guideSource != source {
+            guideSoloedSubChannels.removeAll()
+        }
         currentSong.excludesClickAndGuide = false
         currentSong.guideSource = source
         if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {
@@ -1575,18 +1579,76 @@ extension MultitrackAudioEngine {
             }
         } else {
             if let upBuf = uploadedGuideBuffers[currentSong.id] {
-                let finalBuf: AVAudioPCMBuffer
-                let activeDirCues = currentSong.directionalCues.filter { !isDirectionalCueTrimmedOut($0) }
-                if currentSong.speakDirectionalCuesOnUploadedGuide && !activeDirCues.isEmpty {
-                    finalBuf = guideAudioGenerator.overlayDirectionalCues(
-                        onto: upBuf,
-                        directionalCues: activeDirCues,
-                        voice: .rita, // directional cues default to Rita, with macOS TTS fallback
-                        fallbackVoice: currentSong.guideFallbackVoice
-                    )
+                var finalBuf: AVAudioPCMBuffer
+                if guideSoloedSubChannels.isEmpty {
+                    finalBuf = upBuf
+                } else if let silentBase = AVAudioPCMBuffer(pcmFormat: upBuf.format, frameCapacity: upBuf.frameLength) {
+                    silentBase.frameLength = upBuf.frameLength
+                    for ch in 0..<Int(upBuf.format.channelCount) {
+                        if let ptr = silentBase.floatChannelData?[ch] {
+                            memset(ptr, 0, Int(upBuf.frameLength) * MemoryLayout<Float>.size)
+                        }
+                    }
+                    finalBuf = silentBase
                 } else {
                     finalBuf = upBuf
                 }
+                var overlayMeterEvents: [GuideCueMeterEvent] = []
+                let activeDirCues = currentSong.directionalCues.filter { !isDirectionalCueTrimmedOut($0) }
+                if currentSong.speakDirectionalCuesOnUploadedGuide && !activeDirCues.isEmpty {
+                    let dirRes = guideAudioGenerator.overlayDirectionalCuesWithMeterEvents(
+                        onto: finalBuf,
+                        directionalCues: activeDirCues,
+                        voice: .rita, // directional cues default to Rita, with macOS TTS fallback
+                        fallbackVoice: currentSong.guideFallbackVoice,
+                        cueVolume: currentSong.guideDirectionsVolume,
+                        cueEnabled: currentSong.guideDirectionsEnabled,
+                        fallbackVolume: currentSong.guideFallbackVolume,
+                        fallbackEnabled: currentSong.guideFallbackEnabled,
+                        soloedSubChannels: guideSoloedSubChannels
+                    )
+                    finalBuf = dirRes.buffer
+                    overlayMeterEvents.append(contentsOf: dirRes.meterEvents)
+                }
+                let durationToUse: TimeInterval = {
+                    if !currentSong.sections.isEmpty {
+                        return currentSong.sections.map { $0.endTime }.max() ?? currentSongDuration
+                    }
+                    return currentSongDuration > 0 ? currentSongDuration : (tracks.map { $0.duration }.max() ?? 240.0)
+                }()
+                let sortedSecs = currentSong.sections.sorted { $0.startTime < $1.startTime }
+                let isLastLooped = isLoopActive && (loopedSection?.id == sortedSecs.last?.id) &&
+                    (loopMode == .infinite || (loopMode == .single && singleLoopRemaining > 0))
+                if !isLastLooped,
+                   queuedNextSection == nil,
+                   let nextCue = resolvedNextSongSectionCue(forSongAt: currentSongIndex, song: currentSong, duration: durationToUse) {
+                    let arrangementBeatTimes = guideAudioGenerator.cueMeasureTimestamps(
+                        before: nextCue.targetTime,
+                        beatGrid: currentSong.effectiveBeatGrid(totalDuration: durationToUse),
+                        bpm: currentSong.bpm,
+                        timeSignatureNumerator: currentSong.timeSignatureNumerator,
+                        timeSignatureDenominator: currentSong.timeSignatureDenominator
+                    )
+                    if !arrangementBeatTimes.isEmpty && (arrangementBeatTimes.last ?? 0.0) < nextCue.targetTime - 0.02 {
+                        let sourceBeatTimes = arrangementBeatTimes.map { audioTime(forArrangementTime: $0) }
+                        let secRes = guideAudioGenerator.overlaySectionCueWithMeterEvents(
+                            onto: finalBuf,
+                            targetSection: nextCue.section,
+                            beatTimes: sourceBeatTimes,
+                            voice: currentSong.guideVoice,
+                            fallbackVoice: currentSong.guideFallbackVoice,
+                            countInEnabled: currentSong.guideCountInEnabled,
+                            cueVolume: currentSong.guideDirectionsVolume,
+                            cueEnabled: currentSong.guideDirectionsEnabled,
+                            fallbackVolume: currentSong.guideFallbackVolume,
+                            fallbackEnabled: currentSong.guideFallbackEnabled,
+                            soloedSubChannels: guideSoloedSubChannels
+                        )
+                        finalBuf = secRes.buffer
+                        overlayMeterEvents.append(contentsOf: secRes.meterEvents)
+                    }
+                }
+                guideCueMeterEvents[currentSong.id] = overlayMeterEvents
                 track.duration = Double(finalBuf.frameLength) / finalBuf.format.sampleRate
                 if let ch = channels[track.id] {
                     ch.buffer = finalBuf
@@ -1752,6 +1814,87 @@ extension MultitrackAudioEngine {
             clickSoloedSubdivisions.insert(subdivision)
         }
         regenerateClickTrack()
+    }
+
+    // MARK: - Guide Sub-Channel Levels, Mute & Solo
+
+    private func refreshGuideForSubChannelChange() {
+        if currentSong.guideSource == .generated {
+            regenerateGuideTrack()
+        } else {
+            applyGuideBuffer()
+            objectWillChange.send()
+        }
+    }
+
+    public func setGuideSubChannelVolume(channel: GuideSubChannel, volume: Float, commit: Bool = true) {
+        let clamped = max(0.0, min(1.0, volume))
+        switch channel {
+        case .sections:
+            currentSong.guideSectionsVolume = clamped
+            currentSong.guideSectionsEnabled = (clamped > 0.001)
+        case .directions:
+            currentSong.guideDirectionsVolume = clamped
+            currentSong.guideDirectionsEnabled = (clamped > 0.001)
+        case .fallback:
+            currentSong.guideFallbackVolume = clamped
+            currentSong.guideFallbackEnabled = (clamped > 0.001)
+        }
+        if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {
+            currentSetlist.songs[currentSongIndex].guideSectionsVolume = currentSong.guideSectionsVolume
+            currentSetlist.songs[currentSongIndex].guideSectionsEnabled = currentSong.guideSectionsEnabled
+            currentSetlist.songs[currentSongIndex].guideDirectionsVolume = currentSong.guideDirectionsVolume
+            currentSetlist.songs[currentSongIndex].guideDirectionsEnabled = currentSong.guideDirectionsEnabled
+            currentSetlist.songs[currentSongIndex].guideFallbackVolume = currentSong.guideFallbackVolume
+            currentSetlist.songs[currentSongIndex].guideFallbackEnabled = currentSong.guideFallbackEnabled
+        }
+        if commit {
+            markSessionChanged()
+            refreshGuideForSubChannelChange()
+        }
+    }
+
+    /// Toggles mute/unmute for a single Guide sub-channel in the Guide Tray while preserving its fader level.
+    public func toggleGuideSubChannelMute(_ channel: GuideSubChannel) {
+        switch channel {
+        case .sections:
+            let nextEnabled = !currentSong.guideSectionsEnabled
+            currentSong.guideSectionsEnabled = nextEnabled
+            if nextEnabled && currentSong.guideSectionsVolume <= 0.001 {
+                currentSong.guideSectionsVolume = 0.80
+            }
+        case .directions:
+            let nextEnabled = !currentSong.guideDirectionsEnabled
+            currentSong.guideDirectionsEnabled = nextEnabled
+            if nextEnabled && currentSong.guideDirectionsVolume <= 0.001 {
+                currentSong.guideDirectionsVolume = 0.80
+            }
+        case .fallback:
+            let nextEnabled = !currentSong.guideFallbackEnabled
+            currentSong.guideFallbackEnabled = nextEnabled
+            if nextEnabled && currentSong.guideFallbackVolume <= 0.001 {
+                currentSong.guideFallbackVolume = 0.80
+            }
+        }
+        if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {
+            currentSetlist.songs[currentSongIndex].guideSectionsVolume = currentSong.guideSectionsVolume
+            currentSetlist.songs[currentSongIndex].guideSectionsEnabled = currentSong.guideSectionsEnabled
+            currentSetlist.songs[currentSongIndex].guideDirectionsVolume = currentSong.guideDirectionsVolume
+            currentSetlist.songs[currentSongIndex].guideDirectionsEnabled = currentSong.guideDirectionsEnabled
+            currentSetlist.songs[currentSongIndex].guideFallbackVolume = currentSong.guideFallbackVolume
+            currentSetlist.songs[currentSongIndex].guideFallbackEnabled = currentSong.guideFallbackEnabled
+        }
+        markSessionChanged()
+        refreshGuideForSubChannelChange()
+    }
+
+    public func toggleGuideSubChannelSolo(_ channel: GuideSubChannel) {
+        if guideSoloedSubChannels.contains(channel) {
+            guideSoloedSubChannels.remove(channel)
+        } else {
+            guideSoloedSubChannels.insert(channel)
+        }
+        refreshGuideForSubChannelChange()
     }
     
     public func setClickSound(_ sound: ClickSoundType) {
@@ -1950,15 +2093,17 @@ extension MultitrackAudioEngine {
         let lMode: LoopMode = loopAct ? self.loopMode : .none
         let singleRem = (loopAct && lMode == .single) ? self.singleLoopRemaining : 0
         let queuedSec = self.queuedNextSection
+        let nextCue = resolvedNextSongSectionCue(forSongAt: currentSongIndex, song: currentSong, duration: durationToUse)
         
         let activeDirectionalCues = currentSong.directionalCues.filter { !isDirectionalCueTrimmedOut($0) }
+        let guideSoloed = self.guideSoloedSubChannels
         isGeneratingGuide = true
         updateGenerationStatus()
         objectWillChange.send()
         
         Task {
-            let genBuf = await Task.detached(priority: .userInitiated) { [currentSong = self.currentSong, activeDirectionalCues, canonicalFormat, durationToUse, loopAct, loopedSec, lMode, singleRem, queuedSec] in
-                return GuideAudioGenerator.shared.generateGuideBuffer(
+            let genResult = await Task.detached(priority: .userInitiated) { [currentSong = self.currentSong, activeDirectionalCues, canonicalFormat, durationToUse, loopAct, loopedSec, lMode, singleRem, queuedSec, nextCue, guideSoloed] in
+                return GuideAudioGenerator.shared.generateGuideBufferWithMeterEvents(
                     sections: currentSong.sections,
                     directionalCues: activeDirectionalCues,
                     bpm: currentSong.bpm,
@@ -1974,6 +2119,15 @@ extension MultitrackAudioEngine {
                     isLoopActive: loopAct,
                     loopMode: lMode,
                     singleLoopRemaining: singleRem,
+                    nextSongFirstSection: nextCue?.section,
+                    nextSongCueTargetTime: nextCue?.targetTime,
+                    sectionsVolume: currentSong.guideSectionsVolume,
+                    sectionsEnabled: currentSong.guideSectionsEnabled,
+                    directionsVolume: currentSong.guideDirectionsVolume,
+                    directionsEnabled: currentSong.guideDirectionsEnabled,
+                    fallbackVolume: currentSong.guideFallbackVolume,
+                    fallbackEnabled: currentSong.guideFallbackEnabled,
+                    soloedSubChannels: guideSoloed,
                     format: canonicalFormat
                 )
             }.value
@@ -1982,13 +2136,14 @@ extension MultitrackAudioEngine {
                 if regenGen == self.guideRegenerationGeneration {
                     self.isGeneratingGuide = false
                 }
-                if let buf = genBuf {
+                if let res = genResult {
                     if self.currentSong.id == currentSong.id {
                         if regenGen == self.guideRegenerationGeneration &&
                            !self.currentSong.excludesClickAndGuide &&
                            self.currentLiveGuideLoopState() == targetGuideState {
-                            self.generatedGuideBuffers[currentSong.id] = buf
+                            self.generatedGuideBuffers[currentSong.id] = res.buffer
                             self.generatedGuideLoopStates[currentSong.id] = targetGuideState
+                            self.guideCueMeterEvents[currentSong.id] = res.meterEvents
                             if self.uploadedGuideBuffers[currentSong.id] == nil {
                                 self.currentSong.guideSource = .generated
                             }
@@ -1996,9 +2151,10 @@ extension MultitrackAudioEngine {
                         }
                     } else if let idx = self.currentSetlist.songs.firstIndex(where: { $0.id == currentSong.id }),
                               !self.currentSetlist.songs[idx].excludesClickAndGuide,
-                              targetGuideState == Self.defaultGuideLoopState(for: self.currentSetlist.songs[idx]) {
-                        self.generatedGuideBuffers[currentSong.id] = buf
+                              targetGuideState == self.expectedDefaultGuideLoopState(forSongAt: idx, song: self.currentSetlist.songs[idx], duration: durationToUse) {
+                        self.generatedGuideBuffers[currentSong.id] = res.buffer
                         self.generatedGuideLoopStates[currentSong.id] = targetGuideState
+                        self.guideCueMeterEvents[currentSong.id] = res.meterEvents
                     }
                 }
                 self.updateGenerationStatus()

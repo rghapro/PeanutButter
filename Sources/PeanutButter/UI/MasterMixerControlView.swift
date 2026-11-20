@@ -25,8 +25,33 @@ public struct MasterMixerControlView: View {
     
     public var body: some View {
         HStack(spacing: 6) {
-            // 1. Vertical Action Toolbar (Mixer, Buses, Pad Player, Mute MIDI, Loop, Link)
+            // 1. Vertical Action Toolbar (Clear Solos, Mixer, Buses, Pad Player, Mute MIDI, Loop)
             VStack(spacing: 10) {
+                if engine.hasAnySolo {
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            engine.clearAllSolos()
+                        }
+                    }) {
+                        VStack(spacing: 1.5) {
+                            Text("CLEAR")
+                                .font(.system(size: 10, weight: .black))
+                            Text("SOLOS")
+                                .font(.system(size: 9, weight: .black))
+                        }
+                        .foregroundColor(Color(red: 0.98, green: 0.72, blue: 0.12))
+                        .frame(width: 54, height: 42)
+                        .background(Color(red: 0.98, green: 0.72, blue: 0.12).opacity(0.22))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color(red: 0.98, green: 0.72, blue: 0.12), lineWidth: 1.5)
+                        )
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear all soloed tracks and busses")
+                }
+
                 // Tracks / Mixer Mode Button
                 MIDIMappableButton(targetId: "faders_button", isMappingMode: engine.isEditMIDIMappingMode, action: {
                     withAnimation(.easeInOut(duration: 0.15)) {
