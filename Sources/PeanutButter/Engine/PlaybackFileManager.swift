@@ -1150,6 +1150,34 @@ public final class PlaybackFileManager: @unchecked Sendable {
         }
     }
     
+    public func hasTransposedBuffersOnDisk(
+        songId: UUID,
+        semitones: Int,
+        preserveVocalFormants: Bool = true,
+        bpm: Double? = nil,
+        originalBPM: Double? = nil,
+        trackIds: [UUID]
+    ) -> Bool {
+        let tempoChanged = (bpm != nil && originalBPM != nil && abs(bpm! - originalBPM!) > 0.005)
+        guard (semitones != 0 || tempoChanged), !trackIds.isEmpty else { return false }
+        let dir = transposedStemCacheDirectory(
+            songId: songId,
+            semitones: semitones,
+            preserveVocalFormants: preserveVocalFormants,
+            bpm: bpm,
+            originalBPM: originalBPM
+        )
+        let fm = FileManager.default
+        for trackId in trackIds {
+            let wavURL = dir.appendingPathComponent("\(trackId.uuidString).wav")
+            let m4aURL = dir.appendingPathComponent("\(trackId.uuidString).m4a")
+            if !fm.fileExists(atPath: wavURL.path) && !fm.fileExists(atPath: m4aURL.path) {
+                return false
+            }
+        }
+        return true
+    }
+
     public func loadTransposedBuffersFromDisk(
         songId: UUID,
         semitones: Int,
@@ -1157,8 +1185,10 @@ public final class PlaybackFileManager: @unchecked Sendable {
         bpm: Double? = nil,
         originalBPM: Double? = nil,
         trackIds: [UUID],
-        canonicalFormat: AVAudioFormat
+        canonicalFormat: AVAudioFormat,
+        isCancelled: (() -> Bool)? = nil
     ) -> [UUID: AVAudioPCMBuffer]? {
+        if isCancelled?() == true { return nil }
         let tempoChanged = (bpm != nil && originalBPM != nil && abs(bpm! - originalBPM!) > 0.005)
         guard (semitones != 0 || tempoChanged), !trackIds.isEmpty else { return nil }
         let dir = transposedStemCacheDirectory(
@@ -1173,6 +1203,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
         var resolvedURLs: [URL] = []
         resolvedURLs.reserveCapacity(count)
         for trackId in trackIds {
+            if isCancelled?() == true { return nil }
             let wavURL = dir.appendingPathComponent("\(trackId.uuidString).wav")
             let m4aURL = dir.appendingPathComponent("\(trackId.uuidString).m4a")
             if fm.fileExists(atPath: wavURL.path) {
@@ -1190,13 +1221,16 @@ public final class PlaybackFileManager: @unchecked Sendable {
             box.deallocate()
         }
         DispatchQueue.concurrentPerform(iterations: count) { idx in
+            if isCancelled?() == true { return }
             let fileURL = resolvedURLs[idx]
             guard let raw = try? self.readPCMBuffer(from: fileURL), raw.frameLength > 100 else {
                 try? FileManager.default.removeItem(at: fileURL)
                 return
             }
+            if isCancelled?() == true { return }
             box[idx] = Self.normalizeBuffer(raw, to: canonicalFormat)
         }
+        if isCancelled?() == true { return nil }
         var result: [UUID: AVAudioPCMBuffer] = [:]
         result.reserveCapacity(count)
         for idx in 0..<count {
@@ -3221,6 +3255,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
         rootFolder: URL,
         canonicalFormat: AVAudioFormat?,
         localLibraryIndex: [LocalLibrarySongEntry]? = nil,
+        keepPCMInMemory: Bool = true,
         isCancelled: (() -> Bool)? = nil,
         progressHandler: ((Int, Int) -> Void)? = nil
     ) -> (tracks: [(StemTrack, AVAudioPCMBuffer)], transposedBuffers: [UUID: AVAudioPCMBuffer]) {
@@ -3233,6 +3268,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             canonicalFormat: canonicalFormat,
             preloadedPeaksByTrackId: preloadedPeaks,
             localLibraryIndex: localLibraryIndex,
+            keepPCMInMemory: keepPCMInMemory,
             isCancelled: isCancelled,
             progressHandler: progressHandler
         )
@@ -3293,6 +3329,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
         canonicalFormat: AVAudioFormat?,
         preloadedPeaksByTrackId: [UUID: [Float]] = [:],
         localLibraryIndex: [LocalLibrarySongEntry]? = nil,
+        keepPCMInMemory: Bool = true,
         isCancelled: (() -> Bool)? = nil,
         progressHandler: ((Int, Int) -> Void)? = nil
     ) -> (song: Song, tracks: [(StemTrack, AVAudioPCMBuffer)], transposedBuffers: [UUID: AVAudioPCMBuffer]) {
@@ -3412,6 +3449,62 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     return
                 }
                 
+                let tempoChanged = abs(songEntry.bpm - songEntry.originalBPM) > 0.005
+                if !keepPCMInMemory {
+                    if !tempoChanged,
+                       let transRel = tm.relativeTransposedAudioPath,
+                       !transRel.isEmpty,
+                       tm.transposedSemitones == songEntry.transposeSemitones,
+                       let transAudioURL = self.resolvePackageStemURL(relativePath: transRel, rootFolder: rootFolder),
+                       fm.fileExists(atPath: transAudioURL.path) {
+                        let ext = transAudioURL.pathExtension.isEmpty ? "m4a" : transAudioURL.pathExtension.lowercased()
+                        let cacheDir = self.transposedStemCacheDirectory(
+                            songId: songEntry.id,
+                            semitones: songEntry.transposeSemitones,
+                            preserveVocalFormants: songEntry.preserveVocalFormants,
+                            bpm: songEntry.bpm,
+                            originalBPM: songEntry.originalBPM
+                        )
+                        let destTransURL = cacheDir.appendingPathComponent("\(tm.id.uuidString).\(ext)")
+                        if !fm.fileExists(atPath: destTransURL.path) {
+                            try? fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+                            try? self.linkOrCopyFile(from: transAudioURL, to: destTransURL)
+                        }
+                    }
+
+                    var cacheReady = self.hasValidCachedStem(for: tm.id)
+                    if !cacheReady && sourceAudioURL.pathExtension.lowercased() == "m4a" && fm.fileExists(atPath: sourceAudioURL.path) {
+                        try? fm.createDirectory(at: self.stemCacheDirectory, withIntermediateDirectories: true)
+                        try? self.linkOrCopyFile(from: sourceAudioURL, to: cachedURL)
+                        cacheReady = self.hasValidCachedStem(for: tm.id)
+                    }
+                    if cacheReady {
+                        guard let tinyBuf = AVAudioPCMBuffer(pcmFormat: fallbackFormat, frameCapacity: 1) else { return }
+                        tinyBuf.frameLength = 1
+                        let fallbackSongDur = songEntry.sections.map { $0.endTime }.max() ?? 0.0
+                        let stemTrack = StemTrack(
+                            id: tm.id,
+                            name: tm.name,
+                            role: tm.role,
+                            fileURL: cachedURL,
+                            sourceFileURL: tm.sourceFilePath.map { URL(fileURLWithPath: $0) }
+                                ?? self.lookupLocalLosslessSourceURL(for: tm.id),
+                            volume: tm.volume,
+                            pan: tm.pan,
+                            isMuted: tm.isMuted,
+                            isSoloed: tm.isSoloed,
+                            isSoloSafe: tm.isSoloSafe,
+                            routing: tm.routing,
+                            assignedBusName: tm.assignedBusName,
+                            includeInWaveform: tm.includeInWaveform
+                        )
+                        stemTrack.duration = (tm.duration ?? 0.0) > 0 ? (tm.duration ?? fallbackSongDur) : fallbackSongDur
+                        stemTrack.waveformPeaks = preloadedPeaksByTrackId[tm.id] ?? TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
+                        decodedBox[idx] = DecodedTrackItem(track: stemTrack, buffer: tinyBuf, persistentURL: cachedURL, transposedBuffer: nil)
+                        return
+                    }
+                }
+
                 var decodedRaw = try? self.readPCMBuffer(from: sourceAudioURL)
                 if decodedRaw == nil && usedCachedStem {
                     // Evict corrupted/incomplete cached stem and retry from cloud/package source
@@ -3452,38 +3545,39 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 
                 // Read optional pre-rendered transposed/time-stretched buffer if saved in package or disk cache
                 var transposedBuffer: AVAudioPCMBuffer? = nil
-                let tempoChanged = abs(songEntry.bpm - songEntry.originalBPM) > 0.005
-                if !tempoChanged, let transRel = tm.relativeTransposedAudioPath, !transRel.isEmpty, tm.transposedSemitones == songEntry.transposeSemitones {
-                    if let transAudioURL = self.resolvePackageStemURL(relativePath: transRel, rootFolder: rootFolder),
-                       fm.fileExists(atPath: transAudioURL.path),
-                       let rawTrans = try? self.readPCMBuffer(from: transAudioURL),
-                       rawTrans.frameLength > 100 {
-                        transposedBuffer = canonicalFormat != nil ? Self.normalizeBuffer(rawTrans, to: canonicalFormat!) : rawTrans
+                if keepPCMInMemory {
+                    if !tempoChanged, let transRel = tm.relativeTransposedAudioPath, !transRel.isEmpty, tm.transposedSemitones == songEntry.transposeSemitones {
+                        if let transAudioURL = self.resolvePackageStemURL(relativePath: transRel, rootFolder: rootFolder),
+                           fm.fileExists(atPath: transAudioURL.path),
+                           let rawTrans = try? self.readPCMBuffer(from: transAudioURL),
+                           rawTrans.frameLength > 100 {
+                            transposedBuffer = canonicalFormat != nil ? Self.normalizeBuffer(rawTrans, to: canonicalFormat!) : rawTrans
+                        }
                     }
-                }
-                if transposedBuffer == nil && (songEntry.transposeSemitones != 0 || tempoChanged) {
-                    let cat = StemCategory.category(for: tm.name, role: tm.role)
-                    let isClickOrGuideRole = (cat == .click || cat == .guide || tm.role == .click || tm.role == .guide)
-                    let isGeneratedClickOrGuide = (cat == .click && songEntry.clickSource == .generated)
-                        || (cat == .guide && songEntry.guideSource == .generated)
-                        || (isClickOrGuideRole && tm.relativeAudioPath.isEmpty)
-                    let shouldCheckCache = tempoChanged ? !isGeneratedClickOrGuide : !isClickOrGuideRole
-                    if shouldCheckCache {
-                        let cacheDir = self.transposedStemCacheDirectory(
-                            songId: songEntry.id,
-                            semitones: songEntry.transposeSemitones,
-                            preserveVocalFormants: songEntry.preserveVocalFormants,
-                            bpm: songEntry.bpm,
-                            originalBPM: songEntry.originalBPM
-                        )
-                        let diskWavURL = cacheDir.appendingPathComponent("\(tm.id.uuidString).wav")
-                        let diskM4aURL = cacheDir.appendingPathComponent("\(tm.id.uuidString).m4a")
-                        let diskTransURL = fm.fileExists(atPath: diskWavURL.path) ? diskWavURL : diskM4aURL
-                        if fm.fileExists(atPath: diskTransURL.path) {
-                            if let rawTrans = try? self.readPCMBuffer(from: diskTransURL), rawTrans.frameLength > 100 {
-                                transposedBuffer = canonicalFormat != nil ? Self.normalizeBuffer(rawTrans, to: canonicalFormat!) : rawTrans
-                            } else {
-                                try? fm.removeItem(at: diskTransURL)
+                    if transposedBuffer == nil && (songEntry.transposeSemitones != 0 || tempoChanged) {
+                        let cat = StemCategory.category(for: tm.name, role: tm.role)
+                        let isClickOrGuideRole = (cat == .click || cat == .guide || tm.role == .click || tm.role == .guide)
+                        let isGeneratedClickOrGuide = (cat == .click && songEntry.clickSource == .generated)
+                            || (cat == .guide && songEntry.guideSource == .generated)
+                            || (isClickOrGuideRole && tm.relativeAudioPath.isEmpty)
+                        let shouldCheckCache = tempoChanged ? !isGeneratedClickOrGuide : !isClickOrGuideRole
+                        if shouldCheckCache {
+                            let cacheDir = self.transposedStemCacheDirectory(
+                                songId: songEntry.id,
+                                semitones: songEntry.transposeSemitones,
+                                preserveVocalFormants: songEntry.preserveVocalFormants,
+                                bpm: songEntry.bpm,
+                                originalBPM: songEntry.originalBPM
+                            )
+                            let diskWavURL = cacheDir.appendingPathComponent("\(tm.id.uuidString).wav")
+                            let diskM4aURL = cacheDir.appendingPathComponent("\(tm.id.uuidString).m4a")
+                            let diskTransURL = fm.fileExists(atPath: diskWavURL.path) ? diskWavURL : diskM4aURL
+                            if fm.fileExists(atPath: diskTransURL.path) {
+                                if let rawTrans = try? self.readPCMBuffer(from: diskTransURL), rawTrans.frameLength > 100 {
+                                    transposedBuffer = canonicalFormat != nil ? Self.normalizeBuffer(rawTrans, to: canonicalFormat!) : rawTrans
+                                } else {
+                                    try? fm.removeItem(at: diskTransURL)
+                                }
                             }
                         }
                     }
@@ -3492,7 +3586,20 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 // Ensure StemCache holds the compressed .m4a so tempDir can be safely deleted and future saves are instant
                 if sourceAudioURL.pathExtension.lowercased() == "m4a" {
                     if !self.hasValidCachedStem(for: tm.id) {
+                        try? fm.createDirectory(at: self.stemCacheDirectory, withIntermediateDirectories: true)
                         try? self.linkOrCopyFile(from: sourceAudioURL, to: cachedURL)
+                    }
+                } else if !keepPCMInMemory {
+                    if !self.hasValidCachedStem(for: tm.id) {
+                        try? fm.createDirectory(at: self.stemCacheDirectory, withIntermediateDirectories: true)
+                        let tempFile = self.stemCacheDirectory.appendingPathComponent("tmp_sync_\(UUID().uuidString).m4a")
+                        defer { try? fm.removeItem(at: tempFile) }
+                        if (try? self.writeCompressedStem(finalBuffer, to: tempFile)) != nil {
+                            if fm.fileExists(atPath: cachedURL.path) {
+                                try? fm.removeItem(at: cachedURL)
+                            }
+                            try? fm.moveItem(at: tempFile, to: cachedURL)
+                        }
                     }
                 } else {
                     self.cacheStemInBackground(trackId: tm.id, buffer: finalBuffer)
@@ -3524,7 +3631,16 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     stemTrack.waveformPeaks = Self.extractPeaks(from: finalBuffer, samplesCount: 4000)
                 }
                 
-                decodedBox[idx] = DecodedTrackItem(track: stemTrack, buffer: finalBuffer, persistentURL: persistentURL, transposedBuffer: transposedBuffer)
+                let bufferToReturn: AVAudioPCMBuffer
+                if keepPCMInMemory {
+                    bufferToReturn = finalBuffer
+                } else if let tinyBuf = AVAudioPCMBuffer(pcmFormat: fallbackFormat, frameCapacity: 1) {
+                    tinyBuf.frameLength = 1
+                    bufferToReturn = tinyBuf
+                } else {
+                    bufferToReturn = finalBuffer
+                }
+                decodedBox[idx] = DecodedTrackItem(track: stemTrack, buffer: bufferToReturn, persistentURL: persistentURL, transposedBuffer: transposedBuffer)
             }
         }
         

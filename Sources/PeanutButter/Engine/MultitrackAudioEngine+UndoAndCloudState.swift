@@ -822,8 +822,7 @@ extension MultitrackAudioEngine {
         guard !rehydrated.isEmpty else { return }
         songBuffersCache[song.id] = rehydrated
         recordTrackMetadataBackup(for: song.id, tracks: rehydrated.map { $0.0 })
-        if rehydrated.contains(where: { !Self.isClickOrGuideTrack($0.0) && $0.1.frameLength > 100 })
-            || !rehydrated.contains(where: { !Self.isClickOrGuideTrack($0.0) }) {
+        if hasAllRequiredAudioHydrated(in: rehydrated) {
             memoryEvictedSongIds.remove(song.id)
         }
     }
@@ -953,9 +952,747 @@ extension MultitrackAudioEngine {
 
         if !loaded.isEmpty {
             recordTrackMetadataBackup(for: song.id, tracks: loaded.map { $0.0 })
-            memoryEvictedSongIds.remove(song.id)
+            if hasAllRequiredAudioHydrated(in: loaded) {
+                memoryEvictedSongIds.remove(song.id)
+            }
         }
         return loaded
+    }
+
+    // MARK: - Asynchronous Cancellable Song Hydration & Prefetch
+
+    final class HydrationCancellationFlag: @unchecked Sendable {
+        private let lock = OSAllocatedUnfairLock(initialState: false)
+        var isCancelled: Bool { lock.withLock { $0 } }
+        func cancel() { lock.withLock { $0 = true } }
+    }
+
+    struct TrackHydrationDescriptor: @unchecked Sendable {
+        let trackId: UUID
+        let localBackingURL: URL?
+        let includeInWaveform: Bool
+        let needsPeaks: Bool
+        let isClick: Bool
+        let isGuide: Bool
+        let needsTransform: Bool
+    }
+
+    struct SongHydrationRequest: @unchecked Sendable {
+        let songId: UUID
+        let sourceSongId: UUID?
+        let sessionURL: URL?
+        let stemURLs: [URL]
+        let descriptors: [TrackHydrationDescriptor]
+        let canonicalFormat: AVAudioFormat
+        let needsPristine: Bool
+        let needsTransposedDisk: Bool
+        let transposeSemitones: Int
+        let preserveVocalFormants: Bool
+        let bpm: Double
+        let originalBPM: Double
+        let clickSource: ClickSource
+        let guideSource: GuideSource
+    }
+
+    struct DecodedHydrationTrackItem: @unchecked Sendable {
+        let trackId: UUID
+        let resolvedURL: URL?
+        let buffer: AVAudioPCMBuffer
+        let peaks: [Float]?
+        let reconstructedTrack: StemTrack?
+    }
+
+    struct AsyncSongHydrationResult: @unchecked Sendable {
+        let songId: UUID
+        let decodedItems: [DecodedHydrationTrackItem]
+        let reconstructedFromStemURLs: Bool
+        let loadedTransposedBuffers: [UUID: AVAudioPCMBuffer]?
+        let transposeSemitones: Int
+        let preserveVocalFormants: Bool
+        let bpmHundredths: Int
+    }
+
+    func hasAllRequiredAudioHydrated(in items: [(track: StemTrack, buffer: AVAudioPCMBuffer)]) -> Bool {
+        let nonUtility = items.filter { !Self.isClickOrGuideTrack($0.track) }
+        if !nonUtility.isEmpty {
+            let hasAnyPlayableStem = nonUtility.contains { $0.buffer.frameLength > 100 }
+            let allBackingFilesHydrated = nonUtility.allSatisfy {
+                $0.buffer.frameLength > 100 || ($0.track.fileURL == nil && !Self.hasLocalBackingAudioFile(for: $0.track))
+            }
+            return hasAnyPlayableStem && allBackingFilesHydrated
+        }
+        guard !items.isEmpty else { return false }
+        return items.allSatisfy {
+            $0.buffer.frameLength > 100 || $0.track.fileURL == nil
+        }
+    }
+
+    func songNeedsBufferHydration(_ song: Song) -> (needsPristine: Bool, needsTransposedDisk: Bool) {
+        if downloadingSongProgress[song.id] != nil {
+            return (false, false)
+        }
+
+        let existing = songBuffersCache[song.id]
+        let needsPristine: Bool
+        if let existing = existing, !existing.isEmpty {
+            if hasAllRequiredAudioHydrated(in: existing) {
+                needsPristine = false
+            } else {
+                needsPristine = existing.contains { track, buf in
+                    buf.frameLength <= 100 && resolveLocalBackingURL(for: track) != nil
+                }
+            }
+        } else if let backed = songTrackMetadataBackup[song.id], !backed.isEmpty {
+            needsPristine = backed.contains { resolveLocalBackingURL(for: $0) != nil }
+        } else {
+            needsPristine = !song.stemURLs.isEmpty && song.stemURLs.contains { FileManager.default.fileExists(atPath: $0.path) }
+        }
+
+        let needsTransform = (song.transposeSemitones != 0 || song.isTempoShifted)
+        let needsTransposedDisk: Bool
+        if needsTransform &&
+           cachedTransformedBuffers(for: song) == nil &&
+           transposeTasksBySong[song.id] == nil {
+            if needsPristine {
+                needsTransposedDisk = true
+            } else {
+                let tracksList: [StemTrack] = (song.id == currentSong.id && !channels.isEmpty)
+                    ? channels.values.map { $0.track }
+                    : ((existing?.map { $0.track }) ?? songTrackMetadataBackup[song.id] ?? [])
+                let targetTrackIds = tracksList
+                    .filter { shouldRenderTransformedTrack($0, for: song, tempoShifted: song.isTempoShifted) }
+                    .map { $0.id }
+                needsTransposedDisk = PlaybackFileManager.shared.hasTransposedBuffersOnDisk(
+                    songId: song.id,
+                    semitones: song.transposeSemitones,
+                    preserveVocalFormants: song.preserveVocalFormants,
+                    bpm: song.bpm,
+                    originalBPM: song.originalBPM,
+                    trackIds: targetTrackIds
+                )
+            }
+        } else {
+            needsTransposedDisk = false
+        }
+
+        return (needsPristine, needsTransposedDisk)
+    }
+
+    private func buildSongHydrationRequest(
+        for song: Song,
+        needsPristine: Bool,
+        needsTransposedDisk: Bool
+    ) -> SongHydrationRequest {
+        let canonicalFormat = getCanonicalProcessingFormat()
+        let savedTracks: [StemTrack] = {
+            if song.id == currentSong.id && !tracks.isEmpty {
+                return tracks
+            }
+            if let existing = songBuffersCache[song.id], !existing.isEmpty {
+                return existing.map { $0.track }
+            }
+            return songTrackMetadataBackup[song.id] ?? []
+        }()
+
+        let existingBufferByTrackId: [UUID: AVAudioPCMBuffer] = {
+            if song.id == currentSong.id && !pristineMasterBuffers.isEmpty {
+                return pristineMasterBuffers
+            }
+            var map: [UUID: AVAudioPCMBuffer] = [:]
+            for item in songBuffersCache[song.id] ?? [] {
+                map[item.track.id] = item.buffer
+            }
+            return map
+        }()
+
+        let descriptors: [TrackHydrationDescriptor] = savedTracks.map { track in
+            let existingLen = existingBufferByTrackId[track.id]?.frameLength ?? 0
+            let needsTrackRead = needsPristine && existingLen <= 100
+            return TrackHydrationDescriptor(
+                trackId: track.id,
+                localBackingURL: needsTrackRead ? resolveLocalBackingURL(for: track) : nil,
+                includeInWaveform: track.includeInWaveform,
+                needsPeaks: track.waveformPeaks.isEmpty,
+                isClick: Self.isClickTrack(track),
+                isGuide: Self.isGuideTrack(track),
+                needsTransform: shouldRenderTransformedTrack(track, for: song, tempoShifted: song.isTempoShifted)
+            )
+        }
+
+        return SongHydrationRequest(
+            songId: song.id,
+            sourceSongId: song.sourceSongId,
+            sessionURL: currentSessionURL,
+            stemURLs: song.stemURLs,
+            descriptors: descriptors,
+            canonicalFormat: canonicalFormat,
+            needsPristine: needsPristine,
+            needsTransposedDisk: needsTransposedDisk,
+            transposeSemitones: song.transposeSemitones,
+            preserveVocalFormants: song.preserveVocalFormants,
+            bpm: song.bpm,
+            originalBPM: song.originalBPM,
+            clickSource: song.clickSource,
+            guideSource: song.guideSource
+        )
+    }
+
+    private nonisolated static func performOffMainSongHydration(
+        request: SongHydrationRequest,
+        flag: HydrationCancellationFlag
+    ) -> AsyncSongHydrationResult? {
+        if flag.isCancelled || Task.isCancelled { return nil }
+
+        var decodedItems: [DecodedHydrationTrackItem] = []
+        var reconstructedFromStemURLs = false
+        var transformTrackIds: [UUID] = []
+
+        if !request.descriptors.isEmpty {
+            transformTrackIds = request.descriptors.filter { $0.needsTransform }.map { $0.trackId }
+
+            if request.needsPristine {
+                let count = request.descriptors.count
+                let box = UnsafeMutableBufferPointer<DecodedHydrationTrackItem?>.allocate(capacity: count)
+                box.initialize(repeating: nil)
+                defer {
+                    box.deinitialize()
+                    box.deallocate()
+                }
+                DispatchQueue.concurrentPerform(iterations: count) { idx in
+                    if flag.isCancelled { return }
+                    let desc = request.descriptors[idx]
+                    guard let localURL = desc.localBackingURL,
+                          let raw = try? PlaybackFileManager.shared.readPCMBuffer(from: localURL) else {
+                        return
+                    }
+                    if flag.isCancelled { return }
+                    let norm = PlaybackFileManager.normalizeBuffer(raw, to: request.canonicalFormat)
+                    if flag.isCancelled { return }
+                    let peaks: [Float]? = (desc.needsPeaks && desc.includeInWaveform && norm.frameLength > 100 && !desc.isClick && !desc.isGuide)
+                        ? PlaybackFileManager.extractPeaks(from: norm, samplesCount: 4000)
+                        : nil
+                    box[idx] = DecodedHydrationTrackItem(
+                        trackId: desc.trackId,
+                        resolvedURL: localURL,
+                        buffer: norm,
+                        peaks: peaks,
+                        reconstructedTrack: nil
+                    )
+                }
+                if flag.isCancelled || Task.isCancelled { return nil }
+                decodedItems.reserveCapacity(count)
+                for idx in 0..<count {
+                    if let item = box[idx] {
+                        decodedItems.append(item)
+                    }
+                }
+            }
+        } else if request.needsPristine && !request.stemURLs.isEmpty {
+            reconstructedFromStemURLs = true
+            var diskMetaById: [UUID: TrackFileMetadata] = [:]
+            if let sessURL = request.sessionURL {
+                let metaTracks = PlaybackFileManager.shared.loadSongTrackMetadataFromSession(songId: request.songId, sessionURL: sessURL)
+                    ?? (request.sourceSongId.flatMap { PlaybackFileManager.shared.loadSongTrackMetadataFromSession(songId: $0, sessionURL: sessURL) })
+                if let metaTracks = metaTracks {
+                    for tm in metaTracks where !Self.isLikelyUUIDString(tm.name) {
+                        diskMetaById[tm.id] = tm
+                    }
+                }
+            }
+            if flag.isCancelled || Task.isCancelled { return nil }
+
+            let count = request.stemURLs.count
+            let box = UnsafeMutableBufferPointer<DecodedHydrationTrackItem?>.allocate(capacity: count)
+            box.initialize(repeating: nil)
+            defer {
+                box.deinitialize()
+                box.deallocate()
+            }
+            DispatchQueue.concurrentPerform(iterations: count) { idx in
+                if flag.isCancelled { return }
+                let url = request.stemURLs[idx]
+                guard let raw = try? PlaybackFileManager.shared.readPCMBuffer(from: url) else { return }
+                if flag.isCancelled { return }
+                let norm = PlaybackFileManager.normalizeBuffer(raw, to: request.canonicalFormat)
+                if flag.isCancelled { return }
+                let baseName = url.deletingPathExtension().lastPathComponent
+
+                let track: StemTrack
+                if let uuid = UUID(uuidString: baseName), let tm = diskMetaById[uuid] {
+                    let restoredSourceURL = tm.sourceFilePath.map { URL(fileURLWithPath: $0) }
+                        ?? PlaybackFileManager.shared.lookupLocalLosslessSourceURL(for: tm.id)
+                    let t = StemTrack(
+                        id: tm.id,
+                        name: tm.name,
+                        role: tm.role,
+                        fileURL: url,
+                        sourceFileURL: restoredSourceURL,
+                        volume: tm.volume,
+                        pan: tm.pan,
+                        isMuted: tm.isMuted,
+                        isSoloed: tm.isSoloed,
+                        isSoloSafe: tm.isSoloSafe,
+                        routing: tm.routing,
+                        assignedBusName: tm.assignedBusName,
+                        includeInWaveform: tm.includeInWaveform
+                    )
+                    if let dur = tm.duration, dur > 0 {
+                        t.duration = dur
+                    }
+                    t.waveformPeaks = TrackFileMetadata.decodePeaks(tm.waveformPeaksData)
+                    track = t
+                } else {
+                    let cat = StemCategory.category(for: baseName)
+                    let role: TrackRole = (cat == .click) ? .click : ((cat == .guide) ? .guide : .stem)
+                    track = StemTrack(name: baseName, role: role, fileURL: url)
+                }
+
+                let cat = StemCategory.category(for: track.name, role: track.role)
+                if cat == .click { track.role = .click }
+                else if cat == .guide { track.role = .guide }
+                if norm.frameLength > 10 && track.duration <= 0 {
+                    track.duration = Double(norm.frameLength) / norm.format.sampleRate
+                }
+                var computedPeaks: [Float]? = nil
+                if track.waveformPeaks.isEmpty && track.includeInWaveform && norm.frameLength > 100 && cat != .click && cat != .guide {
+                    computedPeaks = PlaybackFileManager.extractPeaks(from: norm, samplesCount: 4000)
+                    if let p = computedPeaks {
+                        track.waveformPeaks = p
+                    }
+                }
+                box[idx] = DecodedHydrationTrackItem(
+                    trackId: track.id,
+                    resolvedURL: url,
+                    buffer: norm,
+                    peaks: computedPeaks,
+                    reconstructedTrack: track
+                )
+            }
+            if flag.isCancelled || Task.isCancelled { return nil }
+            decodedItems.reserveCapacity(count)
+            for idx in 0..<count {
+                if let item = box[idx] {
+                    decodedItems.append(item)
+                    if let t = item.reconstructedTrack {
+                        let tempoShifted = abs(request.bpm - request.originalBPM) > 0.005
+                        let isClick = Self.isClickTrack(t)
+                        let isGuide = Self.isGuideTrack(t)
+                        let includeTrack: Bool
+                        if !isClick && !isGuide {
+                            includeTrack = true
+                        } else if tempoShifted {
+                            let isGenClick = isClick && request.clickSource == .generated
+                            let isGenGuide = isGuide && request.guideSource == .generated
+                            includeTrack = !isGenClick && !isGenGuide
+                        } else {
+                            includeTrack = false
+                        }
+                        if includeTrack {
+                            transformTrackIds.append(t.id)
+                        }
+                    }
+                }
+            }
+        }
+
+        if flag.isCancelled || Task.isCancelled { return nil }
+
+        var loadedTransposed: [UUID: AVAudioPCMBuffer]? = nil
+        if request.needsTransposedDisk && !transformTrackIds.isEmpty {
+            loadedTransposed = PlaybackFileManager.shared.loadTransposedBuffersFromDisk(
+                songId: request.songId,
+                semitones: request.transposeSemitones,
+                preserveVocalFormants: request.preserveVocalFormants,
+                bpm: request.bpm,
+                originalBPM: request.originalBPM,
+                trackIds: transformTrackIds,
+                canonicalFormat: request.canonicalFormat,
+                isCancelled: { flag.isCancelled }
+            )
+        }
+
+        if flag.isCancelled || Task.isCancelled { return nil }
+
+        return AsyncSongHydrationResult(
+            songId: request.songId,
+            decodedItems: decodedItems,
+            reconstructedFromStemURLs: reconstructedFromStemURLs,
+            loadedTransposedBuffers: loadedTransposed,
+            transposeSemitones: request.transposeSemitones,
+            preserveVocalFormants: request.preserveVocalFormants,
+            bpmHundredths: PlaybackFileManager.cacheBPMHundredths(request.bpm)
+        )
+    }
+
+    func startAsyncHydrationForActiveSong(_ song: Song, generation: UInt64) {
+        activeSongHydrationTask?.cancel()
+        backgroundPrefetchTasksBySong.removeValue(forKey: song.id)?.cancel()
+
+        let need = songNeedsBufferHydration(song)
+        guard need.needsPristine || need.needsTransposedDisk else {
+            hydratingSongIds.remove(song.id)
+            return
+        }
+
+        hydratingSongIds.insert(song.id)
+        let request = buildSongHydrationRequest(
+            for: song,
+            needsPristine: need.needsPristine,
+            needsTransposedDisk: need.needsTransposedDisk
+        )
+        let flag = HydrationCancellationFlag()
+
+        activeSongHydrationTask = Task.detached(priority: .userInitiated) { [weak self, request, flag, generation] in
+            let result = await withTaskCancellationHandler {
+                Self.performOffMainSongHydration(request: request, flag: flag)
+            } onCancel: {
+                flag.cancel()
+            }
+
+            await MainActor.run { [weak self] in
+                guard let self = self else { return }
+                guard self.songSwitchGeneration == generation else { return }
+                self.activeSongHydrationTask = nil
+                guard !flag.isCancelled, !Task.isCancelled, let result = result else {
+                    self.hydratingSongIds.remove(request.songId)
+                    return
+                }
+                self.applyAsyncHydratedSongResult(result, expectedGeneration: generation, isPriorityActive: true)
+            }
+        }
+    }
+
+    func prefetchSongInBackgroundIfNeeded(song: Song) {
+        guard song.id != currentSong.id else { return }
+        guard downloadingSongProgress[song.id] == nil else { return }
+        guard backgroundPrefetchTasksBySong[song.id] == nil else { return }
+
+        let need = songNeedsBufferHydration(song)
+        guard need.needsPristine || need.needsTransposedDisk else { return }
+
+        let request = buildSongHydrationRequest(
+            for: song,
+            needsPristine: need.needsPristine,
+            needsTransposedDisk: need.needsTransposedDisk
+        )
+        let flag = HydrationCancellationFlag()
+
+        backgroundPrefetchTasksBySong[song.id] = Task.detached(priority: .utility) { [weak self, request, flag] in
+            let result = await withTaskCancellationHandler {
+                Self.performOffMainSongHydration(request: request, flag: flag)
+            } onCancel: {
+                flag.cancel()
+            }
+
+            await MainActor.run { [weak self] in
+                guard let self = self else { return }
+                self.backgroundPrefetchTasksBySong.removeValue(forKey: request.songId)
+                guard !flag.isCancelled, !Task.isCancelled, let result = result else { return }
+                guard self.currentSetlist.songs.contains(where: { $0.id == request.songId }) else { return }
+                guard self.isSongInProtectedRAMWindow(request.songId) else { return }
+                self.applyAsyncHydratedSongResult(result, expectedGeneration: nil, isPriorityActive: false)
+            }
+        }
+    }
+
+    func applyAsyncHydratedSongResult(
+        _ result: AsyncSongHydrationResult,
+        expectedGeneration: UInt64?,
+        isPriorityActive: Bool
+    ) {
+        if isPriorityActive, let expectedGeneration = expectedGeneration, expectedGeneration != songSwitchGeneration {
+            return
+        }
+        guard let songIdx = currentSetlist.songs.firstIndex(where: { $0.id == result.songId }) else {
+            hydratingSongIds.remove(result.songId)
+            return
+        }
+        let song = currentSetlist.songs[songIdx]
+        let isActiveSong = (currentSong.id == result.songId)
+        let canonicalFormat = getCanonicalProcessingFormat()
+
+        if let loadedTransposed = result.loadedTransposedBuffers, !loadedTransposed.isEmpty,
+           (song.transposeSemitones != 0 || song.isTempoShifted),
+           song.transposeSemitones == result.transposeSemitones,
+           song.preserveVocalFormants == result.preserveVocalFormants,
+           PlaybackFileManager.cacheBPMHundredths(song.bpm) == result.bpmHundredths {
+            songTransposedBuffersCache[result.songId] = (
+                song.transposeSemitones,
+                song.preserveVocalFormants,
+                result.bpmHundredths,
+                loadedTransposed
+            )
+        }
+
+        let cachedTransposed = cachedTransformedBuffers(for: song)
+        var didUpdatePeaks = false
+        var maxDur: TimeInterval = 0.0
+
+        var existingOrderTracks: [(StemTrack, AVAudioPCMBuffer)] = {
+            if isActiveSong && !tracks.isEmpty {
+                return tracks.map { ($0, pristineMasterBuffers[$0.id] ?? channels[$0.id]?.buffer ?? makeSilentStub(format: canonicalFormat)!) }
+            }
+            return songBuffersCache[result.songId] ?? []
+        }()
+
+        let decodedById = Dictionary(uniqueKeysWithValues: result.decodedItems.map { ($0.trackId, $0) })
+        var rebuiltItems: [(track: StemTrack, buffer: AVAudioPCMBuffer)] = []
+
+        if !result.reconstructedFromStemURLs && !existingOrderTracks.isEmpty {
+            rebuiltItems.reserveCapacity(existingOrderTracks.count)
+            for (track, existingBuf) in existingOrderTracks {
+                let cat = StemCategory.category(for: track.name, role: track.role)
+                if cat == .click { track.role = .click }
+                else if cat == .guide { track.role = .guide }
+
+                let decoded = decodedById[track.id]
+                if track.fileURL == nil, let resolvedURL = decoded?.resolvedURL {
+                    track.fileURL = resolvedURL
+                }
+                let rawPristineBuf = decoded?.buffer ?? existingBuf
+
+                var bufferForCache = rawPristineBuf
+                if cat == .click {
+                    if rawPristineBuf.frameLength > 100 && (decoded != nil || track.fileURL != nil) {
+                        uploadedClickBuffers[song.id] = rawPristineBuf
+                    }
+                    if song.clickSource == .generated {
+                        if let genClick = generatedClickBuffers[song.id], genClick.frameLength > 1 {
+                            bufferForCache = genClick
+                        } else if let stub = makeSilentStub(format: canonicalFormat) {
+                            bufferForCache = stub
+                        }
+                    }
+                } else if cat == .guide {
+                    if rawPristineBuf.frameLength > 100 && (decoded != nil || track.fileURL != nil) {
+                        uploadedGuideBuffers[song.id] = rawPristineBuf
+                    }
+                    if song.guideSource == .generated {
+                        let expectedState = isActiveSong
+                            ? currentLiveGuideLoopState()
+                            : expectedDefaultGuideLoopState(forSongAt: songIdx, song: song)
+                        if let genGuide = generatedGuideBuffers[song.id],
+                           genGuide.frameLength > 1,
+                           generatedGuideLoopStates[song.id] == expectedState {
+                            bufferForCache = genGuide
+                        } else if let stub = makeSilentStub(format: canonicalFormat) {
+                            bufferForCache = stub
+                        }
+                    }
+                }
+
+                let activeBuf = cachedTransposed?[track.id] ?? bufferForCache
+                if activeBuf.frameLength > 10 {
+                    let dur = Double(activeBuf.frameLength) / activeBuf.format.sampleRate
+                    track.duration = dur
+                    if dur > maxDur { maxDur = dur }
+                } else if track.duration > maxDur {
+                    maxDur = track.duration
+                }
+                if track.waveformPeaks.isEmpty, let peaks = decoded?.peaks, !peaks.isEmpty {
+                    track.waveformPeaks = peaks
+                    didUpdatePeaks = true
+                }
+                rebuiltItems.append((track, bufferForCache))
+            }
+        } else {
+            // Reconstructed from `song.stemURLs`
+            rebuiltItems.reserveCapacity(result.decodedItems.count)
+            for item in result.decodedItems {
+                guard let track = item.reconstructedTrack else { continue }
+                let norm = item.buffer
+                let cat = StemCategory.category(for: track.name, role: track.role)
+                var bufferForCache = norm
+                if cat == .click {
+                    track.role = .click
+                    if norm.frameLength > 100 {
+                        uploadedClickBuffers[song.id] = norm
+                    }
+                    if song.clickSource == .generated {
+                        if let genClick = generatedClickBuffers[song.id], genClick.frameLength > 1 {
+                            bufferForCache = genClick
+                        } else if let stub = makeSilentStub(format: canonicalFormat) {
+                            bufferForCache = stub
+                        }
+                    }
+                } else if cat == .guide {
+                    track.role = .guide
+                    if norm.frameLength > 100 {
+                        uploadedGuideBuffers[song.id] = norm
+                    }
+                    if song.guideSource == .generated {
+                        let expectedState = isActiveSong
+                            ? currentLiveGuideLoopState()
+                            : expectedDefaultGuideLoopState(forSongAt: songIdx, song: song)
+                        if let genGuide = generatedGuideBuffers[song.id],
+                           genGuide.frameLength > 1,
+                           generatedGuideLoopStates[song.id] == expectedState {
+                            bufferForCache = genGuide
+                        } else if let stub = makeSilentStub(format: canonicalFormat) {
+                            bufferForCache = stub
+                        }
+                    }
+                }
+                let activeBuf = cachedTransposed?[track.id] ?? bufferForCache
+                if activeBuf.frameLength > 10 {
+                    let dur = Double(activeBuf.frameLength) / activeBuf.format.sampleRate
+                    track.duration = dur
+                    if dur > maxDur { maxDur = dur }
+                } else if track.duration > maxDur {
+                    maxDur = track.duration
+                }
+                if track.waveformPeaks.isEmpty, let peaks = item.peaks, !peaks.isEmpty {
+                    track.waveformPeaks = peaks
+                    didUpdatePeaks = true
+                }
+                rebuiltItems.append((track, bufferForCache))
+            }
+        }
+
+        if rebuiltItems.contains(where: { Self.isClickTrack($0.track) && $0.track.fileURL != nil }) {
+            rebuiltItems.removeAll { Self.isClickTrack($0.track) && $0.track.fileURL == nil }
+        }
+        if rebuiltItems.contains(where: { Self.isGuideTrack($0.track) && $0.track.fileURL != nil }) {
+            rebuiltItems.removeAll { Self.isGuideTrack($0.track) && $0.track.fileURL == nil }
+        }
+
+        let songDur = max(maxDur, song.sections.map { $0.endTime }.max() ?? (song.totalDuration > 0 ? song.totalDuration : 240.0))
+        if result.reconstructedFromStemURLs && !song.excludesClickAndGuide {
+            let sr = canonicalFormat.sampleRate > 0 ? canonicalFormat.sampleRate : 44100.0
+            let initFrames = AVAudioFrameCount(max(1, Int64(round(songDur * sr))))
+            if !rebuiltItems.contains(where: { StemCategory.category(for: $0.track.name, role: $0.track.role) == .click }) {
+                let clickTrack = StemTrack(name: "Click", role: .click, volume: 0.8, routing: .clickOut)
+                clickTrack.duration = songDur
+                if let genClick = (song.clickSource == .generated ? generatedClickBuffers[song.id] : nil), genClick.frameLength > 1 {
+                    rebuiltItems.append((clickTrack, genClick))
+                } else if let silentBuf = AVAudioPCMBuffer(pcmFormat: canonicalFormat, frameCapacity: initFrames) {
+                    silentBuf.frameLength = initFrames
+                    rebuiltItems.append((clickTrack, silentBuf))
+                }
+            }
+            if !rebuiltItems.contains(where: { StemCategory.category(for: $0.track.name, role: $0.track.role) == .guide }) {
+                let guideTrack = StemTrack(name: "Guide", role: .guide, volume: 0.8, routing: .guideOut)
+                guideTrack.duration = songDur
+                let expectedState = isActiveSong
+                    ? currentLiveGuideLoopState()
+                    : expectedDefaultGuideLoopState(forSongAt: songIdx, song: song)
+                if let genGuide = (song.guideSource == .generated && generatedGuideLoopStates[song.id] == expectedState ? generatedGuideBuffers[song.id] : nil),
+                   genGuide.frameLength > 1 {
+                    rebuiltItems.append((guideTrack, genGuide))
+                } else if let silentBuf = AVAudioPCMBuffer(pcmFormat: canonicalFormat, frameCapacity: initFrames) {
+                    silentBuf.frameLength = initFrames
+                    rebuiltItems.append((guideTrack, silentBuf))
+                }
+            }
+        }
+
+        if rebuiltItems.count > 1 && (result.reconstructedFromStemURLs || tracks.isEmpty) {
+            rebuiltItems.sort { a, b in
+                let ord1 = StemCategory.playbackOrder(for: a.track.name, role: a.track.role)
+                let ord2 = StemCategory.playbackOrder(for: b.track.name, role: b.track.role)
+                if ord1 != ord2 { return ord1 < ord2 }
+                let cat1 = StemCategory.category(for: a.track.name, role: a.track.role)
+                let cat2 = StemCategory.category(for: b.track.name, role: b.track.role)
+                if cat1 != cat2 { return cat1 < cat2 }
+                return a.track.name.localizedStandardCompare(b.track.name) == .orderedAscending
+            }
+        }
+
+        if !rebuiltItems.isEmpty {
+            songBuffersCache[song.id] = rebuiltItems
+            recordTrackMetadataBackup(for: song.id, tracks: rebuiltItems.map { $0.track })
+            if hasAllRequiredAudioHydrated(in: rebuiltItems) {
+                memoryEvictedSongIds.remove(song.id)
+            }
+        }
+        hydratingSongIds.remove(song.id)
+
+        if isActiveSong {
+            var newPristine: [UUID: AVAudioPCMBuffer] = [:]
+            var newChannels: [UUID: TrackChannel] = result.reconstructedFromStemURLs ? [:] : channels
+            for (track, buf) in rebuiltItems {
+                newPristine[track.id] = buf
+                let activeBuf = cachedTransposed?[track.id] ?? buf
+                if let ch = newChannels[track.id] {
+                    ch.buffer = activeBuf
+                } else {
+                    newChannels[track.id] = TrackChannel(track: track, buffer: activeBuf)
+                }
+            }
+            pristineMasterBuffers = newPristine
+            channels = newChannels
+            if result.reconstructedFromStemURLs || tracks.isEmpty {
+                tracks = rebuiltItems.map { $0.track }
+            }
+
+            if maxDur > 0 && currentSong.sections.isEmpty {
+                currentSongDuration = maxDur
+            }
+
+            if didUpdatePeaks || masterWaveformPeaks.isEmpty {
+                recalculateAggregateWaveform(samplesCount: 4000)
+                if !masterWaveformPeaks.isEmpty {
+                    songWaveformCache[song.id] = (masterWaveformPeaks, renderedWaveformImage)
+                }
+            }
+
+            if !currentSong.excludesClickAndGuide {
+                if currentSong.clickSource == .generated {
+                    if let cBuf = generatedClickBuffers[song.id], cBuf.frameLength > 1 {
+                        applyClickBuffer()
+                    } else {
+                        regenerateClickTrack()
+                    }
+                } else if currentSong.clickSource == .uploaded, uploadedClickBuffers[song.id] != nil {
+                    applyClickBuffer()
+                }
+                if currentSong.guideSource == .generated {
+                    let expectedGuideState = currentLiveGuideLoopState()
+                    if let gBuf = generatedGuideBuffers[song.id],
+                       gBuf.frameLength > 1,
+                       generatedGuideLoopStates[song.id] == expectedGuideState {
+                        applyGuideBuffer()
+                    } else {
+                        regenerateGuideTrack()
+                    }
+                } else if currentSong.guideSource == .uploaded, uploadedGuideBuffers[song.id] != nil {
+                    applyGuideBuffer()
+                }
+            }
+
+            updateMatrix(persistBusRouting: false)
+
+            if (currentSong.transposeSemitones != 0 || currentSong.isTempoShifted) &&
+               cachedTransformedBuffers(for: currentSong) == nil &&
+               transposeTasksBySong[currentSong.id] == nil {
+                setKeyAndTempo(forSongIndex: currentSongIndex)
+            }
+
+            if pendingPlayAfterHydration && !isCurrentSongTransposing && !isCurrentSongDownloading {
+                let queuedSection = pendingPlaySectionAfterHydration
+                pendingPlayAfterHydration = false
+                pendingPlaySectionAfterHydration = nil
+                if let sec = queuedSection {
+                    playSection(sec)
+                } else {
+                    play()
+                }
+            }
+
+            scheduleSlidingWindowRebalance()
+        } else {
+            if !song.excludesClickAndGuide && (song.clickSource == .generated || song.guideSource == .generated) {
+                preGenerateClickAndGuide(forSongId: song.id)
+            }
+            if (song.transposeSemitones != 0 || song.isTempoShifted) &&
+               cachedTransformedBuffers(for: song) == nil &&
+               transposeTasksBySong[song.id] == nil {
+                preRenderTranspose(forSongIndex: songIdx)
+            }
+            if songIdx == currentSongIndex + 1 {
+                syncMixState()
+            }
+        }
     }
     
 }

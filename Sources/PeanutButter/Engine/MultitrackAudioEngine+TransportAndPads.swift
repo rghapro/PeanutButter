@@ -62,6 +62,14 @@ extension MultitrackAudioEngine {
             showDownloadingWarning = true
             return
         }
+        if isCurrentSongHydrating {
+            pendingPlayAfterHydration = true
+            pendingPlaySectionAfterHydration = section
+            if activeSongHydrationTask == nil {
+                startAsyncHydrationForActiveSong(currentSong, generation: songSwitchGeneration)
+            }
+            return
+        }
         guard !channels.isEmpty else { return }
         closeEditMode()
         if isPostSongClickActive {
@@ -86,7 +94,7 @@ extension MultitrackAudioEngine {
         let preRollStartFrame = Int64(round(preTime * sr))
         let downbeatFrame = Int64(round(downbeatTime * sr))
         
-        updateMatrix()
+        updateMatrix(persistBusRouting: false)
         mixState.startPreRoll(preRollStartFrame: preRollStartFrame, targetDownbeatFrame: downbeatFrame)
         mixState.setPlaying(true)
         
@@ -155,6 +163,14 @@ extension MultitrackAudioEngine {
         }
         if isCurrentSongDownloading {
             showDownloadingWarning = true
+            return
+        }
+        if isCurrentSongHydrating {
+            pendingPlayAfterHydration = true
+            pendingPlaySectionAfterHydration = section
+            if activeSongHydrationTask == nil {
+                startAsyncHydrationForActiveSong(currentSong, generation: songSwitchGeneration)
+            }
             return
         }
         if isSongSectionPreRollEnabled && !isSectionCountOff(section) {
@@ -334,22 +350,17 @@ extension MultitrackAudioEngine {
         }
         
         let nextSong = currentSetlist.songs[currentSongIndex + 1]
-        let canonicalFormat = getCanonicalProcessingFormat()
-        rehydrateEvictedSongBuffersIfNeeded(for: nextSong)
-        let nextSongItems: [(track: StemTrack, buffer: AVAudioPCMBuffer)]
-        if let cached = songBuffersCache[nextSong.id], !cached.isEmpty {
-            nextSongItems = cached
-        } else if !nextSong.stemURLs.isEmpty {
-            let loaded = reconstructTracksFromStemURLs(for: nextSong, canonicalFormat: canonicalFormat)
-            songBuffersCache[nextSong.id] = loaded
-            nextSongItems = loaded
-        } else {
+        let nextNeed = songNeedsBufferHydration(nextSong)
+        if nextNeed.needsPristine || nextNeed.needsTransposedDisk {
+            prefetchSongInBackgroundIfNeeded(song: nextSong)
             return (.cueNextSong, 0, 0, [], [], [], false, 0, 0.0)
         }
-        
-        guard !nextSongItems.isEmpty else {
+        guard let cached = songBuffersCache[nextSong.id],
+              !cached.isEmpty,
+              hasAllRequiredAudioHydrated(in: cached) else {
             return (.cueNextSong, 0, 0, [], [], [], false, 0, 0.0)
         }
+        let nextSongItems = cached
         
         let needsPreGenClick = !nextSong.excludesClickAndGuide && nextSong.clickSource == .generated && (generatedClickBuffers[nextSong.id]?.frameLength ?? 0) <= 1
         let expectedNextGuideState = expectedDefaultGuideLoopState(forSongAt: currentSongIndex + 1, song: nextSong)
@@ -610,6 +621,14 @@ extension MultitrackAudioEngine {
             showDownloadingWarning = true
             return
         }
+        if isCurrentSongHydrating {
+            pendingPlayAfterHydration = true
+            pendingPlaySectionAfterHydration = nil
+            if activeSongHydrationTask == nil {
+                startAsyncHydrationForActiveSong(currentSong, generation: songSwitchGeneration)
+            }
+            return
+        }
         guard !channels.isEmpty else { return }
         if playbackState == .playing { return }
         
@@ -647,7 +666,7 @@ extension MultitrackAudioEngine {
         }
         
         syncMixState()
-        updateMatrix()
+        updateMatrix(persistBusRouting: false)
         mixState.setPlayhead(seconds: playbackOffsetSeconds)
         mixState.setPlaying(true)
         
@@ -717,6 +736,8 @@ extension MultitrackAudioEngine {
     }
     
     public func pause() {
+        pendingPlayAfterHydration = false
+        pendingPlaySectionAfterHydration = nil
         guard playbackState == .playing else { return }
         mixState.cancelPreRoll()
         preRollTargetSectionId = nil
@@ -741,6 +762,8 @@ extension MultitrackAudioEngine {
     }
     
     public func stop() {
+        pendingPlayAfterHydration = false
+        pendingPlaySectionAfterHydration = nil
         let wasActivePlayback = (playbackState != .stopped)
         mixState.cancelPreRoll()
         preRollTargetSectionId = nil
@@ -797,6 +820,11 @@ extension MultitrackAudioEngine {
     }
     
     public func togglePlayPause() {
+        if pendingPlayAfterHydration {
+            pendingPlayAfterHydration = false
+            pendingPlaySectionAfterHydration = nil
+            return
+        }
         if playbackState == .playing {
             pause()
         } else {
@@ -1616,7 +1644,7 @@ extension MultitrackAudioEngine {
                 }
                 songBuffersCache[currentSong.id] = currentBuffers
                 recordTrackMetadataBackup(for: currentSong.id, tracks: currentBuffers.map { $0.0 })
-                if currentBuffers.contains(where: { $0.1.frameLength > 100 }) {
+                if hasAllRequiredAudioHydrated(in: currentBuffers) {
                     memoryEvictedSongIds.remove(currentSong.id)
                 }
             }
@@ -1728,7 +1756,7 @@ extension MultitrackAudioEngine {
         
         // Update mixer gains and stage the subsequent song (`currentSongIndex + 1`) without resetting `mixState` playhead!
         updateSMPTEState(persistDevicePreset: false)
-        updateMatrix()
+        updateMatrix(persistBusRouting: false)
         if isLoopActive {
             syncMixState()
             if !currentSong.excludesClickAndGuide && currentSong.guideSource == .generated &&
@@ -1770,6 +1798,7 @@ extension MultitrackAudioEngine {
         }
         updateTransportPosition(to: currentSeconds)
         updatePlaybackActivityAssertion()
+        scheduleSlidingWindowRebalance()
     }
     
     // MARK: - Post-Song Continue Click Support

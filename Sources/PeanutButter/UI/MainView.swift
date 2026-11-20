@@ -703,21 +703,35 @@ public struct MainView: View {
                             badgeOffset: CGPoint(x: 4, y: -6),
                             action: { engine.togglePlayPause() }
                         ) {
-                            Canvas { context, size in
-                                let greenColor = Color(red: 0.25, green: 0.88, blue: 0.45)
-                                let midY = size.height / 2
-                                let midX = size.width / 2
-                                var tri = Path()
-                                tri.move(to: CGPoint(x: midX - 7.2, y: midY - 10.5))
-                                tri.addLine(to: CGPoint(x: midX + 10.5, y: midY))
-                                tri.addLine(to: CGPoint(x: midX - 7.2, y: midY + 10.5))
-                                tri.closeSubpath()
-                                context.stroke(tri, with: .color(greenColor), lineWidth: 1.6)
+                            ZStack {
+                                Canvas { context, size in
+                                    let greenColor = Color(red: 0.25, green: 0.88, blue: 0.45)
+                                    let midY = size.height / 2
+                                    let midX = size.width / 2
+                                    var tri = Path()
+                                    tri.move(to: CGPoint(x: midX - 7.2, y: midY - 10.5))
+                                    tri.addLine(to: CGPoint(x: midX + 10.5, y: midY))
+                                    tri.addLine(to: CGPoint(x: midX - 7.2, y: midY + 10.5))
+                                    tri.closeSubpath()
+                                    context.stroke(tri, with: .color(greenColor), lineWidth: 1.6)
+                                }
+                                .opacity((engine.isCurrentSongDownloading || engine.isCurrentSongHydrating) ? 0.35 : 1.0)
+
+                                if engine.isCurrentSongHydrating {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .tint(engine.pendingPlayAfterHydration ? Color(red: 0.25, green: 0.88, blue: 0.45) : .white)
+                                }
                             }
                             .frame(width: 140, height: 67)
-                            .opacity(engine.isCurrentSongDownloading ? 0.35 : 1.0)
                         }
-                        .help(engine.isCurrentSongDownloading ? "Downloading stems..." : "Play / Pause")
+                        .help(
+                            engine.isCurrentSongDownloading
+                                ? "Downloading stems..."
+                                : (engine.isCurrentSongHydrating
+                                    ? (engine.pendingPlayAfterHydration ? "Starting playback as soon as song audio loads..." : "Loading song audio...")
+                                    : "Play / Pause")
+                        )
                         
                         // FADE Button
                         MIDIMappableButton(

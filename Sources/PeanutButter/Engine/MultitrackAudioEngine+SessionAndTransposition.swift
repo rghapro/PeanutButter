@@ -88,7 +88,7 @@ extension MultitrackAudioEngine {
                 }
                 songBuffersCache[currentSong.id] = currentBuffers
                 recordTrackMetadataBackup(for: currentSong.id, tracks: currentBuffers.map { $0.0 })
-                if currentBuffers.contains(where: { $0.1.frameLength > 100 }) {
+                if hasAllRequiredAudioHydrated(in: currentBuffers) {
                     memoryEvictedSongIds.remove(currentSong.id)
                 }
             }
@@ -203,6 +203,14 @@ extension MultitrackAudioEngine {
     }
 
     public func loadSong(_ song: Song) {
+        songSwitchGeneration &+= 1
+        let activeGeneration = songSwitchGeneration
+        activeSongHydrationTask?.cancel()
+        activeSongHydrationTask = nil
+        hydratingSongIds.removeAll()
+        pendingPlayAfterHydration = false
+        pendingPlaySectionAfterHydration = nil
+
         if !currentSong.title.isEmpty && currentSong.id != song.id && !currentSong.automationPoints.isEmpty {
             restoreAutomatedParametersToBaseMix(updateAudioMatrix: false)
         }
@@ -239,19 +247,25 @@ extension MultitrackAudioEngine {
         transportDisplayClock.update(with: transportPosition)
         
         let canonicalFormat = getCanonicalProcessingFormat()
-        rehydrateEvictedSongBuffersIfNeeded(for: song)
+        let hydrationNeed = songNeedsBufferHydration(song)
+        let needsAsyncHydration = hydrationNeed.needsPristine || hydrationNeed.needsTransposedDisk
         var loadedItems: [(StemTrack, AVAudioPCMBuffer)] = []
         
-        // Check if we have cached stems in memory for this song
+        // Check if we have cached stems (or evicted metadata stubs) in memory for this song
         let loadedFromCache = (songBuffersCache[song.id]?.isEmpty == false)
         if let cached = songBuffersCache[song.id], !cached.isEmpty {
             loadedItems.reserveCapacity(cached.count)
             for (track, buf) in cached {
-                let finalBuffer = normalizeBufferToCanonical(buffer: buf, targetFormat: canonicalFormat)
+                let needsNormalize = buf.frameLength > 1 &&
+                    (buf.format.sampleRate != canonicalFormat.sampleRate || buf.format.channelCount != canonicalFormat.channelCount)
+                let finalBuffer = needsNormalize
+                    ? normalizeBufferToCanonical(buffer: buf, targetFormat: canonicalFormat)
+                    : buf
                 loadedItems.append((track, finalBuffer))
             }
-        } else if !song.stemURLs.isEmpty {
-            loadedItems = reconstructTracksFromStemURLs(for: song, canonicalFormat: canonicalFormat)
+        } else if let backed = songTrackMetadataBackup[song.id], !backed.isEmpty,
+                  let stub = makeSilentStub(format: canonicalFormat) {
+            loadedItems = backed.map { ($0, stub) }
         }
         
         // Deduplicate synthesized utility tracks if an uploaded Click/Guide track already exists
@@ -266,10 +280,12 @@ extension MultitrackAudioEngine {
         // Guarantees Click and Guide channel strips are ALWAYS included, defaulting to generated if not uploaded
         let nonUtilityWithFiles = loadedItems.filter { !Self.isClickOrGuideTrack($0.0) && $0.0.fileURL != nil }
         let isMetadataPlaceholder: Bool
-        if !nonUtilityWithFiles.isEmpty {
+        if hydrationNeed.needsPristine || downloadingSongProgress[song.id] != nil {
+            isMetadataPlaceholder = true
+        } else if !nonUtilityWithFiles.isEmpty {
             isMetadataPlaceholder = nonUtilityWithFiles.allSatisfy { $0.1.frameLength <= 1 }
         } else {
-            isMetadataPlaceholder = downloadingSongProgress[song.id] != nil
+            isMetadataPlaceholder = false
         }
         let baseDuration: TimeInterval
         if isMetadataPlaceholder {
@@ -375,29 +391,7 @@ extension MultitrackAudioEngine {
         var newPristine: [UUID: AVAudioPCMBuffer] = [:]
         var maxDur: TimeInterval = 0.0
         
-        var cachedTransposed = cachedTransformedBuffers(for: song)
-        
-        if !isMetadataPlaceholder && (song.transposeSemitones != 0 || song.isTempoShifted) && cachedTransposed == nil {
-            let targetTrackIds = loadedItems.filter { shouldRenderTransformedTrack($0.0, for: song, tempoShifted: song.isTempoShifted) }.map { $0.0.id }
-            if !targetTrackIds.isEmpty,
-               let diskShifted = PlaybackFileManager.shared.loadTransposedBuffersFromDisk(
-                   songId: song.id,
-                   semitones: song.transposeSemitones,
-                   preserveVocalFormants: song.preserveVocalFormants,
-                   bpm: song.bpm,
-                   originalBPM: song.originalBPM,
-                   trackIds: targetTrackIds,
-                   canonicalFormat: canonicalFormat
-               ) {
-                songTransposedBuffersCache[song.id] = (
-                    song.transposeSemitones,
-                    song.preserveVocalFormants,
-                    PlaybackFileManager.cacheBPMHundredths(song.bpm),
-                    diskShifted
-                )
-                cachedTransposed = diskShifted
-            }
-        }
+        let cachedTransposed = cachedTransformedBuffers(for: song)
         
         for (track, finalBuffer) in loadedItems {
             track.peakLevelLeft = 0.0
@@ -417,7 +411,7 @@ extension MultitrackAudioEngine {
             track.duration = trackDuration
             if trackDuration > maxDur { maxDur = trackDuration }
             
-            if !isMetadataPlaceholder && track.waveformPeaks.isEmpty && track.includeInWaveform {
+            if !isMetadataPlaceholder && track.waveformPeaks.isEmpty && track.includeInWaveform && finalBuffer.frameLength > 100 {
                 track.waveformPeaks = extractWaveformPeaks(from: finalBuffer, samplesCount: 4000)
             }
             
@@ -429,10 +423,12 @@ extension MultitrackAudioEngine {
             newTracks.append(track)
         }
         
-        songBuffersCache[song.id] = loadedItems
-        recordTrackMetadataBackup(for: song.id, tracks: loadedItems.map { $0.0 })
-        if !isMetadataPlaceholder {
-            memoryEvictedSongIds.remove(song.id)
+        if !loadedItems.isEmpty {
+            songBuffersCache[song.id] = loadedItems
+            recordTrackMetadataBackup(for: song.id, tracks: loadedItems.map { $0.0 })
+            if !isMetadataPlaceholder && hasAllRequiredAudioHydrated(in: loadedItems) {
+                memoryEvictedSongIds.remove(song.id)
+            }
         }
         
         // Single batched state assignment -> SwiftUI only diffs `MixerRackView` once!
@@ -456,7 +452,7 @@ extension MultitrackAudioEngine {
         }
         
         updateSMPTEState(persistDevicePreset: false)
-        updateMatrix()
+        updateMatrix(persistBusRouting: false)
         if isLoopActive {
             syncMixState()
         }
@@ -489,7 +485,7 @@ extension MultitrackAudioEngine {
                 applyGuideBuffer()
             }
             preGenerateRemainingSetlistClickAndGuide()
-            if song.transposeSemitones != 0 || song.isTempoShifted {
+            if (song.transposeSemitones != 0 || song.isTempoShifted) && !needsAsyncHydration {
                 if cachedTransposed == nil {
                     if transposeTasksBySong[song.id] != nil {
                         // Already transposing this song in the background — do not cancel or restart it
@@ -511,6 +507,10 @@ extension MultitrackAudioEngine {
                 }
             }
         }
+        if needsAsyncHydration {
+            startAsyncHydrationForActiveSong(song, generation: activeGeneration)
+        }
+        scheduleSlidingWindowRebalance()
     }
     
     // MARK: - Pre-Rendered Offline Transposition Feature (Excludes Click & Guide)
@@ -1184,11 +1184,14 @@ extension MultitrackAudioEngine {
             songBuffersCache[songId] = cached
         }
     }
-    /// Sequentially pre-renders generated Click and Guide buffers for other songs in the setlist
-    /// in the background so switching songs is instantaneous without stalling the UI or audio thread.
+    /// Sequentially pre-renders generated Click and Guide buffers for nearby window songs in the setlist
+    /// in the background so switching adjacent songs is instantaneous without bloating RAM on distant songs.
     public func preGenerateRemainingSetlistClickAndGuide() {
         preGenerateSetlistTask?.cancel()
-        let songIds = currentSetlist.songs.map { $0.id }
+        let songIds = prioritizedWindowSongIds(
+            around: currentSongIndex,
+            maxCount: effectiveMemoryWindowPolicy().maxResidentSongs
+        )
         let activeId = currentSong.id
         preGenerateSetlistTask = Task { [weak self] in
             // Let the active song settle first
@@ -1453,6 +1456,18 @@ extension MultitrackAudioEngine {
         sessionHydrationTask = nil
         sessionHydrationGeneration &+= 1
 
+        activeSongHydrationTask?.cancel()
+        activeSongHydrationTask = nil
+        songSwitchGeneration &+= 1
+        hydratingSongIds.removeAll()
+        pendingPlayAfterHydration = false
+        pendingPlaySectionAfterHydration = nil
+
+        slidingWindowRebalanceTask?.cancel()
+        slidingWindowRebalanceTask = nil
+        backgroundPrefetchTasksBySong.values.forEach { $0.cancel() }
+        backgroundPrefetchTasksBySong.removeAll()
+
         preGenerateSetlistTask?.cancel()
         preGenerateSetlistTask = nil
 
@@ -1475,6 +1490,8 @@ extension MultitrackAudioEngine {
         guard index >= 0 && index < currentSetlist.songs.count else { return }
         let removedSong = currentSetlist.songs.remove(at: index)
         cancelTransposeTask(for: removedSong.id)
+        backgroundPrefetchTasksBySong.removeValue(forKey: removedSong.id)?.cancel()
+        hydratingSongIds.remove(removedSong.id)
         songBuffersCache.removeValue(forKey: removedSong.id)
         memoryEvictedSongIds.remove(removedSong.id)
         songTrackMetadataBackup.removeValue(forKey: removedSong.id)
@@ -2518,7 +2535,22 @@ extension MultitrackAudioEngine {
                         let needsDownload = downloadIdSet.contains(entry.id)
                         group.addTask { [weak self] in
                             if Task.isCancelled || self?.isSongDownloadCancelled(entry.id) == true { return }
+                            let plan: (skipDecode: Bool, keepInRAM: Bool) = await MainActor.run { [weak self] in
+                                guard let self = self, self.sessionHydrationGeneration == generation else {
+                                    return (true, false)
+                                }
+                                let cached = self.songBuffersCache[entry.id] ?? []
+                                let alreadyReady = self.hydratingSongIds.contains(entry.id) ||
+                                    (!self.memoryEvictedSongIds.contains(entry.id) && self.hasAllRequiredAudioHydrated(in: cached))
+                                let keepRAM = self.isSongInProtectedRAMWindow(entry.id)
+                                return (!needsDownload && alreadyReady, keepRAM)
+                            }
+                            if plan.skipDecode || Task.isCancelled || self?.isSongDownloadCancelled(entry.id) == true {
+                                return
+                            }
+                            let keepInRAM = plan.keepInRAM
                             let expectedAudioTrackCount = entry.tracks.filter { !$0.relativeAudioPath.isEmpty }.count
+                            let expectedAudioTrackIds = Set(entry.tracks.filter { !$0.relativeAudioPath.isEmpty }.map { $0.id })
                             var decodedTracks: [(StemTrack, AVAudioPCMBuffer)] = []
                             var decodedTransposed: [UUID: AVAudioPCMBuffer] = [:]
 
@@ -2531,6 +2563,7 @@ extension MultitrackAudioEngine {
                                     rootFolder: hydrated.metadataRootFolder,
                                     canonicalFormat: canonicalFormat,
                                     localLibraryIndex: localLibraryIndex,
+                                    keepPCMInMemory: keepInRAM,
                                     isCancelled: { [weak self] in
                                         Task.isCancelled || (self?.isSongDownloadCancelled(entry.id) ?? true)
                                     },
@@ -2546,7 +2579,16 @@ extension MultitrackAudioEngine {
                                 )
                                 decodedTracks = res.tracks
                                 decodedTransposed = res.transposedBuffers
-                                let hydratedAudioCount = decodedTracks.filter { $0.1.frameLength > 100 }.count
+                                let hydratedAudioCount: Int
+                                if keepInRAM {
+                                    hydratedAudioCount = decodedTracks.filter { $0.1.frameLength > 100 }.count
+                                } else {
+                                    hydratedAudioCount = decodedTracks.filter { track, _ in
+                                        expectedAudioTrackIds.contains(track.id) &&
+                                        track.fileURL != nil &&
+                                        FileManager.default.fileExists(atPath: track.fileURL!.path)
+                                    }.count
+                                }
                                 if hydratedAudioCount >= expectedAudioTrackCount || attempt == 4 {
                                     break
                                 }
@@ -2559,7 +2601,7 @@ extension MultitrackAudioEngine {
 
                             var finalTransposed = decodedTransposed
                             let entryTempoShifted = abs(entry.bpm - entry.originalBPM) > 0.005
-                            if (entry.transposeSemitones != 0 || entryTempoShifted) && finalTransposed.isEmpty {
+                            if keepInRAM && (entry.transposeSemitones != 0 || entryTempoShifted) && finalTransposed.isEmpty {
                                 let targetTrackIds = decodedTracks.filter { (track, _) in
                                     if !Self.isClickOrGuideTrack(track) { return true }
                                     guard entryTempoShifted else { return false }
@@ -2593,7 +2635,8 @@ extension MultitrackAudioEngine {
                                     songId: entry.id,
                                     decodedTracks: finalTracks,
                                     decodedTransposed: resolvedTransposed,
-                                    canonicalFormat: canonicalFormat
+                                    canonicalFormat: canonicalFormat,
+                                    keptPCMInMemory: keepInRAM
                                 )
                             }
                         }
@@ -2614,7 +2657,8 @@ extension MultitrackAudioEngine {
         songId: UUID,
         decodedTracks: [(StemTrack, AVAudioPCMBuffer)],
         decodedTransposed: [UUID: AVAudioPCMBuffer],
-        canonicalFormat: AVAudioFormat
+        canonicalFormat: AVAudioFormat,
+        keptPCMInMemory: Bool = true
     ) {
         guard let songIdx = currentSetlist.songs.firstIndex(where: { $0.id == songId }) else { return }
         let song = currentSetlist.songs[songIdx]
@@ -2707,11 +2751,14 @@ extension MultitrackAudioEngine {
                 maxDur = track.duration
             }
             
-            if track.waveformPeaks.isEmpty && track.includeInWaveform && norm.frameLength > 100 {
-                track.waveformPeaks = decTrack.waveformPeaks.isEmpty
-                    ? extractWaveformPeaks(from: norm, samplesCount: 4000)
-                    : decTrack.waveformPeaks
-                didUpdatePeaks = true
+            if track.waveformPeaks.isEmpty && track.includeInWaveform {
+                if !decTrack.waveformPeaks.isEmpty {
+                    track.waveformPeaks = decTrack.waveformPeaks
+                    didUpdatePeaks = true
+                } else if norm.frameLength > 100 {
+                    track.waveformPeaks = extractWaveformPeaks(from: norm, samplesCount: 4000)
+                    didUpdatePeaks = true
+                }
             }
             
             hydratedItems.append((track, bufferForCache))
@@ -2738,9 +2785,20 @@ extension MultitrackAudioEngine {
         
         songBuffersCache[songId] = hydratedItems
         recordTrackMetadataBackup(for: songId, tracks: hydratedItems.map { $0.0 })
-        if hydratedItems.contains(where: { !Self.isClickOrGuideTrack($0.0) && $0.1.frameLength > 100 })
-            || !hydratedItems.contains(where: { !Self.isClickOrGuideTrack($0.0) }) {
+        if hasAllRequiredAudioHydrated(in: hydratedItems) {
             memoryEvictedSongIds.remove(songId)
+        } else {
+            memoryEvictedSongIds.insert(songId)
+        }
+
+        if !keptPCMInMemory {
+            if isActiveSong {
+                tracks = hydratedItems.map { $0.0 }
+                startAsyncHydrationForActiveSong(currentSong, generation: songSwitchGeneration)
+            } else {
+                scheduleSlidingWindowRebalance()
+            }
+            return
         }
 
         // Fallback to generated Click/Guide if the song was marked `.uploaded` without an actual audio buffer
@@ -2797,7 +2855,7 @@ extension MultitrackAudioEngine {
             }
             
             syncMixState()
-            updateMatrix()
+            updateMatrix(persistBusRouting: false)
             
             if (currentSong.transposeSemitones != 0 || currentSong.isTempoShifted) &&
                cachedTransformedBuffers(for: currentSong) == nil {
@@ -2806,8 +2864,19 @@ extension MultitrackAudioEngine {
             if !isApplyingUndoRedo && undoStack.isEmpty {
                 baselineUndoSnapshot = captureCurrentUndoSnapshot()
             }
+            if pendingPlayAfterHydration && !isCurrentSongTransposing && !isCurrentSongDownloading {
+                let queuedSection = pendingPlaySectionAfterHydration
+                pendingPlayAfterHydration = false
+                pendingPlaySectionAfterHydration = nil
+                if let sec = queuedSection {
+                    playSection(sec)
+                } else {
+                    play()
+                }
+            }
+            scheduleSlidingWindowRebalance()
         } else {
-            if !song.excludesClickAndGuide && (song.clickSource == .generated || song.guideSource == .generated) {
+            if isSongInProtectedRAMWindow(songId) && !song.excludesClickAndGuide && (song.clickSource == .generated || song.guideSource == .generated) {
                 preGenerateClickAndGuide(forSongId: songId)
             }
             if (song.transposeSemitones != 0 || song.isTempoShifted) &&
@@ -2817,6 +2886,7 @@ extension MultitrackAudioEngine {
             if songIdx == currentSongIndex + 1 {
                 syncMixState()
             }
+            scheduleSlidingWindowRebalance()
         }
     }
     

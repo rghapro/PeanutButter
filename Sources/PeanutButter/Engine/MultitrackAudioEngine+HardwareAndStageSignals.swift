@@ -412,8 +412,255 @@ extension MultitrackAudioEngine {
         memoryPressureSource = source
     }
 
+    // MARK: - Proactive Sliding-Window Memory Management
+
+    public func effectiveMemoryWindowPolicy() -> MemoryWindowPolicy {
+        memoryWindowPolicyOverride ?? .forPhysicalMemory()
+    }
+
+    static func pcmBufferByteSize(_ buffer: AVAudioPCMBuffer) -> Int64 {
+        Int64(buffer.frameLength) * Int64(max(1, buffer.format.channelCount)) * Int64(MemoryLayout<Float>.size)
+    }
+
+    func estimatedResidentPCMBytes(for songId: UUID) -> Int64 {
+        var seen = Set<ObjectIdentifier>()
+        var total: Int64 = 0
+
+        func account(_ buf: AVAudioPCMBuffer?) {
+            guard let buf = buf, buf.frameLength > 1 else { return }
+            let oid = ObjectIdentifier(buf)
+            if seen.insert(oid).inserted {
+                total += Self.pcmBufferByteSize(buf)
+            }
+        }
+
+        if songId == currentSong.id {
+            for buf in pristineMasterBuffers.values {
+                account(buf)
+            }
+            for ch in channels.values {
+                account(ch.buffer)
+            }
+        }
+        if let cached = songBuffersCache[songId] {
+            for item in cached {
+                account(item.buffer)
+            }
+        }
+        if let transposed = songTransposedBuffersCache[songId]?.buffers {
+            for buf in transposed.values {
+                account(buf)
+            }
+        }
+        account(uploadedClickBuffers[songId])
+        account(uploadedGuideBuffers[songId])
+        account(generatedClickBuffers[songId])
+        account(generatedGuideBuffers[songId])
+        return total
+    }
+
+    func totalResidentPCMBytes() -> Int64 {
+        var total: Int64 = 0
+        for song in currentSetlist.songs {
+            total += estimatedResidentPCMBytes(for: song.id)
+        }
+        return total
+    }
+
+    func prioritizedWindowSongIds(around centerIndex: Int, maxCount: Int) -> [UUID] {
+        let count = currentSetlist.songs.count
+        guard count > 0, maxCount > 0 else { return [] }
+        let center = max(0, min(count - 1, centerIndex))
+        var result: [UUID] = []
+        var seen = Set<UUID>()
+
+        func appendIfValid(_ idx: Int) {
+            guard idx >= 0, idx < count, result.count < maxCount else { return }
+            let id = currentSetlist.songs[idx].id
+            if seen.insert(id).inserted {
+                result.append(id)
+            }
+        }
+
+        // Priority 0: Active song
+        appendIfValid(center)
+        // Priority 1: Next song (always protected for 0.00ms Auto-Link/Overlap/Crossfade transitions)
+        appendIfValid(center + 1)
+        // Priority 2: Previous song
+        appendIfValid(center - 1)
+        // Priority 3+: Expand outward (+offset, -offset)
+        var offset = 2
+        while result.count < min(maxCount, count) && offset <= count {
+            appendIfValid(center + offset)
+            appendIfValid(center - offset)
+            offset += 1
+        }
+        return result
+    }
+
+    func isSongInProtectedRAMWindow(_ songId: UUID) -> Bool {
+        let windowIds = prioritizedWindowSongIds(
+            around: currentSongIndex,
+            maxCount: effectiveMemoryWindowPolicy().maxResidentSongs
+        )
+        return windowIds.contains(songId)
+    }
+
+    @discardableResult
+    func evictSongFromMemory(
+        _ songId: UUID,
+        allowWaveformEviction: Bool = false,
+        forceDropTransposedWithoutDiskCache: Bool = false
+    ) -> Bool {
+        guard songId != currentSong.id else { return false }
+        if downloadingSongProgress[songId] != nil ||
+           transposeTasksBySong[songId] != nil ||
+           transposingSongId == songId ||
+           hydratingSongIds.contains(songId) {
+            return false
+        }
+
+        var didRelease = false
+        let song = currentSetlist.songs.first(where: { $0.id == songId })
+
+        if let transEntry = songTransposedBuffersCache[songId] {
+            let canDropTransposed: Bool
+            if forceDropTransposedWithoutDiskCache {
+                canDropTransposed = true
+            } else if let song = song {
+                let targetTrackIds = Array(transEntry.buffers.keys)
+                canDropTransposed = PlaybackFileManager.shared.hasTransposedBuffersOnDisk(
+                    songId: songId,
+                    semitones: song.transposeSemitones,
+                    preserveVocalFormants: song.preserveVocalFormants,
+                    bpm: song.bpm,
+                    originalBPM: song.originalBPM,
+                    trackIds: targetTrackIds
+                )
+            } else {
+                canDropTransposed = true
+            }
+            if canDropTransposed {
+                songTransposedBuffersCache.removeValue(forKey: songId)
+                didRelease = true
+            }
+        }
+
+        if let existing = songBuffersCache[songId],
+           !existing.isEmpty,
+           existing.contains(where: { $0.buffer.frameLength > 100 }) {
+            let allHaveLocalFiles = existing.allSatisfy { (track, _) in
+                if track.fileURL == nil && Self.isClickOrGuideTrack(track) {
+                    return true
+                }
+                return Self.hasLocalBackingAudioFile(for: track)
+            }
+            if allHaveLocalFiles, let stub = makeSilentStub(format: getCanonicalProcessingFormat()) {
+                recordTrackMetadataBackup(for: songId, tracks: existing.map { $0.track })
+                var stubbed: [(track: StemTrack, buffer: AVAudioPCMBuffer)] = []
+                stubbed.reserveCapacity(existing.count)
+                for (track, _) in existing {
+                    if track.fileURL == nil && PlaybackFileManager.shared.hasValidCachedStem(for: track.id) {
+                        track.fileURL = PlaybackFileManager.shared.cachedStemURL(for: track.id)
+                    }
+                    stubbed.append((track: track, buffer: stub))
+                }
+                songBuffersCache[songId] = stubbed
+                uploadedClickBuffers.removeValue(forKey: songId)
+                uploadedGuideBuffers.removeValue(forKey: songId)
+                generatedClickBuffers.removeValue(forKey: songId)
+                generatedGuideBuffers.removeValue(forKey: songId)
+                generatedGuideLoopStates.removeValue(forKey: songId)
+                memoryEvictedSongIds.insert(songId)
+                didRelease = true
+            }
+        }
+
+        if generatedClickBuffers.removeValue(forKey: songId) != nil {
+            didRelease = true
+        }
+        if generatedGuideBuffers.removeValue(forKey: songId) != nil {
+            generatedGuideLoopStates.removeValue(forKey: songId)
+            didRelease = true
+        }
+
+        if allowWaveformEviction {
+            songWaveformCache.removeValue(forKey: songId)
+        }
+        return didRelease
+    }
+
+    public func rebalanceSlidingWindowMemory(prefetchNeighbors: Bool = true) {
+        let count = currentSetlist.songs.count
+        guard count > 0 else { return }
+
+        let policy = effectiveMemoryWindowPolicy()
+        let windowIds = prioritizedWindowSongIds(around: currentSongIndex, maxCount: policy.maxResidentSongs)
+        let windowSet = Set(windowIds)
+
+        // Pass 1: Evict songs outside the active sliding window
+        for song in currentSetlist.songs where !windowSet.contains(song.id) {
+            backgroundPrefetchTasksBySong.removeValue(forKey: song.id)?.cancel()
+            _ = evictSongFromMemory(
+                song.id,
+                allowWaveformEviction: false,
+                forceDropTransposedWithoutDiskCache: false
+            )
+        }
+
+        // Pass 2: Enforce soft PCM byte budget without ever evicting Active (index 0) or Next (index 1)
+        if totalResidentPCMBytes() > policy.softPCMByteBudget && windowIds.count > 2 {
+            for idx in stride(from: windowIds.count - 1, through: 2, by: -1) {
+                if totalResidentPCMBytes() <= policy.softPCMByteBudget {
+                    break
+                }
+                let candidateId = windowIds[idx]
+                backgroundPrefetchTasksBySong.removeValue(forKey: candidateId)?.cancel()
+                _ = evictSongFromMemory(
+                    candidateId,
+                    allowWaveformEviction: false,
+                    forceDropTransposedWithoutDiskCache: false
+                )
+            }
+        }
+
+        guard prefetchNeighbors else { return }
+
+        // Pass 3: Proactively prefetch Next song (0.00ms transitions) and Prev song (if within budget)
+        let nextIdx = currentSongIndex + 1
+        if nextIdx >= 0 && nextIdx < count {
+            let nextSong = currentSetlist.songs[nextIdx]
+            let need = songNeedsBufferHydration(nextSong)
+            if need.needsPristine || need.needsTransposedDisk {
+                prefetchSongInBackgroundIfNeeded(song: nextSong)
+            }
+        }
+
+        let prevIdx = currentSongIndex - 1
+        if prevIdx >= 0 && prevIdx < count {
+            let prevSong = currentSetlist.songs[prevIdx]
+            if windowSet.contains(prevSong.id) && totalResidentPCMBytes() < policy.softPCMByteBudget {
+                let need = songNeedsBufferHydration(prevSong)
+                if need.needsPristine || need.needsTransposedDisk {
+                    prefetchSongInBackgroundIfNeeded(song: prevSong)
+                }
+            }
+        }
+    }
+
+    func scheduleSlidingWindowRebalance(delayNanoseconds: UInt64 = 220_000_000) {
+        slidingWindowRebalanceTask?.cancel()
+        slidingWindowRebalanceTask = Task { @MainActor [weak self] in
+            if delayNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: delayNanoseconds)
+            }
+            guard !Task.isCancelled, let self = self else { return }
+            self.rebalanceSlidingWindowMemory(prefetchNeighbors: true)
+        }
+    }
+
     /// Graceful fallback for lower-RAM Macs under memory pressure: preserves active + immediate next song
-    /// in RAM for 0.00ms transitions while unloading distant session-backed song PCM buffers without ever
+    /// in RAM for 0.00ms transitions while unloading distant locally-backed song PCM buffers without ever
     /// discarding track metadata (names, roles, mutes, faders, routing, or buses).
     public func handleMemoryPressure(critical: Bool) {
         // Release transient orphan buffers immediately on any memory pressure warning,
@@ -428,7 +675,7 @@ extension MultitrackAudioEngine {
             canUndo = !undoStack.isEmpty
         }
 
-        guard currentSessionURL != nil, currentSetlist.songs.count > 2 else { return }
+        guard currentSetlist.songs.count > 2 else { return }
         var protectedIds = Set<UUID>()
         protectedIds.insert(currentSong.id)
         let nextIdx = currentSongIndex + 1
@@ -442,43 +689,14 @@ extension MultitrackAudioEngine {
             }
         }
         for song in currentSetlist.songs where !protectedIds.contains(song.id) {
-            if downloadingSongProgress[song.id] != nil ||
-               transposeTasksBySong[song.id] != nil ||
-               transposingSongId == song.id {
-                continue
-            }
-
-            songTransposedBuffersCache.removeValue(forKey: song.id)
-
+            backgroundPrefetchTasksBySong.removeValue(forKey: song.id)?.cancel()
             if critical || currentSetlist.songs.count > 3 {
-                if let existing = songBuffersCache[song.id],
-                   !existing.isEmpty,
-                   existing.contains(where: { $0.buffer.frameLength > 100 }) {
-                    let allHaveLocalFiles = existing.allSatisfy { (track, _) in
-                        if track.fileURL == nil && Self.isClickOrGuideTrack(track) {
-                            return true
-                        }
-                        return Self.hasLocalBackingAudioFile(for: track)
-                    }
-                    if allHaveLocalFiles, let stub = makeSilentStub(format: getCanonicalProcessingFormat()) {
-                        recordTrackMetadataBackup(for: song.id, tracks: existing.map { $0.track })
-                        var stubbed: [(track: StemTrack, buffer: AVAudioPCMBuffer)] = []
-                        stubbed.reserveCapacity(existing.count)
-                        for (track, _) in existing {
-                            if track.fileURL == nil && PlaybackFileManager.shared.hasValidCachedStem(for: track.id) {
-                                track.fileURL = PlaybackFileManager.shared.cachedStemURL(for: track.id)
-                            }
-                            stubbed.append((track: track, buffer: stub))
-                        }
-                        songBuffersCache[song.id] = stubbed
-                        uploadedClickBuffers.removeValue(forKey: song.id)
-                        uploadedGuideBuffers.removeValue(forKey: song.id)
-                        memoryEvictedSongIds.insert(song.id)
-                    }
-                }
-            }
-
-            if critical {
+                _ = evictSongFromMemory(
+                    song.id,
+                    allowWaveformEviction: critical,
+                    forceDropTransposedWithoutDiskCache: true
+                )
+            } else if critical {
                 songWaveformCache.removeValue(forKey: song.id)
             }
         }
@@ -543,8 +761,15 @@ extension MultitrackAudioEngine {
                 isMono: bus.isMono
             )
         }
-        if let data = try? JSONEncoder().encode(dict) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        if let data = try? encoder.encode(dict) {
+            if key == lastSavedBusRoutingKey && data == lastSavedBusRoutingData {
+                return
+            }
             UserDefaults.standard.set(data, forKey: key)
+            lastSavedBusRoutingKey = key
+            lastSavedBusRoutingData = data
         }
     }
     

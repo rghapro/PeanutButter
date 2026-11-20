@@ -8,6 +8,31 @@ import QuartzCore
 import SwiftUI
 import os
 
+/// Controls the physical-RAM-scaled sliding window of resident decoded song PCM buffers.
+public struct MemoryWindowPolicy: Equatable, Sendable {
+    public let maxResidentSongs: Int
+    public let softPCMByteBudget: Int64
+
+    public init(maxResidentSongs: Int, softPCMByteBudget: Int64) {
+        self.maxResidentSongs = maxResidentSongs
+        self.softPCMByteBudget = softPCMByteBudget
+    }
+
+    public static func forPhysicalMemory(_ bytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> MemoryWindowPolicy {
+        let gb = Double(bytes) / 1_073_741_824.0
+        if gb <= 18.0 {
+            // 8 GB / 16 GB Macs: Active + Next + Prev hot in RAM (~3.5 GB soft PCM budget)
+            return MemoryWindowPolicy(maxResidentSongs: 3, softPCMByteBudget: 3_500_000_000)
+        } else if gb <= 36.0 {
+            // 24 GB / 32 GB Macs: 6-song sliding window (~8 GB soft PCM budget)
+            return MemoryWindowPolicy(maxResidentSongs: 6, softPCMByteBudget: 8_000_000_000)
+        } else {
+            // 48 GB+ Macs: 12-song sliding window (~18 GB soft PCM budget)
+            return MemoryWindowPolicy(maxResidentSongs: 12, softPCMByteBudget: 18_000_000_000)
+        }
+    }
+}
+
 /// Core multitrack audio engine managing sample-accurate 26+ track synchronized playback, bussing, and transport
 @MainActor
 public final class MultitrackAudioEngine: ObservableObject {
@@ -232,6 +257,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                 return nil
             }
         }
+        rehydrateEvictedSongBuffersIfNeeded(for: song)
         if let cached = songBuffersCache[song.id] {
             return cached.map { ($0.0, $0.1) }
         }
@@ -648,6 +674,17 @@ public final class MultitrackAudioEngine: ObservableObject {
     var songWaveformCache: [UUID: (peaks: [Float], image: NSImage?)] = [:]
     // Transformed audio buffers cache for transposed / tempo-shifted songs in the setlist
     var songTransposedBuffersCache: [UUID: (semitones: Int, preserveVocalFormants: Bool, bpmHundredths: Int, buffers: [UUID: AVAudioPCMBuffer])] = [:]
+    @Published public internal(set) var hydratingSongIds: Set<UUID> = []
+    @Published public internal(set) var pendingPlayAfterHydration: Bool = false
+    var pendingPlaySectionAfterHydration: SongSection? = nil
+    public var isCurrentSongHydrating: Bool { hydratingSongIds.contains(currentSong.id) }
+    var songSwitchGeneration: UInt64 = 0
+    var activeSongHydrationTask: Task<Void, Never>? = nil
+    var backgroundPrefetchTasksBySong: [UUID: Task<Void, Never>] = [:]
+    var slidingWindowRebalanceTask: Task<Void, Never>? = nil
+    var memoryWindowPolicyOverride: MemoryWindowPolicy? = nil
+    var lastSavedBusRoutingKey: String? = nil
+    var lastSavedBusRoutingData: Data? = nil
 
     // Hardware Audio Devices
     public let deviceManager = AudioDeviceManager.shared
@@ -963,6 +1000,9 @@ public final class MultitrackAudioEngine: ObservableObject {
         if let obs = engineConfigObserver {
             NotificationCenter.default.removeObserver(obs)
         }
+        activeSongHydrationTask?.cancel()
+        slidingWindowRebalanceTask?.cancel()
+        backgroundPrefetchTasksBySong.values.forEach { $0.cancel() }
         uiFallbackTimer?.invalidate()
         uiDisplayLink?.invalidate()
         transportWatchdogTimer?.cancel()
@@ -2717,7 +2757,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
     }
 
-    public func updateMatrix() {
+    public func updateMatrix(persistBusRouting: Bool = true) {
         let anyTrackSoloed = channels.values.contains { $0.track.isSoloed } || padChannelSoloed
         let anyBusSoloed = busses.contains { $0.isSoloed }
         
@@ -2767,7 +2807,9 @@ public final class MultitrackAudioEngine: ObservableObject {
         } else {
             syncMixState()
         }
-        saveBusRouting(for: deviceManager.selectedDevice)
+        if persistBusRouting {
+            saveBusRouting(for: deviceManager.selectedDevice)
+        }
         refreshSoloWaveformIfNeeded()
         objectWillChange.send()
     }
