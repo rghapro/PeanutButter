@@ -1027,7 +1027,7 @@ public final class RemoteControlServer: ObservableObject {
                 title: item.title,
                 artist: item.artist,
                 bpm: item.bpm,
-                musicalKey: item.musicalKey,
+                musicalKey: item.currentTransposedKey,
                 isActive: idx == engine.currentSongIndex
             )
         }
@@ -1079,7 +1079,7 @@ public final class RemoteControlServer: ObservableObject {
             songTitle: song.title,
             artist: song.artist,
             bpm: song.bpm,
-            musicalKey: song.musicalKey,
+            musicalKey: song.currentTransposedKey,
             isPlaying: engine.playbackState == .playing,
             currentTime: currentTime,
             duration: engine.currentSongDuration,

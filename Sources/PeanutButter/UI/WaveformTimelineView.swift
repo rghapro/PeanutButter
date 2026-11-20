@@ -175,6 +175,7 @@ public struct WaveformTimelineView: View {
     @State private var lockedStationaryTime: TimeInterval? = nil
     @State private var snapCommitWorkItem: DispatchWorkItem? = nil
     @State private var gridTileCache = BeatGridTileCache()
+    @State private var waveformTileCache = WaveformTileCache()
     
     private func scheduleAutoSnapTimer() {
         autoSnapTimer?.invalidate()
@@ -310,6 +311,13 @@ public struct WaveformTimelineView: View {
             )
             let laneHeight: CGFloat = 22.0
             let waveformHeight = max(100.0, geo.size.height - laneHeight)
+            let waveformKey = WaveformTileCache.CacheKey(
+                songId: engine.currentSong.id,
+                waveformVersion: engine.waveformVersion,
+                waveformWidthQ: Int((waveformWidth * 2.0).rounded()),
+                heightQ: Int((waveformHeight * 2.0).rounded()),
+                peakCount: aggregateWaveform.count
+            )
             let midY = waveformHeight * 0.50
             let badgeY = geo.size.height - 44.0
             let leadPlusX: CGFloat = 18.0
@@ -395,6 +403,9 @@ public struct WaveformTimelineView: View {
                         engine: engine,
                         gridTileCache: gridTileCache,
                         gridKey: gridKey,
+                        waveformTileCache: waveformTileCache,
+                        waveformKey: waveformKey,
+                        peaks: aggregateWaveform,
                         waveformWidth: waveformWidth,
                         waveformHeight: waveformHeight,
                         viewportWidth: geo.size.width,
@@ -745,10 +756,7 @@ public struct WaveformTimelineView: View {
         let waveformHeight = max(100.0, geo.size.height - laneHeight)
         
         ZStack(alignment: .topLeading) {
-            // 1. Waveform & Centerline (confined to upper window above cue lane)
-            waveformView(waveformWidth: waveformWidth, height: waveformHeight)
-            
-            // 2. Time Signature Badges in timeline coordinates (move natively with scroll offset)
+            // 1. Time Signature Badges in timeline coordinates (move natively with scroll offset)
             if !engine.currentSong.timeSignatureChanges.isEmpty {
                 ForEach(engine.currentSong.timeSignatureChanges) { tsChange in
                     let dispTime: TimeInterval = {
@@ -912,47 +920,6 @@ public struct WaveformTimelineView: View {
             )
             .zIndex(200)
         }
-    }
-    
-    @ViewBuilder
-    private func waveformView(waveformWidth: CGFloat, height: CGFloat) -> some View {
-        if let img = engine.renderedWaveformImage {
-            Image(nsImage: img)
-                .resizable(resizingMode: .stretch)
-                .frame(width: waveformWidth, height: height)
-        } else if !aggregateWaveform.isEmpty {
-            Canvas { context, size in
-                guard size.width > 0, size.height > 0 else { return }
-                let midY = size.height * 0.50
-                let maxH = size.height * 0.30 // Equal ~50pt margin above (for section pills) and below (for cues track)
-                let count = aggregateWaveform.count
-                let step = size.width / CGFloat(max(1, count - 1))
-                
-                var path = Path()
-                path.move(to: CGPoint(x: 0, y: midY))
-                for i in 0..<count {
-                    let x = CGFloat(i) * step
-                    let peak = CGFloat(max(0.02, aggregateWaveform[i]))
-                    path.addLine(to: CGPoint(x: x, y: midY - peak * maxH))
-                }
-                path.addLine(to: CGPoint(x: size.width, y: midY))
-                for i in (0..<count).reversed() {
-                    let x = CGFloat(i) * step
-                    let peak = CGFloat(max(0.02, aggregateWaveform[i]))
-                    path.addLine(to: CGPoint(x: x, y: midY + peak * maxH))
-                }
-                path.closeSubpath()
-                context.fill(path, with: .color(Color(red: 0.82, green: 0.85, blue: 0.88).opacity(0.85)))
-            }
-            .frame(width: waveformWidth, height: height)
-        }
-        
-        Path { p in
-            let midY = height * 0.50
-            p.move(to: CGPoint(x: 0, y: midY))
-            p.addLine(to: CGPoint(x: waveformWidth, y: midY))
-        }
-        .stroke(Color.white.opacity(0.18), lineWidth: 1)
     }
     
     @ViewBuilder
@@ -1702,6 +1669,9 @@ private struct TimelinePlayheadScrollContainer<StaticContent: View>: View {
     let engine: MultitrackAudioEngine
     let gridTileCache: BeatGridTileCache
     let gridKey: BeatGridTileCache.CacheKey
+    let waveformTileCache: WaveformTileCache
+    let waveformKey: WaveformTileCache.CacheKey
+    let peaks: [Float]
     let waveformWidth: CGFloat
     let waveformHeight: CGFloat
     let viewportWidth: CGFloat
@@ -1739,8 +1709,8 @@ private struct TimelinePlayheadScrollContainer<StaticContent: View>: View {
 
         let tileW = BeatGridTileCache.tileWidth
         let totalTiles = max(1, Int(ceil((waveformWidth + 4.0) / tileW)))
-        let minVisibleX = max(0, -scrollX - 24.0)
-        let maxVisibleX = min(waveformWidth + 4.0, -scrollX + viewportWidth + 24.0)
+        let minVisibleX = max(0, -scrollX - 128.0)
+        let maxVisibleX = min(waveformWidth + 4.0, -scrollX + viewportWidth + 128.0)
         let firstTile = max(0, Int(floor(minVisibleX / tileW)))
         let lastTile = min(totalTiles - 1, Int(ceil(maxVisibleX / tileW)))
 
@@ -1758,11 +1728,218 @@ private struct TimelinePlayheadScrollContainer<StaticContent: View>: View {
                     firstTile: firstTile,
                     lastTile: lastTile
                 ))
+
+                EquatableView(content: TimelineWaveformBandView(
+                    key: waveformKey,
+                    cache: waveformTileCache,
+                    peaks: peaks,
+                    waveformWidth: waveformWidth,
+                    height: waveformHeight,
+                    firstTile: firstTile,
+                    lastTile: lastTile
+                ))
             }
 
             scrollingStaticContent
         }
         .offset(x: scrollX)
+    }
+}
+
+private struct TimelineWaveformBandView: View, Equatable {
+    let key: WaveformTileCache.CacheKey
+    let cache: WaveformTileCache
+    let peaks: [Float]
+    let waveformWidth: CGFloat
+    let height: CGFloat
+    let firstTile: Int
+    let lastTile: Int
+
+    static func == (lhs: TimelineWaveformBandView, rhs: TimelineWaveformBandView) -> Bool {
+        lhs.key == rhs.key &&
+        lhs.firstTile == rhs.firstTile &&
+        lhs.lastTile == rhs.lastTile &&
+        lhs.height == rhs.height
+    }
+
+    var body: some View {
+        let _ = cache.ensureKey(key)
+        let tileW = WaveformTileCache.tileWidth
+        ZStack(alignment: .topLeading) {
+            if firstTile <= lastTile {
+                ForEach(firstTile...lastTile, id: \.self) { tileIdx in
+                    let tileStartX = CGFloat(tileIdx) * tileW
+                    let actualW = min(tileW, waveformWidth - tileStartX)
+                    if actualW > 0 {
+                        let img = cache.tileImage(
+                            index: tileIdx,
+                            tileWidth: actualW,
+                            height: height,
+                            waveformWidth: waveformWidth,
+                            peaks: peaks
+                        )
+                        Image(nsImage: img)
+                            .frame(width: actualW, height: height)
+                            .offset(x: tileStartX)
+                    }
+                }
+            }
+        }
+        .frame(width: max(1, waveformWidth), height: height, alignment: .topLeading)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Renders and caches 1024pt-wide Retina waveform bitmap tiles on demand so arbitrarily long or zoomed
+/// timelines never hit Metal's max texture dimensions or clip off-screen waveform regions.
+@MainActor
+fileprivate final class WaveformTileCache {
+    static let tileWidth: CGFloat = 1024.0
+    static let maxCachedTiles: Int = 48
+
+    struct CacheKey: Equatable {
+        let songId: UUID
+        let waveformVersion: UInt64
+        let waveformWidthQ: Int
+        let heightQ: Int
+        let peakCount: Int
+    }
+
+    private var currentKey: CacheKey?
+    private var tiles: [Int: NSImage] = [:]
+
+    func ensureKey(_ key: CacheKey) {
+        if currentKey != key {
+            currentKey = key
+            tiles.removeAll(keepingCapacity: true)
+        }
+    }
+
+    func tileImage(
+        index: Int,
+        tileWidth actualW: CGFloat,
+        height: CGFloat,
+        waveformWidth: CGFloat,
+        peaks: [Float]
+    ) -> NSImage {
+        if let existing = tiles[index] {
+            return existing
+        }
+
+        let scale: CGFloat = 2.0
+        let pxW = max(1, Int(ceil(actualW * scale)))
+        let pxH = max(1, Int(ceil(height * scale)))
+
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pxW,
+            pixelsHigh: pxH,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return NSImage(size: NSSize(width: actualW, height: height))
+        }
+        rep.size = NSSize(width: actualW, height: height)
+
+        NSGraphicsContext.saveGraphicsState()
+        if let baseCtx = NSGraphicsContext(bitmapImageRep: rep) {
+            let cg = baseCtx.cgContext
+            cg.translateBy(x: 0, y: height)
+            cg.scaleBy(x: 1, y: -1)
+            cg.setAllowsAntialiasing(true)
+            cg.setShouldAntialias(true)
+            cg.clip(to: CGRect(x: 0, y: 0, width: actualW, height: height))
+
+            let midY = height * 0.50
+            let maxAmp = height * 0.30
+            let tileStartX = CGFloat(index) * Self.tileWidth
+            let tileEndX = tileStartX + actualW
+            let count = peaks.count
+
+            if count > 1 && waveformWidth > 0 {
+                let step = waveformWidth / CGFloat(count - 1)
+                let startIdx = max(0, min(count - 1, Int(floor(tileStartX / step)) - 1))
+                let endIdx = max(startIdx, min(count - 1, Int(ceil(tileEndX / step)) + 1))
+
+                let path = CGMutablePath()
+                let firstX = CGFloat(startIdx) * step - tileStartX
+                let lastX = CGFloat(endIdx) * step - tileStartX
+                path.move(to: CGPoint(x: firstX, y: midY))
+                for i in startIdx...endIdx {
+                    let x = CGFloat(i) * step - tileStartX
+                    let peak = CGFloat(max(0.015, peaks[i]))
+                    path.addLine(to: CGPoint(x: x, y: midY - (peak * maxAmp)))
+                }
+                path.addLine(to: CGPoint(x: lastX, y: midY))
+                for i in (startIdx...endIdx).reversed() {
+                    let x = CGFloat(i) * step - tileStartX
+                    let peak = CGFloat(max(0.015, peaks[i]))
+                    path.addLine(to: CGPoint(x: x, y: midY + (peak * maxAmp)))
+                }
+                path.closeSubpath()
+
+                let colorSpace = CGColorSpaceCreateDeviceRGB()
+                let gradientColors = [
+                    NSColor(calibratedRed: 0.90, green: 0.92, blue: 0.95, alpha: 0.95).cgColor,
+                    NSColor(calibratedRed: 0.75, green: 0.79, blue: 0.83, alpha: 0.90).cgColor,
+                    NSColor(calibratedRed: 0.55, green: 0.59, blue: 0.63, alpha: 0.85).cgColor
+                ] as CFArray
+                if let gradient = CGGradient(colorsSpace: colorSpace, colors: gradientColors, locations: [0.0, 0.5, 1.0]) {
+                    cg.saveGState()
+                    cg.addPath(path)
+                    cg.clip()
+                    cg.drawLinearGradient(gradient, start: CGPoint(x: 0, y: 0), end: CGPoint(x: 0, y: height), options: [])
+                    cg.restoreGState()
+                }
+
+                cg.setLineWidth(1.0)
+                cg.setStrokeColor(NSColor(calibratedRed: 0.98, green: 0.99, blue: 1.0, alpha: 0.45).cgColor)
+                let firstEven = (startIdx % 2 == 0) ? startIdx : (startIdx + 1)
+                if firstEven <= endIdx {
+                    var segments: [CGPoint] = []
+                    segments.reserveCapacity(((endIdx - firstEven) / 2 + 1) * 2)
+                    for i in stride(from: firstEven, through: endIdx, by: 2) {
+                        let peak = CGFloat(peaks[i])
+                        if peak > 0.035 {
+                            let x = CGFloat(i) * step - tileStartX
+                            let amp = peak * maxAmp
+                            segments.append(CGPoint(x: x, y: midY - amp))
+                            segments.append(CGPoint(x: x, y: midY + amp))
+                        }
+                    }
+                    if !segments.isEmpty {
+                        cg.strokeLineSegments(between: segments)
+                    }
+                }
+            } else if count == 1 && waveformWidth > 0 {
+                let amp = CGFloat(max(0.015, peaks[0])) * maxAmp
+                cg.setFillColor(NSColor(calibratedRed: 0.75, green: 0.79, blue: 0.83, alpha: 0.90).cgColor)
+                cg.fill(CGRect(x: 0, y: midY - amp, width: actualW, height: amp * 2.0))
+            }
+
+            cg.setLineWidth(1.0)
+            cg.setStrokeColor(NSColor.white.withAlphaComponent(0.22).cgColor)
+            cg.strokeLineSegments(between: [
+                CGPoint(x: 0, y: midY),
+                CGPoint(x: actualW, y: midY)
+            ])
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        if tiles.count >= Self.maxCachedTiles {
+            if let furthest = tiles.keys.max(by: { abs($0 - index) < abs($1 - index) }) {
+                tiles.removeValue(forKey: furthest)
+            }
+        }
+        let image = NSImage(size: NSSize(width: actualW, height: height))
+        image.addRepresentation(rep)
+        tiles[index] = image
+        return image
     }
 }
 

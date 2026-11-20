@@ -718,6 +718,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         let beatsPerBar = max(1, timeSignatureNumerator)
         let secPerBar = secPerBeat * Double(beatsPerBar)
         let is68 = (timeSignatureNumerator == 6 && timeSignatureDenominator == 8)
+        let orderedSections = sections.sorted { $0.startTime < $1.startTime }
         
         // Partition beatGrid into ordered measures so count-ins and section cues follow mid-song tempo & meter changes
         let sortedGrid = beatGrid.sorted { $0.time < $1.time }
@@ -738,7 +739,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
                 phrasesToWarm.insert("\(b)")
             }
         }
-        for sec in sections {
+        for sec in orderedSections {
             let label = simplifySectionNameForSpeech(sec.name)
             if !label.isEmpty { phrasesToWarm.insert(label) }
         }
@@ -819,8 +820,10 @@ public final class GuideAudioGenerator: @unchecked Sendable {
                 let activeMarker = sortedGrid.last(where: { $0.time <= targetTime + 0.008 }) ?? sortedGrid.first
                 let localBPM = max(20.0, activeMarker?.instantaneousBPM ?? safeBpm)
                 let localBeatDur = (60.0 / localBPM) * (4.0 / Double(max(1, timeSignatureDenominator)))
-                return (0..<beatsPerBar).compactMap { k in
-                    let t = targetTime - Double(beatsPerBar - k) * localBeatDur
+                let localBeatsPerBar = max(1, activeMarker != nil ? timeSignatureNumerator : beatsPerBar)
+                guard targetTime >= Double(localBeatsPerBar) * localBeatDur - 0.05 else { return [] }
+                return (0..<localBeatsPerBar).compactMap { k in
+                    let t = targetTime - Double(localBeatsPerBar - k) * localBeatDur
                     return t >= -0.05 ? max(0.0, t) : nil
                 }
             }
@@ -881,10 +884,23 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             return nil
         }
         
+        func speakHalfNoteLeadIn(before cueStartTime: TimeInterval) {
+            guard countInEnabled else { return }
+            let prevBarTimes = cueMeasureTimestamps(before: cueStartTime)
+            guard !prevBarTimes.isEmpty,
+                  (prevBarTimes.last ?? 0.0) < cueStartTime - 0.05 else {
+                return
+            }
+            speak(phrase: "1", atTime: prevBarTimes[0])
+            if let halfBeat = halfwayBeatTime(in: prevBarTimes),
+               halfBeat < cueStartTime - 0.05 {
+                speak(phrase: "2", atTime: halfBeat)
+            }
+        }
+        
         // MARK: - 1. Count In at beginning of song
-        let firstSection = sections.first
+        let firstSection = orderedSections.first
         let startsWithCountIn = firstSection != nil && (firstSection!.abbreviation == "Co" || firstSection!.name.localizedCaseInsensitiveContains("count"))
-        let introSection = startsWithCountIn && sections.count > 1 ? sections[1] : firstSection
         let bar1Times: [TimeInterval] = !gridMeasures.isEmpty
             ? gridMeasures[0].map(\.time)
             : (1...(is68 ? 6 : beatsPerBar)).map { timeForMeasureBeat(bar: 1, beat: $0) }
@@ -892,38 +908,42 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             ? gridMeasures[1].map(\.time)
             : (1...(is68 ? 6 : beatsPerBar)).map { timeForMeasureBeat(bar: 2, beat: $0) }
         
-        if startsWithCountIn {
-            // Bar 2 (or last bar) of Count In cues the following section
-            if let targetSec = introSection {
-                let resolvedCueTimes = cueMeasureTimestamps(before: targetSec.startTime)
-                let cueTimes = (!resolvedCueTimes.isEmpty || targetSec.id != firstSection?.id)
-                    ? resolvedCueTimes
-                    : fallbackBar2Times
-                let bar1Start = bar1Times.first ?? 0.0
-                if cueTimes.isEmpty || cueTimes[0] > bar1Start + 0.15 {
+        if startsWithCountIn, let firstSec = firstSection {
+            // Speak cues strictly inside the Count In measure(s) preceding the next section (never overlapping what is already playing)
+            if orderedSections.count > 1 {
+                let targetSec = orderedSections[1]
+                let cueTimes = cueMeasureTimestamps(before: targetSec.startTime)
+                if !cueTimes.isEmpty && (cueTimes.last ?? 0.0) < targetSec.startTime - 0.02 {
+                    speakHalfNoteLeadIn(before: cueTimes[0])
+                    speakSectionCue(for: targetSec, beatTimes: cueTimes)
+                }
+            } else if firstSec.duration >= 2.0 * secPerBar - 0.1,
+                      (fallbackBar2Times.last ?? 0.0) < firstSec.endTime - 0.02 {
+                if countInEnabled, let bar1Start = bar1Times.first {
                     speak(phrase: "1", atTime: bar1Start)
                     if let halfBeat = halfwayBeatTime(in: bar1Times) {
                         speak(phrase: "2", atTime: halfBeat)
                     }
                 }
-                speakSectionCue(for: targetSec, beatTimes: cueTimes)
-            } else {
-                speak(phrase: "1", atTime: bar1Times.first ?? 0.0)
-                if let halfBeat = halfwayBeatTime(in: bar1Times) {
-                    speak(phrase: "2", atTime: halfBeat)
-                }
+                speakSectionCue(for: firstSec, beatTimes: fallbackBar2Times)
+            } else if firstSec.duration >= secPerBar - 0.1 {
+                speakSectionCue(for: firstSec, beatTimes: bar1Times)
+            }
+        } else if let targetSec = firstSection {
+            // Song starts with a non-Count-In section (e.g. Intro, Verse 1, Click Section).
+            // Only speak its cue if there is an unlabeled pre-roll bar strictly before targetSec.startTime.
+            let preRollCueTimes = cueMeasureTimestamps(before: targetSec.startTime)
+            if !preRollCueTimes.isEmpty && (preRollCueTimes.last ?? 0.0) < targetSec.startTime - 0.02 {
+                speakHalfNoteLeadIn(before: preRollCueTimes[0])
+                speakSectionCue(for: targetSec, beatTimes: preRollCueTimes)
             }
         } else if countInEnabled {
-            // Song begins without an explicit Count In section
+            // No sections defined yet: count in 1..2 on bar 1 and 2..4 on bar 2 so the user hears the guide track immediately.
             speak(phrase: "1", atTime: bar1Times.first ?? 0.0)
             if let halfBeat = halfwayBeatTime(in: bar1Times) {
                 speak(phrase: "2", atTime: halfBeat)
             }
-            
-            if let targetSec = firstSection {
-                speakSectionCue(for: targetSec, beatTimes: fallbackBar2Times)
-            } else if fallbackBar2Times.count >= 2 {
-                // No sections defined yet: count in 2, 3, 4 on bar 2 so user hears the guide track immediately!
+            if fallbackBar2Times.count >= 2 {
                 for bIdx in 1..<fallbackBar2Times.count {
                     speak(phrase: "\(bIdx + 1)", atTime: fallbackBar2Times[bIdx])
                 }
@@ -935,14 +955,14 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         // If the current section is set to loop, the guide dynamically calls out the looped section name instead!
         let startIndex: Int = startsWithCountIn ? 2 : 1
         
-        if sections.count > startIndex {
-            for i in startIndex..<sections.count {
-                let sec = sections[i]
+        if orderedSections.count > startIndex {
+            for i in startIndex..<orderedSections.count {
+                let sec = orderedSections[i]
                 let cueTimes = cueMeasureTimestamps(before: sec.startTime)
-                guard !cueTimes.isEmpty else { continue }
+                guard !cueTimes.isEmpty, cueTimes.allSatisfy({ $0 < sec.startTime - 0.02 }) else { continue }
                 
                 // Determine whether the currently ending section is looping or moving to a queued section
-                let currentSec = sections[i - 1]
+                let currentSec = orderedSections[i - 1]
                 let isCurrentSectionLooped = isLoopActive && (loopedSection?.id == currentSec.id)
                 let shouldLoopBack = isCurrentSectionLooped && (loopMode == .infinite || (loopMode == .single && singleLoopRemaining > 0))
                 let isClickLoopSec = currentSec.abbreviation == "Cl" ||
@@ -966,7 +986,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         }
         
         // Handle when the very last section of the song is looped or has a queued section
-        if let lastSec = sections.last {
+        if let lastSec = orderedSections.last {
             let isLooped = isLoopActive && (loopedSection?.id == lastSec.id)
             let shouldLoopBack = isLooped && (loopMode == .infinite || (loopMode == .single && singleLoopRemaining > 0))
             if shouldLoopBack || queuedNextSection != nil {

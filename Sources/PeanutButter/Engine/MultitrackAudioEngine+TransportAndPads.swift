@@ -1545,13 +1545,11 @@ extension MultitrackAudioEngine {
             MIDICueEngine.shared.updateMIDIClockTempo(nextSong.bpm)
         }
         
-        if let cachedWf = songWaveformCache[nextSong.id] {
+        if let cachedWf = songWaveformCache[nextSong.id], !cachedWf.peaks.isEmpty {
             masterWaveformPeaks = cachedWf.peaks
-            aggregateWaveform = cachedWf.peaks
-            renderedWaveformImage = cachedWf.image
+            updateArrangementWaveform()
         } else {
             recalculateAggregateWaveform(samplesCount: 4000)
-            songWaveformCache[nextSong.id] = (masterWaveformPeaks, renderedWaveformImage)
         }
         
         hasTriggeredEarlyTransition = false

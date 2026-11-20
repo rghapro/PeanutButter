@@ -26,6 +26,7 @@ public final class MultitrackAudioEngine: ObservableObject {
     public let transportDisplayClock = TransportDisplayClockModel()
     @Published public internal(set) var aggregateWaveform: [Float] = []
     @Published public internal(set) var renderedWaveformImage: NSImage?
+    @Published public internal(set) var waveformVersion: UInt64 = 0
     public internal(set) var masterWaveformPeaks: [Float] = []
     
     // Master Volume & Busses
@@ -1064,74 +1065,67 @@ public final class MultitrackAudioEngine: ObservableObject {
         return track
     }
     
-    /// Loads multiple audio files concurrently across all CPU cores for rapid multi-stem import
-    public func addTracksConcurrently(from fileURLs: [URL]) {
-        guard !fileURLs.isEmpty else { return }
-        let canonicalFormat = getCanonicalProcessingFormat()
-        
-        struct LoadedStemResult {
-            let track: StemTrack
-            let buffer: AVAudioPCMBuffer
-            let url: URL
-        }
-        
-        let count = fileURLs.count
-        let box = UnsafeMutableBufferPointer<LoadedStemResult?>.allocate(capacity: count)
-        box.initialize(repeating: nil)
-        defer {
-            box.deinitialize()
-            box.deallocate()
-        }
-        
-        DispatchQueue.concurrentPerform(iterations: count) { idx in
-            let url = fileURLs[idx]
-            let didStartScope = url.startAccessingSecurityScopedResource()
-            defer {
-                if didStartScope { url.stopAccessingSecurityScopedResource() }
-            }
-            let audioFile: AVAudioFile
-            do {
-                audioFile = try AVAudioFile(forReading: url)
-            } catch {
-                PeanutButterLog.storage.error("Failed opening stem file \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
-                return
-            }
-            guard let fileBuffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: AVAudioFrameCount(audioFile.length)) else {
-                return
-            }
-            do {
-                try audioFile.read(into: fileBuffer)
-            } catch {
-                PeanutButterLog.storage.error("Failed reading stem audio \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
-                return
-            }
-            let finalBuffer = PlaybackFileManager.normalizeBuffer(fileBuffer, to: canonicalFormat)
-            let trackName = url.deletingPathExtension().lastPathComponent
-            let cat = StemCategory.category(for: trackName)
-            let role: TrackRole = cat == .click ? .click : (cat == .guide ? .guide : .stem)
-            let track = StemTrack(name: trackName, role: role, fileURL: url)
-            track.duration = Double(finalBuffer.frameLength) / finalBuffer.format.sampleRate
-            if track.includeInWaveform {
-                track.waveformPeaks = PlaybackFileManager.extractPeaks(from: finalBuffer, samplesCount: 4000)
-            }
-            PlaybackFileManager.shared.cacheStemInBackground(trackId: track.id, buffer: finalBuffer, sourceURL: url)
-            box[idx] = LoadedStemResult(track: track, buffer: finalBuffer, url: url)
-        }
+    private struct LoadedStemPayload: @unchecked Sendable {
+        let index: Int
+        let track: StemTrack
+        let buffer: AVAudioPCMBuffer
+        let url: URL
+    }
 
-        let losslessPairs: [(UUID, URL?)] = (0..<count).compactMap { idx in
-            guard let item = box[idx] else { return nil }
-            return (item.track.id, item.url)
+    private struct SendableFormatBox: @unchecked Sendable {
+        let format: AVAudioFormat
+    }
+
+    private nonisolated static func decodeAndNormalizeStem(
+        index: Int,
+        from url: URL,
+        canonicalFormat: AVAudioFormat
+    ) -> LoadedStemPayload? {
+        let didStartScope = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStartScope { url.stopAccessingSecurityScopedResource() }
         }
+        let audioFile: AVAudioFile
+        do {
+            audioFile = try AVAudioFile(forReading: url)
+        } catch {
+            PeanutButterLog.storage.error("Failed opening stem file \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+        guard let fileBuffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: AVAudioFrameCount(audioFile.length)) else {
+            return nil
+        }
+        do {
+            try audioFile.read(into: fileBuffer)
+        } catch {
+            PeanutButterLog.storage.error("Failed reading stem audio \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+        let finalBuffer = PlaybackFileManager.normalizeBuffer(fileBuffer, to: canonicalFormat)
+        let trackName = url.deletingPathExtension().lastPathComponent
+        let cat = StemCategory.category(for: trackName)
+        let role: TrackRole = cat == .click ? .click : (cat == .guide ? .guide : .stem)
+        let track = StemTrack(name: trackName, role: role, fileURL: url)
+        track.duration = Double(finalBuffer.frameLength) / max(1.0, finalBuffer.format.sampleRate)
+        if track.includeInWaveform {
+            track.waveformPeaks = PlaybackFileManager.extractPeaks(from: finalBuffer, samplesCount: 4000)
+        }
+        return LoadedStemPayload(index: index, track: track, buffer: finalBuffer, url: url)
+    }
+
+    private func attachDecodedStems(_ items: [LoadedStemPayload]) {
+        guard !items.isEmpty else { return }
+
+        let losslessPairs: [(UUID, URL?)] = items.map { ($0.track.id, $0.url) }
         PlaybackFileManager.shared.recordLocalLosslessSources(losslessPairs)
-        
-        for idx in 0..<count {
-            guard let item = box[idx] else { continue }
+
+        for item in items {
             let track = item.track
             let finalBuffer = item.buffer
-            
+
             pristineMasterBuffers[track.id] = finalBuffer
             channels[track.id] = TrackChannel(track: track, buffer: finalBuffer, audioFile: nil)
-            
+
             let cat = StemCategory.category(for: track.name, role: track.role)
             if track.role == .click || cat == .click {
                 track.role = .click
@@ -1154,19 +1148,115 @@ public final class MultitrackAudioEngine: ObservableObject {
                     currentSetlist.songs[currentSongIndex].guideSource = src
                 }
             }
-            
+
             if isFadersDefault100Enabled && track.volume >= 0.79 && track.volume <= 0.81 {
                 track.volume = 1.0
             }
-            
+
             tracks.append(track)
-            if track.duration > currentSongDuration {
-                currentSongDuration = track.duration
+        }
+
+        // Update song duration from real imported tracks so any earlier 240s empty Click/Guide placeholder does not linger
+        let realMaxDur = tracks
+            .filter { !Self.isClickOrGuideTrack($0) || $0.fileURL != nil }
+            .map { $0.duration }
+            .max() ?? 0.0
+        if realMaxDur > 0.01 {
+            for utility in tracks where Self.isClickOrGuideTrack(utility) && utility.fileURL == nil {
+                utility.duration = realMaxDur
+            }
+            if currentSong.sections.isEmpty || realMaxDur > currentSongDuration {
+                currentSongDuration = currentSong.sections.isEmpty
+                    ? realMaxDur
+                    : max(currentSongDuration, realMaxDur)
                 transportPosition.totalDuration = currentSongDuration
                 transportClock.position.totalDuration = currentSongDuration
                 transportDisplayClock.update(with: transportPosition)
             }
         }
+
+        // Start background .m4a caching only after all stems are decoded & peak-extracted
+        for item in items {
+            PlaybackFileManager.shared.cacheStemInBackground(trackId: item.track.id, buffer: item.buffer, sourceURL: item.url)
+        }
+    }
+
+    /// Loads multiple audio files concurrently across all CPU cores for rapid multi-stem import
+    public func addTracksConcurrently(from fileURLs: [URL]) {
+        guard !fileURLs.isEmpty else { return }
+        let canonicalFormat = getCanonicalProcessingFormat()
+
+        let count = fileURLs.count
+        let box = UnsafeMutableBufferPointer<LoadedStemPayload?>.allocate(capacity: count)
+        box.initialize(repeating: nil)
+        defer {
+            box.deinitialize()
+            box.deallocate()
+        }
+
+        DispatchQueue.concurrentPerform(iterations: count) { idx in
+            box[idx] = Self.decodeAndNormalizeStem(index: idx, from: fileURLs[idx], canonicalFormat: canonicalFormat)
+        }
+
+        let orderedItems = (0..<count).compactMap { box[$0] }
+        attachDecodedStems(orderedItems)
+    }
+
+    /// Asynchronously decodes, normalizes, and extracts waveform peaks off `@MainActor` so the UI stays responsive during multi-stem imports.
+    public func addTracksConcurrentlyAsync(
+        from fileURLs: [URL],
+        onProgress: (@MainActor @Sendable (Int, Int) -> Void)? = nil
+    ) async {
+        guard !fileURLs.isEmpty else { return }
+        let targetSongId = currentSong.id
+        let formatBox = SendableFormatBox(format: getCanonicalProcessingFormat())
+        let totalCount = fileURLs.count
+
+        let decodedItems: [LoadedStemPayload] = await Task.detached(priority: .userInitiated) {
+            let maxConcurrency = max(2, min(ProcessInfo.processInfo.activeProcessorCount, totalCount))
+            var collected: [LoadedStemPayload] = []
+            collected.reserveCapacity(totalCount)
+
+            await withTaskGroup(of: LoadedStemPayload?.self) { group in
+                var nextIdx = 0
+                let initial = min(maxConcurrency, totalCount)
+                while nextIdx < initial {
+                    let idx = nextIdx
+                    let url = fileURLs[idx]
+                    nextIdx += 1
+                    group.addTask {
+                        Self.decodeAndNormalizeStem(index: idx, from: url, canonicalFormat: formatBox.format)
+                    }
+                }
+
+                var completed = 0
+                for await item in group {
+                    completed += 1
+                    if let item {
+                        collected.append(item)
+                    }
+                    if let onProgress {
+                        let done = completed
+                        await MainActor.run {
+                            onProgress(done, totalCount)
+                        }
+                    }
+                    if nextIdx < totalCount {
+                        let idx = nextIdx
+                        let url = fileURLs[idx]
+                        nextIdx += 1
+                        group.addTask {
+                            Self.decodeAndNormalizeStem(index: idx, from: url, canonicalFormat: formatBox.format)
+                        }
+                    }
+                }
+            }
+
+            return collected.sorted { $0.index < $1.index }
+        }.value
+
+        guard currentSong.id == targetSongId else { return }
+        attachDecodedStems(decodedItems)
     }
     
     // Unified V-Sync synchronized CADisplayLink driving both transport playhead & isolated `StereoMeterModel`s
@@ -1754,8 +1844,26 @@ public final class MultitrackAudioEngine: ObservableObject {
         if currentSong.excludesClickAndGuide { return }
         let canonicalFormat = getCanonicalProcessingFormat()
         let sampleRate = canonicalFormat.sampleRate > 0 ? canonicalFormat.sampleRate : 44100.0
-        let masterDur = max(tracks.map { $0.duration }.max() ?? 0.0, duration ?? currentSongDuration, 240.0)
+        let musicalMaxDur = tracks.filter { !Self.isClickOrGuideTrack($0) }.map { $0.duration }.max() ?? 0.0
+        let uploadedUtilMaxDur = tracks.filter { Self.isClickOrGuideTrack($0) && $0.fileURL != nil }.map { $0.duration }.max() ?? 0.0
+        let sectionsEndDur = !currentSong.sections.isEmpty ? (currentSong.sections.map { $0.endTime }.max() ?? 0.0) : 0.0
+        let knownDur = max(musicalMaxDur, uploadedUtilMaxDur, duration ?? 0.0, sectionsEndDur)
+        let masterDur = knownDur > 0.1 ? knownDur : (currentSongDuration > 0.1 ? currentSongDuration : 240.0)
         let initialFrames = AVAudioFrameCount(max(1, Int64(round(masterDur * sampleRate))))
+
+        if knownDur > 0.1 {
+            for utility in tracks where Self.isClickOrGuideTrack(utility) && utility.fileURL == nil {
+                if abs(utility.duration - masterDur) > 0.05 {
+                    utility.duration = masterDur
+                }
+            }
+            if currentSong.sections.isEmpty && abs(currentSongDuration - masterDur) > 0.05 {
+                currentSongDuration = masterDur
+                transportPosition.totalDuration = currentSongDuration
+                transportClock.position.totalDuration = currentSongDuration
+                transportDisplayClock.update(with: transportPosition)
+            }
+        }
         
         var didAdd = false
         
@@ -1834,6 +1942,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         aggregateWaveform.removeAll()
         masterWaveformPeaks.removeAll()
         renderedWaveformImage = nil
+        waveformVersion &+= 1
         currentSongDuration = 0.0
         transportPosition = TransportPosition()
         transportClock.position = TransportPosition()
@@ -1860,10 +1969,13 @@ public final class MultitrackAudioEngine: ObservableObject {
             masterWaveformPeaks = []
             aggregateWaveform = []
             renderedWaveformImage = nil
+            waveformVersion &+= 1
             return
         }
         
-        let masterDuration = max(0.01, tracks.map { $0.duration }.max() ?? currentSongDuration)
+        let musicalMaxDuration = musicalStems.map { $0.duration }.max() ?? 0.0
+        let fallbackDuration = tracks.map { $0.duration }.max() ?? currentSongDuration
+        let masterDuration = max(0.01, musicalMaxDuration > 0.01 ? musicalMaxDuration : fallbackDuration)
         var combined = Array(repeating: Float(0.0), count: samplesCount)
         for stem in musicalStems {
             let peaks = stem.waveformPeaks
@@ -1904,13 +2016,17 @@ public final class MultitrackAudioEngine: ObservableObject {
         guard !masterWaveformPeaks.isEmpty else {
             renderedWaveformImage = nil
             aggregateWaveform = []
+            waveformVersion &+= 1
             return
         }
         
-        let masterDuration = tracks.map { $0.duration }.max() ?? currentSongDuration
+        let musicalMaxDuration = tracks.filter { $0.includeInWaveform }.map { $0.duration }.max() ?? 0.0
+        let fallbackDuration = tracks.map { $0.duration }.max() ?? currentSongDuration
+        let masterDuration = musicalMaxDuration > 0.01 ? musicalMaxDuration : fallbackDuration
         guard masterDuration > 0 else {
             aggregateWaveform = masterWaveformPeaks
-            renderedWaveformImage = generatePreRenderedWaveformImage(peaks: masterWaveformPeaks, width: 4000, height: 233)
+            renderedWaveformImage = nil
+            waveformVersion &+= 1
             return
         }
         
@@ -1926,8 +2042,9 @@ public final class MultitrackAudioEngine: ObservableObject {
         // Fast zero-drift path when in edit mode with linear sequence (so full waveform is displayed!)
         if inEditMode && isLinearSequence && abs(fullDuration - masterDuration) < 0.05 {
             aggregateWaveform = masterWaveformPeaks
-            renderedWaveformImage = generatePreRenderedWaveformImage(peaks: masterWaveformPeaks, width: 4000, height: 233)
-            songWaveformCache[currentSong.id] = (masterWaveformPeaks, renderedWaveformImage)
+            renderedWaveformImage = nil
+            songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+            waveformVersion &+= 1
             return
         }
         
@@ -1937,8 +2054,9 @@ public final class MultitrackAudioEngine: ObservableObject {
         // Fast zero-drift path when sections have not been non-destructively rearranged or trimmed
         if !inEditMode && isLinearUnmodifiedArrangement {
             aggregateWaveform = masterWaveformPeaks
-            renderedWaveformImage = generatePreRenderedWaveformImage(peaks: masterWaveformPeaks, width: 4000, height: 233)
-            songWaveformCache[currentSong.id] = (masterWaveformPeaks, renderedWaveformImage)
+            renderedWaveformImage = nil
+            songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+            waveformVersion &+= 1
             return
         }
         
@@ -1987,8 +2105,9 @@ public final class MultitrackAudioEngine: ObservableObject {
         }
         
         aggregateWaveform = arrangedPeaks
-        renderedWaveformImage = generatePreRenderedWaveformImage(peaks: arrangedPeaks, width: 4000, height: 233)
-        songWaveformCache[currentSong.id] = (arrangedPeaks, renderedWaveformImage)
+        renderedWaveformImage = nil
+        songWaveformCache[currentSong.id] = (masterWaveformPeaks, nil)
+        waveformVersion &+= 1
     }
     
     public func generateArrangedWaveform() {
@@ -2011,17 +2130,33 @@ public final class MultitrackAudioEngine: ObservableObject {
         return arrTime
     }
     
-    /// Pre-renders ultra-fine retina audio waveform texture once upon import
+    /// Pre-renders ultra-fine retina audio waveform texture via modern offscreen bitmap graphics context
     func generatePreRenderedWaveformImage(peaks: [Float], width: CGFloat = 2400, height: CGFloat = 233) -> NSImage? {
         guard !peaks.isEmpty, width > 0, height > 0 else { return nil }
-        
-        let size = NSSize(width: width, height: height)
-        let image = NSImage(size: size)
-        image.lockFocus()
-        guard let ctx = NSGraphicsContext.current?.cgContext else {
-            image.unlockFocus()
+        let scale: CGFloat = 2.0
+        let pxW = max(1, Int(ceil(width * scale)))
+        let pxH = max(1, Int(ceil(height * scale)))
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pxW,
+            pixelsHigh: pxH,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
             return nil
         }
+        rep.size = NSSize(width: width, height: height)
+
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        guard let nsCtx = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.current = nsCtx
+        let ctx = nsCtx.cgContext
         
         ctx.setAllowsAntialiasing(true)
         ctx.setShouldAntialias(true)
@@ -2061,7 +2196,7 @@ public final class MultitrackAudioEngine: ObservableObject {
             ctx.saveGState()
             ctx.addPath(path)
             ctx.clip()
-            ctx.drawLinearGradient(gradient, start: CGPoint(x: 0, y: 0), end: CGPoint(x: 0, y: height), options: [])
+            ctx.drawLinearGradient(gradient, start: CGPoint(x: 0, y: height), end: CGPoint(x: 0, y: 0), options: [])
             ctx.restoreGState()
         }
         
@@ -2090,7 +2225,8 @@ public final class MultitrackAudioEngine: ObservableObject {
             CGPoint(x: width, y: midY)
         ])
         
-        image.unlockFocus()
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.addRepresentation(rep)
         return image
     }
     

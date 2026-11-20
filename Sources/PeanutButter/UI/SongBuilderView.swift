@@ -13,12 +13,17 @@ public struct SongBuilderView: View {
     @State private var songTitle: String
     @State private var artist: String
     @State private var bpm: Double
+    @State private var bpmText: String
     @State private var musicalKey: String
     @State private var timeSigNum: Int
     @State private var timeSigDen: Int
     @State private var sections: [SongSection]
     @State private var artworkData: Data?
     @State private var librarySaveFeedback: String? = nil
+    @State private var confirmedTempoGridBanner: String? = nil
+    @State private var isImportingStems: Bool = false
+    @State private var importProgressText: String = ""
+    @FocusState private var isBPMFieldFocused: Bool
     
     // Tap tempo helper
     @State private var tapTimes: [Date] = []
@@ -44,11 +49,31 @@ public struct SongBuilderView: View {
         self._songTitle = State(initialValue: s.title)
         self._artist = State(initialValue: s.artist)
         self._bpm = State(initialValue: s.bpm)
+        self._bpmText = State(initialValue: Self.formatBPM(s.bpm))
         self._musicalKey = State(initialValue: s.musicalKey == "—" ? "C" : s.musicalKey)
         self._timeSigNum = State(initialValue: s.timeSignatureNumerator)
         self._timeSigDen = State(initialValue: s.timeSignatureDenominator)
         self._sections = State(initialValue: s.sections)
         self._artworkData = State(initialValue: s.artworkData)
+    }
+
+    private static func formatBPM(_ val: Double) -> String {
+        let clamped = max(20.0, min(300.0, (val * 100.0).rounded() / 100.0))
+        return Song.formatBPM(clamped, decimals: Song.tempoDecimalPrecision(for: clamped))
+    }
+
+    private var effectivePendingBPM: Double {
+        let trimmed = bpmText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let parsed = Double(trimmed), parsed.isFinite, parsed > 0 {
+            return max(20.0, min(300.0, (parsed * 100.0).rounded() / 100.0))
+        }
+        return max(20.0, min(300.0, (bpm * 100.0).rounded() / 100.0))
+    }
+
+    private var hasPendingTempoOrGridChanges: Bool {
+        abs(effectivePendingBPM - engine.currentSong.bpm) > 0.005 ||
+        timeSigNum != engine.currentSong.timeSignatureNumerator ||
+        timeSigDen != engine.currentSong.timeSignatureDenominator
     }
     
     public var body: some View {
@@ -68,7 +93,7 @@ public struct SongBuilderView: View {
             }
             .background(Color(white: 0.08))
         }
-        .frame(width: 680, height: 600)
+        .frame(width: 720, height: 615)
         .background(Color(white: 0.08))
         .fileImporter(
             isPresented: $isAudioPickerPresented,
@@ -77,6 +102,7 @@ public struct SongBuilderView: View {
         ) { result in
             do {
                 let urls = try result.get()
+                guard !urls.isEmpty else { return }
                 if songTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    let firstURL = urls.first {
                     let folderName = firstURL.deletingLastPathComponent().lastPathComponent
@@ -85,12 +111,22 @@ public struct SongBuilderView: View {
                         songTitle = folderName
                     }
                 }
-                engine.addTracksConcurrently(from: urls)
-                engine.ensureClickAndGuideTracksExist()
-                engine.autoSortTracks()
-                engine.recalculateAggregateWaveform(samplesCount: 4000)
-                engine.updateMatrix()
+                isImportingStems = true
+                importProgressText = "Importing \(urls.count) \(urls.count == 1 ? "stem" : "stems")..."
+                Task { @MainActor in
+                    await engine.addTracksConcurrentlyAsync(from: urls) { done, total in
+                        importProgressText = "Importing stems (\(done)/\(total))..."
+                    }
+                    engine.ensureClickAndGuideTracksExist()
+                    engine.autoSortTracks()
+                    engine.recalculateAggregateWaveform(samplesCount: 4000)
+                    engine.updateMatrix()
+                    isImportingStems = false
+                    importProgressText = ""
+                }
             } catch {
+                isImportingStems = false
+                importProgressText = ""
                 print("Failed to import audio: \(error.localizedDescription)")
             }
         }
@@ -153,6 +189,7 @@ public struct SongBuilderView: View {
                     .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
+                .disabled(isImportingStems)
                 .help("Save standalone .pbsong directly into your Local Song Library (~/Music/PeanutButter/Songs)")
 
                 if libraryManager.isCloudConnected {
@@ -170,6 +207,7 @@ public struct SongBuilderView: View {
                         .cornerRadius(6)
                     }
                     .buttonStyle(.plain)
+                    .disabled(isImportingStems)
                     .help("Save standalone .pbsong directly into your connected Cloud Song Library")
                 }
                 
@@ -178,11 +216,12 @@ public struct SongBuilderView: View {
                         .font(.system(size: 11, weight: .bold))
                         .frame(width: 175)
                         .padding(.vertical, 5)
-                        .background(Color.blue)
+                        .background(isImportingStems ? Color.blue.opacity(0.45) : Color.blue)
                         .foregroundColor(.white)
                         .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
+                .disabled(isImportingStems)
             }
         }
         .padding(16)
@@ -267,25 +306,34 @@ public struct SongBuilderView: View {
                                 .font(.system(size: 9, weight: .black))
                                 .foregroundColor(Color(white: 0.5))
                             Spacer()
-                            Text(String(format: "%.2f BPM", bpm))
+                            Text("\(Self.formatBPM(effectivePendingBPM)) BPM")
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundColor(.yellow)
                         }
                         
                         HStack(spacing: 6) {
-                            TextField("BPM", value: $bpm, format: .number.precision(.fractionLength(2)))
+                            TextField("120", text: $bpmText)
+                                .focused($isBPMFieldFocused)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 82)
                                 .font(.system(size: 12, weight: .black, design: .monospaced))
+                                .onSubmit {
+                                    confirmTempoAndUpdateGrid()
+                                }
+                                .onChange(of: isBPMFieldFocused) { _, focused in
+                                    if !focused {
+                                        _ = parseTypedBPM()
+                                    }
+                                }
                             
                             Button("-0.1") {
-                                bpm = max(30.0, round((bpm - 0.1) * 100) / 100.0)
+                                stepBuilderBPM(by: -0.1)
                             }
                             .buttonStyle(.bordered)
                             .font(.system(size: 9, weight: .bold))
                             
                             Button("+0.1") {
-                                bpm = min(300.0, round((bpm + 0.1) * 100) / 100.0)
+                                stepBuilderBPM(by: 0.1)
                             }
                             .buttonStyle(.bordered)
                             .font(.system(size: 9, weight: .bold))
@@ -302,13 +350,16 @@ public struct SongBuilderView: View {
                             .buttonStyle(.plain)
                             
                             Button(engine.isAnalyzingClickTempo ? "ANALYZING..." : "AUTO (CLICK)") {
+                                isBPMFieldFocused = false
                                 engine.currentSong.timeSignatureNumerator = timeSigNum
                                 engine.currentSong.timeSignatureDenominator = timeSigDen
                                 engine.autoDetectTempoFromClick { success, _ in
                                     Task { @MainActor in
                                         if success {
                                             bpm = engine.currentSong.bpm
+                                            bpmText = Self.formatBPM(bpm)
                                             sections = engine.currentSong.sections
+                                            showTempoGridConfirmed("Detected \(Self.formatBPM(bpm)) BPM & beat grid updated")
                                         }
                                     }
                                 }
@@ -381,6 +432,57 @@ public struct SongBuilderView: View {
                             .frame(width: 50)
                         }
                     }
+                }
+
+                Divider()
+                    .background(Color(white: 0.2))
+
+                HStack(spacing: 10) {
+                    if let banner = confirmedTempoGridBanner {
+                        HStack(spacing: 5) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                            Text(banner)
+                                .foregroundColor(.green)
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                    } else if hasPendingTempoOrGridChanges {
+                        HStack(spacing: 5) {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .foregroundColor(.orange)
+                            Text("Unconfirmed changes (\(Self.formatBPM(effectivePendingBPM)) BPM • \(timeSigNum)/\(timeSigDen))")
+                                .foregroundColor(.orange)
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                    } else {
+                        HStack(spacing: 5) {
+                            Image(systemName: "metronome")
+                                .foregroundColor(Color(white: 0.55))
+                            Text("Active grid: \(Self.formatBPM(engine.currentSong.bpm)) BPM • \(engine.currentSong.timeSignatureNumerator)/\(engine.currentSong.timeSignatureDenominator)")
+                                .foregroundColor(Color(white: 0.58))
+                        }
+                        .font(.system(size: 11, weight: .medium))
+                    }
+
+                    Spacer()
+
+                    Button(action: {
+                        confirmTempoAndUpdateGrid()
+                    }) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 11, weight: .bold))
+                            Text("Confirm")
+                                .font(.system(size: 11, weight: .bold))
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 5)
+                        .background(hasPendingTempoOrGridChanges ? Color.blue : Color(red: 0.16, green: 0.34, blue: 0.56))
+                        .foregroundColor(.white)
+                        .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Confirm tempo & time signature, update beat grid and sections, and regenerate Click & Guide while staying in this menu")
                 }
             }
             .padding(8)
@@ -460,10 +562,23 @@ public struct SongBuilderView: View {
                             Text("Import Audio Stems (.wav, .m4a, .mp3)...")
                         }
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.blue)
+                        .foregroundColor(isImportingStems ? Color.blue.opacity(0.45) : .blue)
                     }
                     .buttonStyle(.plain)
+                    .disabled(isImportingStems)
                     .padding(.top, 4)
+
+                    if isImportingStems {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(importProgressText.isEmpty ? "Importing stems..." : importProgressText)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(Color(red: 0.35, green: 0.78, blue: 1.0))
+                        }
+                        .padding(.leading, 12)
+                        .padding(.top, 4)
+                    }
                     
                     Spacer()
                 }
@@ -542,6 +657,7 @@ public struct SongBuilderView: View {
                         Spacer()
                         
                         Button(action: {
+                            confirmTempoAndUpdateGrid(showFeedback: false)
                             engine.autoLabelSectionsFromGuide { count, _ in
                                 Task { @MainActor in
                                     if count > 0 {
@@ -628,10 +744,14 @@ public struct SongBuilderView: View {
     }
     
     private func recalculateSectionTimes() {
-        let srcGrid = engine.currentSong.sourceBeatGrid()
+        let activeBPM = max(20.0, effectivePendingBPM)
+        let matchesEngineGrid = abs(activeBPM - engine.currentSong.bpm) <= 0.005 &&
+            timeSigNum == engine.currentSong.timeSignatureNumerator &&
+            timeSigDen == engine.currentSong.timeSignatureDenominator
+        let srcGrid = matchesEngineGrid ? engine.currentSong.sourceBeatGrid() : []
         let hasDynamicGrid = !srcGrid.isEmpty
         let gridDownbeats = hasDynamicGrid ? srcGrid.filter { $0.isDownbeat } : []
-        let secPerBeat = (60.0 / max(20.0, bpm)) * (4.0 / Double(max(1, timeSigDen)))
+        let secPerBeat = (60.0 / activeBPM) * (4.0 / Double(max(1, timeSigDen)))
         let secPerMeasure = secPerBeat * Double(timeSigNum)
         var currentTime: TimeInterval = 0.0
         var currentMeasure = 1
@@ -645,7 +765,7 @@ public struct SongBuilderView: View {
                 if endDbIdx < gridDownbeats.count {
                     dur = max(secPerBeat, gridDownbeats[endDbIdx].time - gridDownbeats[startDbIdx].time)
                 } else {
-                    let tailBPM = gridDownbeats[startDbIdx].instantaneousBPM > 20.0 ? gridDownbeats[startDbIdx].instantaneousBPM : max(20.0, bpm)
+                    let tailBPM = gridDownbeats[startDbIdx].instantaneousBPM > 20.0 ? gridDownbeats[startDbIdx].instantaneousBPM : activeBPM
                     let tailBarDur = (60.0 / tailBPM) * (4.0 / Double(max(1, timeSigDen))) * Double(max(1, timeSigNum))
                     dur = Double(sec.measureCount) * tailBarDur
                 }
@@ -663,7 +783,56 @@ public struct SongBuilderView: View {
         self.sections = updated
     }
     
+    @discardableResult
+    private func parseTypedBPM() -> Double {
+        let resolved = effectivePendingBPM
+        bpm = resolved
+        bpmText = Self.formatBPM(resolved)
+        return resolved
+    }
+
+    private func stepBuilderBPM(by delta: Double) {
+        isBPMFieldFocused = false
+        let current = parseTypedBPM()
+        let next = max(20.0, min(300.0, ((current + delta) * 100.0).rounded() / 100.0))
+        bpm = next
+        bpmText = Self.formatBPM(next)
+    }
+
+    private func showTempoGridConfirmed(_ text: String) {
+        withAnimation { confirmedTempoGridBanner = text }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.8) {
+            withAnimation {
+                if confirmedTempoGridBanner == text {
+                    confirmedTempoGridBanner = nil
+                }
+            }
+        }
+    }
+
+    private func confirmTempoAndUpdateGrid(showFeedback: Bool = true) {
+        isBPMFieldFocused = false
+        let resolvedBPM = parseTypedBPM()
+        let resolvedTitle = songTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        engine.applySongBuilderTempoAndGrid(
+            bpm: resolvedBPM,
+            timeSignatureNumerator: timeSigNum,
+            timeSignatureDenominator: timeSigDen,
+            title: resolvedTitle.isEmpty ? nil : resolvedTitle,
+            artist: artist,
+            musicalKey: musicalKey,
+            artworkData: artworkData,
+            sections: sections.isEmpty ? nil : sections,
+            isCreatingNewSong: isCreatingNewSong
+        )
+        sections = engine.currentSong.sections
+        if showFeedback {
+            showTempoGridConfirmed("Confirmed \(Self.formatBPM(resolvedBPM)) BPM • \(timeSigNum)/\(timeSigDen) — Grid updated")
+        }
+    }
+
     private func handleTapTempo() {
+        isBPMFieldFocused = false
         let now = Date()
         tapTimes.append(now)
         if tapTimes.count > 4 { tapTimes.removeFirst() }
@@ -674,25 +843,31 @@ public struct SongBuilderView: View {
             }
             let avgDiff = diffs.reduce(0, +) / Double(diffs.count)
             if avgDiff > 0.2 && avgDiff < 2.0 {
-                bpm = (60.0 / avgDiff).rounded()
+                bpm = max(20.0, min(300.0, (60.0 / avgDiff).rounded()))
+                bpmText = Self.formatBPM(bpm)
                 recalculateSectionTimes()
             }
         }
     }
     
     private func syncBuilderChangesToCurrentSong() -> String {
-        recalculateSectionTimes()
-        let finalTitle = songTitle.isEmpty ? "Untitled Song" : songTitle
-        engine.currentSong.artworkData = artworkData
-        engine.currentSong.timeSignatureNumerator = timeSigNum
-        engine.currentSong.timeSignatureDenominator = timeSigDen
-        engine.updateCurrentSong(
+        isBPMFieldFocused = false
+        let resolvedBPM = parseTypedBPM()
+        let finalTitle = songTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Untitled Song"
+            : songTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        engine.applySongBuilderTempoAndGrid(
+            bpm: resolvedBPM,
+            timeSignatureNumerator: timeSigNum,
+            timeSignatureDenominator: timeSigDen,
             title: finalTitle,
             artist: artist,
-            bpm: bpm,
-            key: musicalKey,
-            sections: sections
+            musicalKey: musicalKey,
+            artworkData: artworkData,
+            sections: sections,
+            isCreatingNewSong: isCreatingNewSong
         )
+        sections = engine.currentSong.sections
         return finalTitle
     }
 
@@ -738,23 +913,22 @@ public struct SongBuilderView: View {
     }
     
     private func saveAndDismiss() {
-        recalculateSectionTimes()
-        let finalTitle = songTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "New Song" : songTitle
-        engine.currentSong.timeSignatureNumerator = timeSigNum
-        engine.currentSong.timeSignatureDenominator = timeSigDen
-        engine.currentSong.artworkData = artworkData
+        isBPMFieldFocused = false
+        let resolvedBPM = parseTypedBPM()
+        let finalTitle = songTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "New Song" : songTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         
         if engine.currentSetlist.songs.isEmpty {
+            recalculateSectionTimes()
             let newSong = Song(
                 title: finalTitle,
                 artist: artist,
-                bpm: bpm,
+                bpm: resolvedBPM,
                 timeSignatureNumerator: timeSigNum,
                 timeSignatureDenominator: timeSigDen,
                 musicalKey: musicalKey,
                 sections: sections,
                 timeSignatureChanges: engine.currentSong.timeSignatureChanges,
-                beatGrid: engine.currentSong.beatGrid,
+                beatGrid: [],
                 startPadWithSong: engine.isGlobalStartPadWithSongEnabled,
                 padPresetId: PadLibraryManager.shared.activePackId,
                 artworkData: artworkData,
@@ -764,18 +938,22 @@ public struct SongBuilderView: View {
             engine.currentSetlist.songs.append(newSong)
             engine.currentSong = newSong
             engine.currentSongIndex = 0
+            engine.rebuildPrecomputedBeatGrid()
+            engine.reindexArrangement()
+            engine.updateArrangementWaveform()
             engine.markSessionChanged()
         } else {
-            engine.updateCurrentSong(
+            engine.applySongBuilderTempoAndGrid(
+                bpm: resolvedBPM,
+                timeSignatureNumerator: timeSigNum,
+                timeSignatureDenominator: timeSigDen,
                 title: finalTitle,
                 artist: artist,
-                bpm: bpm,
-                key: musicalKey,
-                sections: sections
+                musicalKey: musicalKey,
+                artworkData: artworkData,
+                sections: sections,
+                isCreatingNewSong: isCreatingNewSong
             )
-            if engine.currentSongIndex >= 0 && engine.currentSongIndex < engine.currentSetlist.songs.count {
-                engine.currentSetlist.songs[engine.currentSongIndex].artworkData = artworkData
-            }
         }
         engine.ensureClickAndGuideTracksExist()
         if !isCreatingNewSong {

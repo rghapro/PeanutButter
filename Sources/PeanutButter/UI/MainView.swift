@@ -3005,12 +3005,18 @@ public struct MainView: View {
                 }
             }
             if !audioURLs.isEmpty {
-                engine.addTracksConcurrently(from: audioURLs)
-                engine.ensureClickAndGuideTracksExist()
-                engine.autoSortTracks()
-                engine.recalculateAggregateWaveform(samplesCount: 4000)
-                engine.updateMatrix()
-                showStatus("Successfully imported and sorted stems")
+                let totalStems = audioURLs.count
+                showStatus("Importing \(totalStems) \(totalStems == 1 ? "stem" : "stems")...")
+                Task { @MainActor in
+                    await engine.addTracksConcurrentlyAsync(from: audioURLs) { done, total in
+                        statusMessage = "Importing stems (\(done)/\(total))..."
+                    }
+                    engine.ensureClickAndGuideTracksExist()
+                    engine.autoSortTracks()
+                    engine.recalculateAggregateWaveform(samplesCount: 4000)
+                    engine.updateMatrix()
+                    showStatus("Successfully imported and sorted stems")
+                }
             }
         } catch {
             showStatus("Import error: \(error.localizedDescription)")

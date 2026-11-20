@@ -377,16 +377,11 @@ extension MultitrackAudioEngine {
         rebuildPrecomputedBeatGrid()
         rebuildCachedActiveAutomation()
         
-        if let cachedWf = songWaveformCache[song.id], !cachedWf.peaks.isEmpty, cachedWf.image != nil {
+        if let cachedWf = songWaveformCache[song.id], !cachedWf.peaks.isEmpty {
             masterWaveformPeaks = cachedWf.peaks
-            aggregateWaveform = cachedWf.peaks
-            renderedWaveformImage = cachedWf.image
             updateArrangementWaveform()
         } else {
             recalculateAggregateWaveform(samplesCount: 4000)
-            if !masterWaveformPeaks.isEmpty {
-                songWaveformCache[song.id] = (masterWaveformPeaks, renderedWaveformImage)
-            }
         }
         
         updateSMPTEState(persistDevicePreset: false)
@@ -2815,6 +2810,134 @@ extension MultitrackAudioEngine {
         }
     }
     
+    /// Commits tempo, time signature, and optional metadata/sections from the Song Builder
+    /// onto the active song & setlist, rebuilding the beat grid, Click, Guide, and section layout
+    /// while remaining open in the Song Builder.
+    public func applySongBuilderTempoAndGrid(
+        bpm: Double,
+        timeSignatureNumerator: Int,
+        timeSignatureDenominator: Int,
+        title: String? = nil,
+        artist: String? = nil,
+        musicalKey: String? = nil,
+        artworkData: Data? = nil,
+        sections: [SongSection]? = nil,
+        isCreatingNewSong: Bool = false
+    ) {
+        let safeBPM = max(20.0, min(300.0, (bpm * 100.0).rounded() / 100.0))
+        let safeNum = max(1, min(16, timeSignatureNumerator))
+        let safeDen = [2, 4, 8, 16].contains(timeSignatureDenominator) ? timeSignatureDenominator : 4
+
+        let bpmChanged = abs(safeBPM - currentSong.bpm) > 0.005
+        let timeSigChanged = (safeNum != currentSong.timeSignatureNumerator || safeDen != currentSong.timeSignatureDenominator)
+        let wasTempoShifted = currentSong.isTempoShifted
+
+        if bpmChanged || timeSigChanged {
+            currentSong.beatGrid.removeAll()
+        }
+
+        currentSong.bpm = safeBPM
+        if isCreatingNewSong || !wasTempoShifted {
+            currentSong.originalBPM = safeBPM
+        }
+        currentSong.timeSignatureNumerator = safeNum
+        currentSong.timeSignatureDenominator = safeDen
+
+        if let title {
+            currentSong.title = title
+        }
+        if let artist {
+            currentSong.artist = artist
+        }
+        if let musicalKey {
+            currentSong.musicalKey = musicalKey
+        }
+        if let artworkData {
+            currentSong.artworkData = artworkData
+        }
+
+        let targetSections = sections ?? currentSong.sections
+        if !targetSections.isEmpty && (sections != nil || bpmChanged || timeSigChanged) {
+            let srcGrid = currentSong.sourceBeatGrid()
+            let downbeats = srcGrid.filter { $0.isDownbeat }
+            let secPerBeat = (60.0 / safeBPM) * (4.0 / Double(safeDen))
+            let secPerMeasure = secPerBeat * Double(safeNum)
+
+            var curTime: TimeInterval = 0.0
+            var curMeasure = 1
+            var recalculated: [SongSection] = []
+            recalculated.reserveCapacity(targetSections.count)
+
+            for var sec in targetSections {
+                let dur: TimeInterval
+                if !downbeats.isEmpty && curMeasure - 1 < downbeats.count {
+                    let startIdx = curMeasure - 1
+                    let endIdx = startIdx + sec.measureCount
+                    if endIdx < downbeats.count {
+                        dur = max(secPerBeat, downbeats[endIdx].time - downbeats[startIdx].time)
+                    } else {
+                        let tailBPM = downbeats[startIdx].instantaneousBPM > 20.0 ? downbeats[startIdx].instantaneousBPM : safeBPM
+                        let tailBarDur = (60.0 / tailBPM) * (4.0 / Double(safeDen)) * Double(safeNum)
+                        dur = Double(sec.measureCount) * tailBarDur
+                    }
+                } else {
+                    dur = Double(sec.measureCount) * secPerMeasure
+                }
+                sec.startTime = curTime
+                sec.duration = dur
+                sec.startMeasure = curMeasure
+                if !sec.isTrimmed {
+                    sec.audioStartTime = curTime
+                    sec.originalAudioStartTime = curTime
+                    sec.originalDuration = dur
+                }
+                recalculated.append(sec)
+                curTime += dur
+                curMeasure += sec.measureCount
+            }
+
+            currentSong.sections = recalculated
+            currentSong.defaultSections = recalculated
+        }
+
+        if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {
+            currentSetlist.songs[currentSongIndex] = currentSong
+        }
+
+        transportPosition.currentBPM = safeBPM
+        transportClock.position.currentBPM = safeBPM
+        transportDisplayClock.update(with: transportPosition)
+
+        if !currentSong.excludesClickAndGuide {
+            if uploadedClickBuffers[currentSong.id] == nil {
+                currentSong.clickSource = .generated
+            }
+            if uploadedGuideBuffers[currentSong.id] == nil {
+                currentSong.guideSource = .generated
+            }
+            if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {
+                currentSetlist.songs[currentSongIndex].clickSource = currentSong.clickSource
+                currentSetlist.songs[currentSongIndex].guideSource = currentSong.guideSource
+            }
+        }
+
+        syncActivePadToCurrentSongIfNeeded()
+        rebuildPrecomputedBeatGrid()
+        reindexArrangement()
+        if !tracks.isEmpty {
+            ensureClickAndGuideTracksExist()
+        }
+        updateSMPTEState(persistDevicePreset: false)
+        if isPostSongClickActive {
+            activateOrRefreshPostSongClick(mode: postSongClickOriginMode, preserveRunningPhase: true)
+        }
+        if !isMIDIMuted {
+            MIDICueEngine.shared.updateMIDIClockTempo(safeBPM)
+        }
+        markSessionChanged()
+        objectWillChange.send()
+    }
+
     public func updateCurrentSong(title: String, artist: String, bpm: Double, key: String, sections: [SongSection]) {
         let wasTempoShifted = currentSong.isTempoShifted
         currentSong.title = title

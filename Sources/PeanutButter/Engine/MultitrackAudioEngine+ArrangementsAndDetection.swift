@@ -534,12 +534,17 @@ extension MultitrackAudioEngine {
         
         snapshotDefaultBaselineIfUnmodified()
         
+        let prev = currentSong.sections[index - 1]
         let removed = currentSong.sections[index]
-        let prevId = currentSong.sections[index - 1].id
+        let prevId = prev.id
+        let mergedDuration = prev.duration + removed.duration
+        let mergedTrailingTrim = removed.trailingTrimDuration
+        let mergedBaseDuration = mergedDuration + prev.leadingTrimDuration + mergedTrailingTrim
         
-        currentSong.sections[index - 1].duration += removed.duration
+        currentSong.sections[index - 1].duration = mergedDuration
+        currentSong.sections[index - 1].originalDuration = mergedBaseDuration
         currentSong.sections[index - 1].measureCount += removed.measureCount
-        currentSong.sections[index - 1].trailingTrimDuration = removed.trailingTrimDuration
+        currentSong.sections[index - 1].trailingTrimDuration = mergedTrailingTrim
         
         for i in 0..<currentSong.midiCues.count where currentSong.midiCues[i].sectionId == removed.id {
             currentSong.midiCues[i].sectionId = prevId
@@ -550,15 +555,18 @@ extension MultitrackAudioEngine {
         for i in 0..<currentSong.automationPoints.count where currentSong.automationPoints[i].sectionId == removed.id {
             currentSong.automationPoints[i].sectionId = prevId
         }
-        
-        if loopedSection?.id == removed.id {
-            loopedSection = currentSong.sections[index - 1]
+        if var smpte = currentSong.smpteCue, smpte.sectionId == removed.id {
+            smpte.sectionId = prevId
+            currentSong.smpteCue = smpte
         }
         
+        let wasLoopedOnMerged = (loopedSection?.id == removed.id || loopedSection?.id == prevId)
         currentSong.sections.remove(at: index)
         
         reindexArrangement()
-        updateArrangementWaveform()
+        if wasLoopedOnMerged {
+            loopedSection = currentSong.sections.first(where: { $0.id == prevId })
+        }
         regenerateGuideTrack()
         regenerateClickTrack()
         markSessionChanged()
