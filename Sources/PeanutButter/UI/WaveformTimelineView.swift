@@ -339,7 +339,7 @@ public struct WaveformTimelineView: View {
                 clock.position.currentTime
             }
             
-            ZStack(alignment: .leading) {
+            ZStack(alignment: .topLeading) {
                 // 1. Dark Timeline Canvas Background
                 RoundedRectangle(cornerRadius: 4)
                     .fill(Color(red: 0.07, green: 0.08, blue: 0.09))
@@ -442,6 +442,7 @@ public struct WaveformTimelineView: View {
                             currentPlaybackTime: currentTimeProvider
                         )
                     )
+                    .frame(height: geo.size.height, alignment: .topLeading)
                     .simultaneousGesture(
                         (engine.isEditingArrangement || engine.isEditingTempoCurve || isUserScrollBlocked || draggingCueId != nil || isDraggingSMPTECue) ? nil :
                         DragGesture(minimumDistance: 3)
@@ -961,6 +962,7 @@ public struct WaveformTimelineView: View {
             )
             .zIndex(200)
         }
+        .frame(height: geo.size.height, alignment: .topLeading)
     }
 
     @ViewBuilder
@@ -3358,6 +3360,7 @@ struct TimelineCuesLaneLayerView: View, Equatable {
                     context.fill(tri, with: .color(cue.bus.color.opacity(isTrimmedOut ? 0.32 : 1.0)))
                 }
             }
+            .frame(height: totalHeight, alignment: .topLeading)
             .allowsHitTesting(false)
         } else {
         ZStack(alignment: .topLeading) {
@@ -3562,6 +3565,7 @@ struct TimelineCuesLaneLayerView: View, Equatable {
                 }
             }
         }
+        .frame(height: totalHeight, alignment: .topLeading)
         }
     }
 }

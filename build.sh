@@ -93,6 +93,10 @@ else
         "$X86_64_BIN_DIR/PeanutButter"
 fi
 chmod +x "PeanutButter.app/Contents/MacOS/PeanutButter"
+if [ "$BUILD_CONFIG" = "release" ]; then
+    echo "Stripping local/debug symbols from release binary..."
+    /usr/bin/strip -x "PeanutButter.app/Contents/MacOS/PeanutButter"
+fi
 
 BUILT_ARCHS=$(lipo -archs "PeanutButter.app/Contents/MacOS/PeanutButter")
 echo "Built binary architectures: $BUILT_ARCHS"
@@ -108,6 +112,7 @@ if [ "$NATIVE_ONLY" -eq 0 ]; then
 fi
 cp -R Sources/PeanutButter/Resources/* "PeanutButter.app/Contents/Resources/" 2>/dev/null || true
 rm -f "PeanutButter.app/Contents/Resources/Info.plist"
+rm -rf "PeanutButter.app/Contents/Resources/AppIcon.iconset"
 /usr/bin/xattr -cr "PeanutButter.app"
 
 SIGN_IDENTITY=""

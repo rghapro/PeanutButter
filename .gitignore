@@ -17,6 +17,16 @@ Sources/PeanutButter/Resources/Audio/Click/
 Sources/PeanutButter/Resources/Audio/Dynamic Cues/
 Sources/PeanutButter/Resources/Audio/Song Sections/
 
+# Any non-bundled guide packs placed under Resources/Audio/Guides/ are ignored here:
+Sources/PeanutButter/Resources/Audio/Guides/*
+!Sources/PeanutButter/Resources/Audio/Guides/caleb-male/
+!Sources/PeanutButter/Resources/Audio/Guides/claire-female/
+!Sources/PeanutButter/Resources/Audio/Guides/daniel-male/
+!Sources/PeanutButter/Resources/Audio/Guides/hannah-female/
+!Sources/PeanutButter/Resources/Audio/Guides/marcus-male/
+!Sources/PeanutButter/Resources/Audio/Guides/maya-female/
+!Sources/PeanutButter/Resources/Audio/Guides/sam-male/
+
 # User-uploaded pads live in ~/Library/Application Support/PeanutButter/Pads/ (outside repo),
 # and any non-bundled pads placed under Resources/Audio/Pads/ are ignored here:
 Sources/PeanutButter/Resources/Audio/Pads/*
