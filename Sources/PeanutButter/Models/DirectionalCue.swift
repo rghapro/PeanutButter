@@ -194,6 +194,8 @@ public struct GuideVoice: RawRepresentable, Codable, Hashable, Sendable, Identif
     public var id: String { rawValue }
     
     public static let customPrefix = "custom_guide:"
+    public static let cloneActive = GuideVoice(rawValue: "clone_active")
+    public static let clonePackPrefix = "clone_pack:"
     
     public init(rawValue: String) {
         self.rawValue = rawValue
@@ -206,9 +208,27 @@ public struct GuideVoice: RawRepresentable, Codable, Hashable, Sendable, Identif
     public static func custom(packId: String) -> GuideVoice {
         GuideVoice(rawValue: "\(customPrefix)\(packId)")
     }
+
+    public static func clonePack(_ packId: String) -> GuideVoice {
+        GuideVoice(rawValue: "\(clonePackPrefix)\(packId)")
+    }
     
     public var isCustom: Bool {
         rawValue.hasPrefix(Self.customPrefix)
+    }
+
+    public var isCloneActive: Bool {
+        rawValue == Self.cloneActive.rawValue
+    }
+
+    public var isVoiceClone: Bool {
+        isCloneActive || rawValue.hasPrefix(Self.clonePackPrefix)
+    }
+
+    public var clonedPackId: String? {
+        guard rawValue.hasPrefix(Self.clonePackPrefix) else { return nil }
+        let id = String(rawValue.dropFirst(Self.clonePackPrefix.count))
+        return id.isEmpty ? nil : id
     }
     
     public var customPackId: String? {

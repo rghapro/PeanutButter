@@ -220,6 +220,8 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
     public static let defaultClickSoundKey = "Playback_DefaultClickSound"
     public static let defaultGuideVoiceKey = "Playback_DefaultGuideVoice"
     public static let defaultGuideFallbackVoiceKey = "Playback_DefaultGuideFallbackVoice"
+    public static let defaultSystemFallbackVoiceKey = "Playback_DefaultSystemFallbackVoice"
+    public static let preferredDefaultVoiceCloneKey = "Playback_PreferredDefaultVoiceClone"
     
     public static let supportedAudioExtensions: Set<String> = [
         "wav", "aif", "aiff", "m4a", "mp3", "caf", "flac"
@@ -409,6 +411,11 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
     @Published public var defaultClickSoundRaw: String = ""
     @Published public var defaultGuideVoiceRaw: String = ""
     @Published public var defaultGuideFallbackVoiceRaw: String = GuideVoice.zoe.rawValue
+    @Published public var defaultSystemFallbackVoiceRaw: String = GuideVoice.zoe.rawValue
+    @Published public var preferredDefaultVoiceCloneRaw: String = GuideVoice.cloneActive.rawValue
+    private var backingDefaultGuideFallbackVoiceRaw: String = GuideVoice.zoe.rawValue
+    private var backingDefaultSystemFallbackVoiceRaw: String = GuideVoice.zoe.rawValue
+    private var backingPreferredDefaultVoiceCloneRaw: String = GuideVoice.cloneActive.rawValue
     
     private let lock = NSLock()
     private var clickPackIndex: [String: CustomClickPack] = [:]
@@ -430,6 +437,11 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         self.defaultClickSoundRaw = ""
         self.defaultGuideVoiceRaw = ""
         self.defaultGuideFallbackVoiceRaw = GuideVoice.zoe.rawValue
+        self.defaultSystemFallbackVoiceRaw = GuideVoice.zoe.rawValue
+        self.preferredDefaultVoiceCloneRaw = GuideVoice.cloneActive.rawValue
+        self.backingDefaultGuideFallbackVoiceRaw = GuideVoice.zoe.rawValue
+        self.backingDefaultSystemFallbackVoiceRaw = GuideVoice.zoe.rawValue
+        self.backingPreferredDefaultVoiceCloneRaw = GuideVoice.cloneActive.rawValue
 
         refreshPacks()
     }
@@ -448,10 +460,20 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         let savedClick = UserDefaults.standard.string(forKey: Self.defaultClickSoundKey) ?? ""
         let savedGuide = UserDefaults.standard.string(forKey: Self.defaultGuideVoiceKey) ?? ""
         let savedFallback = UserDefaults.standard.string(forKey: Self.defaultGuideFallbackVoiceKey) ?? GuideVoice.zoe.rawValue
+        let savedFallbackVoice = GuideVoice(rawValue: savedFallback)
+        let savedSystemFallback = UserDefaults.standard.string(forKey: Self.defaultSystemFallbackVoiceKey)
+            ?? (savedFallbackVoice.isVoiceClone ? GuideVoice.zoe.rawValue : savedFallback)
+        let savedPreferredClone = UserDefaults.standard.string(forKey: Self.preferredDefaultVoiceCloneKey)
+            ?? (savedFallbackVoice.isVoiceClone ? savedFallback : GuideVoice.cloneActive.rawValue)
         
         self.defaultClickSoundRaw = savedClick
         self.defaultGuideVoiceRaw = savedGuide
         self.defaultGuideFallbackVoiceRaw = savedFallback
+        self.defaultSystemFallbackVoiceRaw = savedSystemFallback
+        self.preferredDefaultVoiceCloneRaw = savedPreferredClone
+        self.backingDefaultGuideFallbackVoiceRaw = savedFallback
+        self.backingDefaultSystemFallbackVoiceRaw = savedSystemFallback
+        self.backingPreferredDefaultVoiceCloneRaw = savedPreferredClone
         
         refreshPacks()
     }
@@ -537,14 +559,93 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
     
     public var defaultGuideFallbackVoice: GuideVoice {
         get {
-            let stored = lock.withLock { defaultGuideFallbackVoiceRaw }
+            let stored = lock.withLock { backingDefaultGuideFallbackVoiceRaw }
             return stored.isEmpty ? .zoe : GuideVoice(rawValue: stored)
         }
         set {
             lock.withLock {
-                defaultGuideFallbackVoiceRaw = newValue.rawValue
+                backingDefaultGuideFallbackVoiceRaw = newValue.rawValue
             }
-            UserDefaults.standard.set(newValue.rawValue, forKey: Self.defaultGuideFallbackVoiceKey)
+            if !isIsolatedForTesting {
+                UserDefaults.standard.set(newValue.rawValue, forKey: Self.defaultGuideFallbackVoiceKey)
+            }
+            if Thread.isMainThread {
+                defaultGuideFallbackVoiceRaw = newValue.rawValue
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let latest = self.lock.withLock { self.backingDefaultGuideFallbackVoiceRaw }
+                    if self.defaultGuideFallbackVoiceRaw != latest {
+                        self.defaultGuideFallbackVoiceRaw = latest
+                    }
+                }
+            }
+            if newValue.isVoiceClone {
+                preferredDefaultVoiceCloneVoice = newValue
+            } else {
+                defaultSystemFallbackVoice = newValue
+            }
+        }
+    }
+
+    public var defaultSystemFallbackVoice: GuideVoice {
+        get {
+            let stored = lock.withLock { backingDefaultSystemFallbackVoiceRaw }
+            if stored.isEmpty {
+                let fb = defaultGuideFallbackVoice
+                return fb.isVoiceClone ? .zoe : fb
+            }
+            let voice = GuideVoice(rawValue: stored)
+            return voice.isVoiceClone ? .zoe : voice
+        }
+        set {
+            let sanitized = newValue.isVoiceClone ? GuideVoice.zoe : newValue
+            lock.withLock {
+                backingDefaultSystemFallbackVoiceRaw = sanitized.rawValue
+            }
+            if !isIsolatedForTesting {
+                UserDefaults.standard.set(sanitized.rawValue, forKey: Self.defaultSystemFallbackVoiceKey)
+            }
+            if Thread.isMainThread {
+                defaultSystemFallbackVoiceRaw = sanitized.rawValue
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let latest = self.lock.withLock { self.backingDefaultSystemFallbackVoiceRaw }
+                    if self.defaultSystemFallbackVoiceRaw != latest {
+                        self.defaultSystemFallbackVoiceRaw = latest
+                    }
+                }
+            }
+        }
+    }
+
+    public var preferredDefaultVoiceCloneVoice: GuideVoice {
+        get {
+            let stored = lock.withLock { backingPreferredDefaultVoiceCloneRaw }
+            guard !stored.isEmpty else { return .cloneActive }
+            let voice = GuideVoice(rawValue: stored)
+            return voice.isVoiceClone ? voice : .cloneActive
+        }
+        set {
+            let sanitized = newValue.isVoiceClone ? newValue : GuideVoice.cloneActive
+            lock.withLock {
+                backingPreferredDefaultVoiceCloneRaw = sanitized.rawValue
+            }
+            if !isIsolatedForTesting {
+                UserDefaults.standard.set(sanitized.rawValue, forKey: Self.preferredDefaultVoiceCloneKey)
+            }
+            if Thread.isMainThread {
+                preferredDefaultVoiceCloneRaw = sanitized.rawValue
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let latest = self.lock.withLock { self.backingPreferredDefaultVoiceCloneRaw }
+                    if self.preferredDefaultVoiceCloneRaw != latest {
+                        self.preferredDefaultVoiceCloneRaw = latest
+                    }
+                }
+            }
         }
     }
     
@@ -1069,6 +1170,7 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         }
 
         writeGuideManifest(pack)
+        VoiceCloneService.shared.invalidatePack(packId: packId)
         refreshPacks()
         return importedCount
     }
@@ -1149,6 +1251,7 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         }
         
         writeGuideManifest(pack)
+        VoiceCloneService.shared.invalidatePack(packId: packId)
         refreshPacks()
         return true
     }
@@ -1171,6 +1274,7 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
             }
         }
         writeGuideManifest(pack)
+        VoiceCloneService.shared.invalidatePack(packId: packId)
         refreshPacks()
     }
 
@@ -1220,12 +1324,14 @@ public final class CustomSampleLibraryManager: ObservableObject, @unchecked Send
         guard !trimmed.isEmpty, var pack = guidePack(forId: id) else { return }
         pack.name = trimmed
         writeGuideManifest(pack)
+        VoiceCloneService.shared.invalidatePack(packId: id)
         refreshPacks()
     }
     
     public func deleteGuidePack(id: String) {
         guard let pack = guidePack(forId: id) else { return }
         AudioSampleBank.shared.invalidateCachedBuffers(matchingPathPrefix: pack.folderPath)
+        VoiceCloneService.shared.invalidatePack(packId: id)
         try? FileManager.default.removeItem(at: pack.folderURL)
         if defaultGuideVoice.customPackId == id {
             setDefaultGuideVoice(.rita)

@@ -21,9 +21,68 @@ public struct AudioOutputDevice: Identifiable, Hashable, Sendable {
 @MainActor
 public final class AudioDeviceManager: ObservableObject {
     public static let shared = AudioDeviceManager()
+
+    public static let preferredDeviceUIDKey = "Playback_PreferredAudioDeviceUID"
+    public static let preferredDeviceNameKey = "Playback_PreferredAudioDeviceName"
     
     @Published public private(set) var availableDevices: [AudioOutputDevice] = []
     @Published public var selectedDevice: AudioOutputDevice?
+
+    public func persistPreferredDevice(_ device: AudioOutputDevice, defaults: UserDefaults = .standard) {
+        if !device.uid.isEmpty {
+            defaults.set(device.uid, forKey: Self.preferredDeviceUIDKey)
+        }
+        if !device.name.isEmpty {
+            defaults.set(device.name, forKey: Self.preferredDeviceNameKey)
+        }
+    }
+
+    public nonisolated static func resolveTargetDevice(
+        from outputs: [AudioOutputDevice],
+        currentSelected: AudioOutputDevice?,
+        preferredUID: String?,
+        preferredName: String?,
+        systemDefaultID: AudioDeviceID?
+    ) -> AudioOutputDevice? {
+        guard !outputs.isEmpty else { return nil }
+
+        if let pUID = preferredUID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !pUID.isEmpty,
+           let match = outputs.first(where: { $0.uid == pUID }) {
+            return match
+        }
+
+        if let pName = preferredName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !pName.isEmpty,
+           let match = outputs.first(where: {
+               $0.name.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(pName) == .orderedSame
+           }) {
+            return match
+        }
+
+        if let defaultID = systemDefaultID,
+           let match = outputs.first(where: { $0.id == defaultID }) {
+            return match
+        }
+
+        if let current = currentSelected {
+            if let match = outputs.first(where: { $0.id == current.id }) {
+                return match
+            }
+            if !current.uid.isEmpty, let match = outputs.first(where: { $0.uid == current.uid }) {
+                return match
+            }
+            let curName = current.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !curName.isEmpty,
+               let match = outputs.first(where: {
+                   $0.name.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(curName) == .orderedSame
+               }) {
+                return match
+            }
+        }
+
+        return outputs.first
+    }
     
     public init() {
         refreshDevices()
@@ -130,15 +189,30 @@ public final class AudioDeviceManager: ObservableObject {
         
         self.availableDevices = outputs
         
-        // Auto-select macOS's currently active default audio interface
+        // Restore the user's preferred audio interface (by UID, then name fallback for USB port changes),
+        // falling back to macOS System Default only if no preferred device is connected or saved.
+        let defaults = UserDefaults.standard
+        let preferredUID = defaults.string(forKey: Self.preferredDeviceUIDKey)
+        let preferredName = defaults.string(forKey: Self.preferredDeviceNameKey)
         let systemDefaultID = getDefaultSystemDeviceID()
-        if let defaultID = systemDefaultID, let match = outputs.first(where: { $0.id == defaultID }) {
-            if self.selectedDevice?.id != match.id {
-                self.selectedDevice = match
+        if let target = Self.resolveTargetDevice(
+            from: outputs,
+            currentSelected: selectedDevice,
+            preferredUID: preferredUID,
+            preferredName: preferredName,
+            systemDefaultID: systemDefaultID
+        ) {
+            if let pName = preferredName?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !pName.isEmpty,
+               target.name.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(pName) == .orderedSame,
+               !target.uid.isEmpty,
+               target.uid != preferredUID {
+                defaults.set(target.uid, forKey: Self.preferredDeviceUIDKey)
             }
-        } else if selectedDevice == nil || !outputs.contains(where: { $0.id == selectedDevice?.id }) {
-            if let first = outputs.first, self.selectedDevice?.id != first.id {
-                self.selectedDevice = first
+            if self.selectedDevice?.id != target.id ||
+               self.selectedDevice?.uid != target.uid ||
+               self.selectedDevice?.outputChannelCount != target.outputChannelCount {
+                self.selectedDevice = target
             }
         }
     }

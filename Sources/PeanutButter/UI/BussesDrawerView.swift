@@ -66,7 +66,7 @@ public struct BussesDrawerView: View {
                     get: { deviceManager.selectedDevice?.id ?? 0 },
                     set: { newID in
                         if let dev = deviceManager.availableDevices.first(where: { $0.id == newID }) {
-                            engine.setOutputDevice(dev)
+                            engine.setOutputDevice(dev, showBanner: true, persistAsPreferred: true)
                         }
                     }
                 )) {

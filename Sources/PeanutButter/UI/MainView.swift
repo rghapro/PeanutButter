@@ -17,6 +17,7 @@ public struct MainView: View {
     @State private var activeSongCardMenuSongId: UUID? = nil
     @State private var activeTransitionSongIndex: Int? = nil
     @State private var isTopLeftMIDICuesMenuOpen: Bool = false
+    @State private var isShowingDeleteAllMIDICuesAlert: Bool = false
     @State private var isTopLeftDirectionalCuesMenuOpen: Bool = false
     @State private var isTopLeftAutomationMenuOpen: Bool = false
     @State private var isTopLeftSMPTEMenuOpen: Bool = false
@@ -79,7 +80,7 @@ public struct MainView: View {
             // Main Playback Console
             VStack(spacing: 0) {
                 // Tier 1: Top Header & Hardware Transport Bar
-                topTransportBarView
+                topTransportBarSection
                 
                 // Tier 2: Setlist Song Carousel Row (continuous slate background with Tier 1)
                 setlistSongCarouselView
@@ -580,6 +581,120 @@ public struct MainView: View {
     
     // MARK: - Tier 1: Top Header & Hardware Transport Bar
     
+    private var deleteAllMIDICuesAlertMessage: String {
+        let count = engine.currentSong.midiCues.count
+        let trimmedTitle = engine.currentSong.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let songName = trimmedTitle.isEmpty ? "this song" : trimmedTitle
+        return "This will remove all \(count) MIDI \(count == 1 ? "cue" : "cues") from \(songName)."
+    }
+
+    private var topTransportBarSection: some View {
+        topTransportBarView
+            .alert("Delete All MIDI Cues?", isPresented: $isShowingDeleteAllMIDICuesAlert) {
+                Button("Delete All", role: .destructive) {
+                    engine.clearAllMIDICues()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(deleteAllMIDICuesAlertMessage)
+            }
+    }
+
+    private var midiCuesActionsPopover: some View {
+        let hasSelected = (engine.selectedMIDICue != nil)
+        let hasAnyCues = !engine.currentSong.midiCues.isEmpty
+        return VStack(alignment: .leading, spacing: 0) {
+            Button(action: {
+                isTopLeftMIDICuesMenuOpen = false
+                if let selId = engine.selectedMIDICueId {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        engine.requestedEditMIDICueId = selId
+                    }
+                }
+            }) {
+                HStack {
+                    Text("Edit MIDI Cue")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(hasSelected ? .white : Color(white: 0.45))
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasSelected)
+            
+            Divider()
+                .background(Color(white: 0.22))
+            
+            Button(action: {
+                isTopLeftMIDICuesMenuOpen = false
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    engine.isNudgingMIDICue = true
+                }
+            }) {
+                HStack {
+                    Text("Nudge MIDI Cue")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(hasSelected ? .white : Color(white: 0.45))
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasSelected)
+            
+            Divider()
+                .background(Color(white: 0.22))
+            
+            Button(action: {
+                isTopLeftMIDICuesMenuOpen = false
+                if let selId = engine.selectedMIDICueId {
+                    engine.removeMIDICue(id: selId)
+                }
+            }) {
+                HStack {
+                    Text("Delete MIDI Cue")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(hasSelected ? Color(red: 0.98, green: 0.24, blue: 0.28) : Color(white: 0.45))
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasSelected)
+            
+            Divider()
+                .background(Color(white: 0.22))
+            
+            Button(action: {
+                isTopLeftMIDICuesMenuOpen = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    isShowingDeleteAllMIDICuesAlert = true
+                }
+            }) {
+                HStack {
+                    Text("Delete All MIDI Cues")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(hasAnyCues ? Color(red: 0.98, green: 0.24, blue: 0.28) : Color(white: 0.45))
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasAnyCues)
+        }
+        .frame(width: 190)
+        .background(Color(red: 0.12, green: 0.12, blue: 0.13))
+    }
+
     private var topTransportBarView: some View {
         let isBlankSession = engine.currentSong.title.isEmpty || engine.tracks.isEmpty
         let baseSessionName = engine.currentSetlist.name.isEmpty ? "New Setlist" : engine.currentSetlist.name
@@ -813,23 +928,35 @@ public struct MainView: View {
                             }
                             engine.togglePlayPause()
                         }) {
-                            Canvas { context, size in
-                                let greenColor = Color(red: 0.25, green: 0.88, blue: 0.45)
-                                let midY = size.height / 2
-                                let midX = size.width / 2
-                                
-                                if engine.playbackState == .playing {
-                                    let leftBar = CGRect(x: midX - 8.2, y: midY - 10.5, width: 4.6, height: 21)
-                                    let rightBar = CGRect(x: midX + 3.8, y: midY - 10.5, width: 4.6, height: 21)
-                                    context.stroke(Path(leftBar), with: .color(greenColor), lineWidth: 1.6)
-                                    context.stroke(Path(rightBar), with: .color(greenColor), lineWidth: 1.6)
-                                } else {
-                                    var tri = Path()
-                                    tri.move(to: CGPoint(x: midX - 7.2, y: midY - 10.5))
-                                    tri.addLine(to: CGPoint(x: midX + 10.5, y: midY))
-                                    tri.addLine(to: CGPoint(x: midX - 7.2, y: midY + 10.5))
-                                    tri.closeSubpath()
-                                    context.stroke(tri, with: .color(greenColor), lineWidth: 1.6)
+                            ZStack(alignment: .bottom) {
+                                Canvas { context, size in
+                                    let greenColor = Color(red: 0.25, green: 0.88, blue: 0.45)
+                                    let midY = engine.isAnnouncingSong ? (size.height / 2 - 5) : (size.height / 2)
+                                    let midX = size.width / 2
+                                    
+                                    if engine.playbackState == .playing {
+                                        let leftBar = CGRect(x: midX - 8.2, y: midY - 10.5, width: 4.6, height: 21)
+                                        let rightBar = CGRect(x: midX + 3.8, y: midY - 10.5, width: 4.6, height: 21)
+                                        context.stroke(Path(leftBar), with: .color(greenColor), lineWidth: 1.6)
+                                        context.stroke(Path(rightBar), with: .color(greenColor), lineWidth: 1.6)
+                                    } else {
+                                        var tri = Path()
+                                        tri.move(to: CGPoint(x: midX - 7.2, y: midY - 10.5))
+                                        tri.addLine(to: CGPoint(x: midX + 10.5, y: midY))
+                                        tri.addLine(to: CGPoint(x: midX - 7.2, y: midY + 10.5))
+                                        tri.closeSubpath()
+                                        context.stroke(tri, with: .color(greenColor), lineWidth: 1.6)
+                                    }
+                                }
+                                if engine.isAnnouncingSong {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "speaker.wave.2.fill")
+                                            .font(.system(size: 8.5, weight: .bold))
+                                        Text("ANNOUNCING")
+                                            .font(.system(size: 8.5, weight: .bold, design: .rounded))
+                                    }
+                                    .foregroundColor(Color(red: 0.25, green: 0.75, blue: 1.0))
+                                    .padding(.bottom, 5)
                                 }
                             }
                             .frame(width: 194, height: 67)
@@ -837,11 +964,16 @@ public struct MainView: View {
                             .cornerRadius(4)
                             .overlay(
                                 RoundedRectangle(cornerRadius: 4)
-                                    .stroke(boxBorder, lineWidth: 1)
+                                    .stroke(
+                                        engine.isAnnouncingSong
+                                            ? Color(red: 0.25, green: 0.75, blue: 1.0).opacity(0.85)
+                                            : boxBorder,
+                                        lineWidth: engine.isAnnouncingSong ? 1.5 : 1
+                                    )
                             )
                         }
                         .buttonStyle(.plain)
-                        .help("Play / Pause (Space)")
+                        .help(engine.isAnnouncingSong ? "Skip Announcement & Play (Space)" : "Play / Pause (Space)")
                         
                         // FADE Button - 130x67 box with concave fade-out curve icon (flips to ramp up when faded)
                         Button(action: {
@@ -1067,76 +1199,7 @@ public struct MainView: View {
                                     .frame(width: 55, height: 67)
                                     .help("MIDI Cue Actions (Edit, Nudge, Delete)")
                                     .popover(isPresented: $isTopLeftMIDICuesMenuOpen, arrowEdge: .bottom) {
-                                        VStack(alignment: .leading, spacing: 0) {
-                                            let hasSelected = (engine.selectedMIDICue != nil)
-                                            
-                                            Button(action: {
-                                                isTopLeftMIDICuesMenuOpen = false
-                                                if let selId = engine.selectedMIDICueId {
-                                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                                        engine.requestedEditMIDICueId = selId
-                                                    }
-                                                }
-                                            }) {
-                                                HStack {
-                                                    Text("Edit MIDI Cue")
-                                                        .font(.system(size: 13, weight: .medium))
-                                                        .foregroundColor(hasSelected ? .white : Color(white: 0.45))
-                                                    Spacer()
-                                                }
-                                                .padding(.horizontal, 14)
-                                                .padding(.vertical, 11)
-                                                .contentShape(Rectangle())
-                                            }
-                                            .buttonStyle(.plain)
-                                            .disabled(!hasSelected)
-                                            
-                                            Divider()
-                                                .background(Color(white: 0.22))
-                                            
-                                            Button(action: {
-                                                isTopLeftMIDICuesMenuOpen = false
-                                                withAnimation(.easeInOut(duration: 0.15)) {
-                                                    engine.isNudgingMIDICue = true
-                                                }
-                                            }) {
-                                                HStack {
-                                                    Text("Nudge MIDI Cue")
-                                                        .font(.system(size: 13, weight: .medium))
-                                                        .foregroundColor(hasSelected ? .white : Color(white: 0.45))
-                                                    Spacer()
-                                                }
-                                                .padding(.horizontal, 14)
-                                                .padding(.vertical, 11)
-                                                .contentShape(Rectangle())
-                                            }
-                                            .buttonStyle(.plain)
-                                            .disabled(!hasSelected)
-                                            
-                                            Divider()
-                                                .background(Color(white: 0.22))
-                                            
-                                            Button(action: {
-                                                isTopLeftMIDICuesMenuOpen = false
-                                                if let selId = engine.selectedMIDICueId {
-                                                    engine.removeMIDICue(id: selId)
-                                                }
-                                            }) {
-                                                HStack {
-                                                    Text("Delete MIDI Cue")
-                                                        .font(.system(size: 13, weight: .medium))
-                                                        .foregroundColor(hasSelected ? Color(red: 0.98, green: 0.24, blue: 0.28) : Color(white: 0.45))
-                                                    Spacer()
-                                                }
-                                                .padding(.horizontal, 14)
-                                                .padding(.vertical, 11)
-                                                .contentShape(Rectangle())
-                                            }
-                                            .buttonStyle(.plain)
-                                            .disabled(!hasSelected)
-                                        }
-                                        .frame(width: 176)
-                                        .background(Color(red: 0.12, green: 0.12, blue: 0.13))
+                                        midiCuesActionsPopover
                                     }
                                 }
                                 

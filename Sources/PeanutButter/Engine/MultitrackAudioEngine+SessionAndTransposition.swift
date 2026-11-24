@@ -62,6 +62,7 @@ extension MultitrackAudioEngine {
         if index == currentSongIndex && currentSetlist.songs[index].id == currentSong.id && !tracks.isEmpty {
             return
         }
+        cancelSongAnnouncement()
         
         // Cache current song's waveform image & buffers cleanly (with any automated parameters restored to baseline)
         if !currentSong.title.isEmpty {
@@ -97,6 +98,7 @@ extension MultitrackAudioEngine {
         currentSongIndex = index
         let song = currentSetlist.songs[index]
         loadSong(song)
+        warmSongAnnouncementsForActiveWindow()
         if updateUndoBaseline && !isApplyingUndoRedo {
             baselineUndoSnapshot = captureCurrentUndoSnapshot()
             lastUndoCommitTime = 0
@@ -690,6 +692,13 @@ extension MultitrackAudioEngine {
             syncActivePadToCurrentSongIfNeeded()
         } else if idx == currentSongIndex + 1 && bpmChanged {
             syncMixState()
+        }
+        if song.announceSongEnabled {
+            songAnnouncementCache.removeValue(forKey: targetSongId)
+            warmSongAnnouncementIfNeeded(for: song)
+            if idx == currentSongIndex + 1 {
+                syncMixState()
+            }
         }
         markSessionChanged()
         
@@ -1446,6 +1455,7 @@ extension MultitrackAudioEngine {
             currentSongIndex = newIndex
         }
         invalidateStaleNextSongSectionGuides()
+        warmSongAnnouncementsForActiveWindow()
         syncMixState()
         markSessionChanged()
     }
@@ -1497,6 +1507,7 @@ extension MultitrackAudioEngine {
         songTrackMetadataBackup.removeValue(forKey: removedSong.id)
         songWaveformCache.removeValue(forKey: removedSong.id)
         songTransposedBuffersCache.removeValue(forKey: removedSong.id)
+        songAnnouncementCache.removeValue(forKey: removedSong.id)
         
         if currentSetlist.songs.isEmpty {
             stop()
@@ -1514,6 +1525,7 @@ extension MultitrackAudioEngine {
             currentSongIndex = max(0, nextIdx)
             loadSong(currentSetlist.songs[currentSongIndex])
             invalidateStaleNextSongSectionGuides()
+            warmSongAnnouncementsForActiveWindow()
         }
         markSessionChanged()
     }
@@ -1535,6 +1547,9 @@ extension MultitrackAudioEngine {
         generatedClickBuffers.removeAll()
         generatedGuideBuffers.removeAll()
         generatedGuideLoopStates.removeAll()
+        songAnnouncementCache.removeAll()
+        songAnnouncementWarmingKeys.removeAll()
+        cancelSongAnnouncement(stopClockIfIdle: false)
         currentSessionURL = nil
         currentSessionLoadedModDate = nil
         currentSessionLoadedRevisionId = nil
@@ -1603,6 +1618,13 @@ extension MultitrackAudioEngine {
         mutableSong.padPresetId = PadLibraryManager.shared.activePackId
         if mutableSong.usesDefaultGuideVoice {
             mutableSong.guideVoice = GuideVoice.defaultVoice
+        } else if let customId = mutableSong.guideVoice.customPackId,
+                  CustomSampleLibraryManager.shared.guidePack(forId: customId) == nil {
+            mutableSong.guideVoice = GuideVoice.defaultVoice
+            mutableSong.usesDefaultGuideVoice = true
+        }
+        if mutableSong.usesDefaultGuideFallback {
+            mutableSong.guideFallbackVoice = CustomSampleLibraryManager.shared.defaultGuideFallbackVoice
         }
         if mutableSong.usesDefaultClickSound {
             mutableSong.clickSound = ClickSoundType.defaultSound
@@ -1685,6 +1707,7 @@ extension MultitrackAudioEngine {
         currentSetlist.songs.append(mutableSong)
         selectSongInSetlist(at: currentSetlist.songs.count - 1, updateUndoBaseline: false)
         invalidateStaleNextSongSectionGuides()
+        warmSongAnnouncementsForActiveWindow()
         markSessionChanged()
     }
     
@@ -1891,6 +1914,7 @@ extension MultitrackAudioEngine {
             s.continuePad = ov.continuePad
             s.continueClick = ov.continueClick
             s.cueNextSongSection = ov.cueNextSongSection
+            s.announceSongEnabled = ov.announceSongEnabled
             s.endFadeOutEnabled = ov.endFadeOutEnabled
             s.fadeEndSectionEnabled = ov.fadeEndSectionEnabled
             s.startPadWithSong = ov.startPadWithSong
@@ -2287,47 +2311,12 @@ extension MultitrackAudioEngine {
     /// so both copies carry the identical `lastSavedRevisionId` and `lastSavedByDeviceId`, clearing both dots immediately.
     @MainActor
     public func saveQuickSession(changeDescription: String? = nil) {
-        let fm = FileManager.default
         let fallbackName = LibraryBrowserManager.sanitizedPackageFilename(
             currentSetlist.name.isEmpty ? "Untitled Session" : currentSetlist.name,
             ext: "pbsession"
         )
-        let primaryURL: URL
-        var mirrorURL: URL? = nil
         let library = LibraryBrowserManager.shared
-
-        if let currentURL = currentSessionURL {
-            primaryURL = currentURL
-            if !LibraryBrowserManager.isURLInCloudLibrary(currentURL),
-               let cloudDir = library.cloudSetlistsDirectory {
-                let cloudByCurrent = cloudDir.appendingPathComponent(currentURL.lastPathComponent)
-                let cloudByName = cloudDir.appendingPathComponent(fallbackName)
-                if fm.fileExists(atPath: cloudByCurrent.path) {
-                    mirrorURL = cloudByCurrent
-                } else if fm.fileExists(atPath: cloudByName.path) {
-                    mirrorURL = cloudByName
-                }
-            } else if LibraryBrowserManager.isURLInCloudLibrary(currentURL) {
-                let localByCurrent = library.setlistsDirectory.appendingPathComponent(currentURL.lastPathComponent)
-                let localByName = library.setlistsDirectory.appendingPathComponent(fallbackName)
-                if fm.fileExists(atPath: localByCurrent.path) {
-                    mirrorURL = localByCurrent
-                } else if fm.fileExists(atPath: localByName.path) {
-                    mirrorURL = localByName
-                }
-            }
-        } else {
-            primaryURL = library.setlistsDirectory.appendingPathComponent(fallbackName)
-            if let cloudDir = library.cloudSetlistsDirectory {
-                let cloudDest = cloudDir.appendingPathComponent(fallbackName)
-                if fm.fileExists(atPath: cloudDest.path) {
-                    mirrorURL = cloudDest
-                }
-            }
-        }
-
-        let targetMirror = mirrorURL
-        let allTargets = [primaryURL, targetMirror].compactMap { $0 }
+        let primaryURL = currentSessionURL ?? library.setlistsDirectory.appendingPathComponent(fallbackName)
         let sharedRevisionId = UUID()
         acknowledgedCloudRevisionIds.insert(sharedRevisionId)
 
@@ -2339,15 +2328,7 @@ extension MultitrackAudioEngine {
                     changeDescription: changeDescription,
                     revisionId: sharedRevisionId
                 )
-                if let mirror = targetMirror {
-                    try? await self.saveSessionAsync(
-                        to: mirror,
-                        recordAsLastSession: false,
-                        changeDescription: changeDescription,
-                        revisionId: sharedRevisionId
-                    )
-                }
-                self.clearSaveAndCloudUpdateIndicators(revisionId: sharedRevisionId, targetURLs: allTargets)
+                self.clearSaveAndCloudUpdateIndicators(revisionId: sharedRevisionId, targetURLs: [primaryURL])
                 library.refreshSetlists()
             } catch {
                 self.hasUnsavedChanges = true
@@ -2380,6 +2361,9 @@ extension MultitrackAudioEngine {
         generatedClickBuffers.removeAll()
         generatedGuideBuffers.removeAll()
         generatedGuideLoopStates.removeAll()
+        songAnnouncementCache.removeAll()
+        songAnnouncementWarmingKeys.removeAll()
+        cancelSongAnnouncement(stopClockIfIdle: false)
         if recordAsLastSession {
             currentSessionURL = url
             currentSessionLoadedModDate = LibraryBrowserManager.packageModificationDate(at: url)
@@ -2513,7 +2497,11 @@ extension MultitrackAudioEngine {
 
             // Build local library stem index once per setlist and kick off all uncached iCloud downloads upfront
             let localLibraryIndex = PlaybackFileManager.shared.buildLocalLibraryStemIndex()
-            PlaybackFileManager.shared.prefetchCloudStems(for: orderedEntries, rootFolder: hydrated.metadataRootFolder)
+            PlaybackFileManager.shared.prefetchCloudStems(
+                for: orderedEntries,
+                rootFolder: hydrated.metadataRootFolder,
+                localLibraryIndex: localLibraryIndex
+            )
 
             let maxConcurrent = 3
             await withTaskGroup(of: Void.self) { group in
@@ -3161,6 +3149,8 @@ extension MultitrackAudioEngine {
             MIDICueEngine.shared.updateMIDIClockTempo(safeBPM)
         }
         markSessionChanged()
+        songAnnouncementCache.removeValue(forKey: currentSong.id)
+        warmSongAnnouncementsForActiveWindow()
         objectWillChange.send()
     }
 
@@ -3199,6 +3189,8 @@ extension MultitrackAudioEngine {
         }
         updateArrangementWaveform()
         markSessionChanged()
+        songAnnouncementCache.removeValue(forKey: currentSong.id)
+        warmSongAnnouncementsForActiveWindow()
         objectWillChange.send()
     }
     

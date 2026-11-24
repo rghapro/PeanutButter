@@ -37,15 +37,15 @@ extension MultitrackAudioEngine {
         return occupied
     }
 
-    public func availableMonoChannelsForRedundancy() -> [String] {
-        let (_, monoOuts) = deviceManager.availableOutputs(for: deviceManager.selectedDevice)
+    public func availableMonoChannelsForRedundancy(for targetDevice: AudioOutputDevice? = nil) -> [String] {
+        let (_, monoOuts) = deviceManager.availableOutputs(for: targetDevice ?? deviceManager.selectedDevice)
         let channels = monoOuts.isEmpty ? ["Out 1", "Out 2"] : monoOuts
         let occupied = occupiedMonoChannelIndices(excludingRedundancy: true, excludingSMPTE: false)
         return channels.filter { !occupied.contains(Self.monoChannelIndex(for: $0)) }
     }
 
-    public func availableMonoChannelsForSMPTE() -> [String] {
-        let (_, monoOuts) = deviceManager.availableOutputs(for: deviceManager.selectedDevice)
+    public func availableMonoChannelsForSMPTE(for targetDevice: AudioOutputDevice? = nil) -> [String] {
+        let (_, monoOuts) = deviceManager.availableOutputs(for: targetDevice ?? deviceManager.selectedDevice)
         let channels = monoOuts.isEmpty ? ["Out 1", "Out 2"] : monoOuts
         let occupied = occupiedMonoChannelIndices(excludingRedundancy: false, excludingSMPTE: true)
         return channels.filter { !occupied.contains(Self.monoChannelIndex(for: $0)) }
@@ -150,8 +150,17 @@ extension MultitrackAudioEngine {
         return "Playback_StageSignals_\(idStr)"
     }
 
-    public func saveStageSignalPreset(for device: AudioOutputDevice?) {
-        guard let key = stageSignalPresetStorageKey(for: device) else { return }
+    public func stageSignalPresetNameStorageKey(for device: AudioOutputDevice?) -> String? {
+        guard let dev = device else { return nil }
+        let normalized = dev.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        return "Playback_StageSignals_Name_\(normalized)"
+    }
+
+    public func saveStageSignalPreset(for device: AudioOutputDevice?, defaults: UserDefaults = .standard) {
+        let primaryKey = stageSignalPresetStorageKey(for: device)
+        let nameKey = stageSignalPresetNameStorageKey(for: device)
+        guard primaryKey != nil || nameKey != nil else { return }
         let preset = DeviceStageSignalPreset(
             isRedundancyEnabled: isRedundancyEnabled,
             redundancyOutputChannel: redundancyOutputChannel,
@@ -160,44 +169,62 @@ extension MultitrackAudioEngine {
             smpteFrameRate: smpteFrameRate
         )
         if let data = try? JSONEncoder().encode(preset) {
-            UserDefaults.standard.set(data, forKey: key)
+            if let key = primaryKey {
+                defaults.set(data, forKey: key)
+            }
+            if let nKey = nameKey, nKey != primaryKey {
+                defaults.set(data, forKey: nKey)
+            }
         }
     }
 
-    public func loadStageSignalPreset(for device: AudioOutputDevice?, allowLegacyGlobalFallback: Bool = false) {
+    public func loadStageSignalPreset(for device: AudioOutputDevice?, allowLegacyGlobalFallback: Bool = false, defaults: UserDefaults = .standard) {
         isRedundancyEnabled = false
         isSMPTEEnabled = false
 
-        if let key = stageSignalPresetStorageKey(for: device),
-           let data = UserDefaults.standard.data(forKey: key),
+        let primaryKey = stageSignalPresetStorageKey(for: device)
+        let nameKey = stageSignalPresetNameStorageKey(for: device)
+        var loadedData: Data? = nil
+        var loadedFromNameFallback = false
+        if let key = primaryKey, let data = defaults.data(forKey: key) {
+            loadedData = data
+        } else if let nKey = nameKey, let data = defaults.data(forKey: nKey) {
+            loadedData = data
+            loadedFromNameFallback = true
+        }
+
+        if let data = loadedData,
            let preset = try? JSONDecoder().decode(DeviceStageSignalPreset.self, from: data) {
+            if loadedFromNameFallback, let key = primaryKey {
+                defaults.set(data, forKey: key)
+            }
             redundancyOutputChannel = preset.redundancyOutputChannel
             smpteOutputChannel = preset.smpteOutputChannel
             smpteFrameRate = preset.smpteFrameRate
-            if preset.isRedundancyEnabled && availableMonoChannelsForRedundancy().contains(preset.redundancyOutputChannel) {
+            if preset.isRedundancyEnabled && availableMonoChannelsForRedundancy(for: device).contains(preset.redundancyOutputChannel) {
                 isRedundancyEnabled = true
             }
-            if preset.isSMPTEEnabled && availableMonoChannelsForSMPTE().contains(preset.smpteOutputChannel) {
+            if preset.isSMPTEEnabled && availableMonoChannelsForSMPTE(for: device).contains(preset.smpteOutputChannel) {
                 isSMPTEEnabled = true
             }
         } else if allowLegacyGlobalFallback {
-            let savedRedundancyEnabled = UserDefaults.standard.bool(forKey: "Playback_RedundancyEnabled")
-            self.redundancyOutputChannel = UserDefaults.standard.string(forKey: "Playback_RedundancyChannel") ?? "Out 1"
-            if savedRedundancyEnabled && availableMonoChannelsForRedundancy().contains(self.redundancyOutputChannel) {
+            let savedRedundancyEnabled = defaults.bool(forKey: "Playback_RedundancyEnabled")
+            self.redundancyOutputChannel = defaults.string(forKey: "Playback_RedundancyChannel") ?? "Out 1"
+            if savedRedundancyEnabled && availableMonoChannelsForRedundancy(for: device).contains(self.redundancyOutputChannel) {
                 self.isRedundancyEnabled = true
             }
 
-            let savedSMPTEEnabled = UserDefaults.standard.bool(forKey: "Playback_SMPTEEnabled")
-            if let rawRate = UserDefaults.standard.string(forKey: "Playback_SMPTEFrameRate"),
+            let savedSMPTEEnabled = defaults.bool(forKey: "Playback_SMPTEEnabled")
+            if let rawRate = defaults.string(forKey: "Playback_SMPTEFrameRate"),
                let rate = SMPTEFrameRate(rawValue: rawRate) {
                 self.smpteFrameRate = rate
             }
-            self.smpteOutputChannel = UserDefaults.standard.string(forKey: "Playback_SMPTEOutputChannel") ?? "Out 2"
-            if savedSMPTEEnabled && availableMonoChannelsForSMPTE().contains(self.smpteOutputChannel) {
+            self.smpteOutputChannel = defaults.string(forKey: "Playback_SMPTEOutputChannel") ?? "Out 2"
+            if savedSMPTEEnabled && availableMonoChannelsForSMPTE(for: device).contains(self.smpteOutputChannel) {
                 self.isSMPTEEnabled = true
             }
             if device != nil && (self.isRedundancyEnabled || self.isSMPTEEnabled) {
-                saveStageSignalPreset(for: device)
+                saveStageSignalPreset(for: device, defaults: defaults)
             }
         }
 
@@ -751,9 +778,18 @@ extension MultitrackAudioEngine {
         guard !idStr.isEmpty else { return nil }
         return "Playback_BusRouting_\(idStr)"
     }
+
+    func busRoutingNameStorageKey(for device: AudioOutputDevice?) -> String? {
+        guard let dev = device else { return nil }
+        let normalized = dev.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        return "Playback_BusRouting_Name_\(normalized)"
+    }
     
-    public func saveBusRouting(for device: AudioOutputDevice?) {
-        guard let key = busRoutingStorageKey(for: device) else { return }
+    public func saveBusRouting(for device: AudioOutputDevice?, defaults: UserDefaults = .standard) {
+        let primaryKey = busRoutingStorageKey(for: device)
+        let nameKey = busRoutingNameStorageKey(for: device)
+        guard primaryKey != nil || nameKey != nil else { return }
         var dict: [String: BusRoutingPreset] = [:]
         for bus in busses {
             dict[bus.name.lowercased()] = BusRoutingPreset(
@@ -764,26 +800,53 @@ extension MultitrackAudioEngine {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         if let data = try? encoder.encode(dict) {
-            if key == lastSavedBusRoutingKey && data == lastSavedBusRoutingData {
-                return
+            let isStandardDefaults = (defaults === UserDefaults.standard)
+            if isStandardDefaults, let key = primaryKey, key == lastSavedBusRoutingKey && data == lastSavedBusRoutingData {
+                if let nKey = nameKey, nKey != key, defaults.data(forKey: nKey) == data {
+                    return
+                }
             }
-            UserDefaults.standard.set(data, forKey: key)
-            lastSavedBusRoutingKey = key
-            lastSavedBusRoutingData = data
+            if let key = primaryKey {
+                defaults.set(data, forKey: key)
+                if isStandardDefaults {
+                    lastSavedBusRoutingKey = key
+                    lastSavedBusRoutingData = data
+                }
+            }
+            if let nKey = nameKey, nKey != primaryKey {
+                defaults.set(data, forKey: nKey)
+            }
         }
     }
     
-    public func loadBusRouting(for device: AudioOutputDevice?) {
+    public func loadBusRouting(for device: AudioOutputDevice?, defaults: UserDefaults = .standard) {
         guard let dev = device else { return }
         let (stereoOuts, monoOuts) = deviceManager.availableOutputs(for: dev)
         let defaultStereo = stereoOuts.first ?? "Out 1/2"
         let defaultMono = monoOuts.first ?? "Out 1"
         let defaultOut = dev.outputChannelCount > 1 ? defaultStereo : defaultMono
         let defaultIsMono = dev.outputChannelCount <= 1
-        
-        guard let key = busRoutingStorageKey(for: dev),
-              let data = UserDefaults.standard.data(forKey: key),
-              let dict = try? JSONDecoder().decode([String: BusRoutingPreset].self, from: data) else {
+
+        let primaryKey = busRoutingStorageKey(for: dev)
+        let nameKey = busRoutingNameStorageKey(for: dev)
+        var resolvedDict: [String: BusRoutingPreset]? = nil
+        var rawLoadedData: Data? = nil
+        var loadedFromNameFallback = false
+
+        if let key = primaryKey,
+           let data = defaults.data(forKey: key),
+           let dict = try? JSONDecoder().decode([String: BusRoutingPreset].self, from: data) {
+            resolvedDict = dict
+            rawLoadedData = data
+        } else if let nKey = nameKey,
+                  let data = defaults.data(forKey: nKey),
+                  let dict = try? JSONDecoder().decode([String: BusRoutingPreset].self, from: data) {
+            resolvedDict = dict
+            rawLoadedData = data
+            loadedFromNameFallback = true
+        }
+
+        guard let dict = resolvedDict else {
             // Brand-new audio interface used: all busses default to Out 1/2 (or Out 1 for mono)
             for bus in busses {
                 bus.physicalOutputChannel = defaultOut
@@ -791,6 +854,14 @@ extension MultitrackAudioEngine {
             }
             validateBusOutputRouting(maxChannels: dev.outputChannelCount)
             return
+        }
+
+        if loadedFromNameFallback, let key = primaryKey, let rawLoadedData {
+            defaults.set(rawLoadedData, forKey: key)
+        }
+        if defaults === UserDefaults.standard, let key = primaryKey, let rawLoadedData {
+            lastSavedBusRoutingKey = key
+            lastSavedBusRoutingData = rawLoadedData
         }
         
         for bus in busses {
@@ -821,7 +892,10 @@ extension MultitrackAudioEngine {
         }
     }
 
-    public func setOutputDevice(_ device: AudioOutputDevice, showBanner: Bool = true) {
+    public func setOutputDevice(_ device: AudioOutputDevice, showBanner: Bool = true, persistAsPreferred: Bool = false) {
+        if persistAsPreferred {
+            deviceManager.persistPreferredDevice(device)
+        }
         if lastAppliedHardwareDeviceID == device.id &&
            lastAppliedHardwareChannelCount == device.outputChannelCount &&
            deviceManager.selectedDevice?.id == device.id &&
@@ -888,7 +962,7 @@ extension MultitrackAudioEngine {
             PeanutButterLog.hardware.error("Failed to start audio engine on \(device.name, privacy: .public): \(error.localizedDescription, privacy: .public)")
             showAudioDeviceBanner("Failed to start audio engine on \(device.name): \(error.localizedDescription)")
         }
-        updateMatrix()
+        updateMatrix(persistBusRouting: false)
         syncMixState()
         objectWillChange.send()
         if showBanner {
@@ -926,9 +1000,15 @@ extension MultitrackAudioEngine {
         isEngineRunning = false
 
         let previousSampleRate = lastConfiguredSampleRate
+        let prevDeviceID = lastAppliedHardwareDeviceID
+        let prevChannelCount = lastAppliedHardwareChannelCount
         lastAppliedHardwareChannelCount = newCh
         if let dev = deviceManager.selectedDevice {
             lastAppliedHardwareDeviceID = dev.id
+            if dev.id != prevDeviceID || dev.outputChannelCount != prevChannelCount {
+                loadBusRouting(for: dev)
+                loadStageSignalPreset(for: dev)
+            }
         }
         validateBusOutputRouting(maxChannels: newCh)
         setupSingleClockSourceNode()
@@ -948,7 +1028,7 @@ extension MultitrackAudioEngine {
             showAudioDeviceBanner("Audio engine restart failed: \(error.localizedDescription)")
         }
 
-        updateMatrix()
+        updateMatrix(persistBusRouting: false)
         syncMixState()
 
         if wasPlaying && isEngineRunning {
@@ -1024,7 +1104,8 @@ extension MultitrackAudioEngine {
     }
     
     public func validateBusOutputRouting(maxChannels: Int) {
-        let (stereo, mono) = deviceManager.availableOutputs(for: deviceManager.selectedDevice)
+        let syntheticDevice = AudioOutputDevice(id: 0, uid: "", name: "", outputChannelCount: max(2, maxChannels))
+        let (stereo, mono) = deviceManager.availableOutputs(for: syntheticDevice)
         for bus in busses {
             if bus.isMono {
                 if !mono.contains(bus.physicalOutputChannel) {

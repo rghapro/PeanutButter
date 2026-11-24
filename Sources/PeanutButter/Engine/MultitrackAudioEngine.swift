@@ -33,9 +33,53 @@ public struct MemoryWindowPolicy: Equatable, Sendable {
     }
 }
 
+public enum SessionStorageLocation: String, Equatable, Sendable {
+    case cloud = "Cloud"
+    case local = "Local"
+    case unsaved = "Unsaved"
+}
+
 /// Core multitrack audio engine managing sample-accurate 26+ track synchronized playback, bussing, and transport
 @MainActor
 public final class MultitrackAudioEngine: ObservableObject {
+
+    public nonisolated static func sessionStorageLocation(
+        for sessionURL: URL?,
+        cloudRootURL: URL?
+    ) -> SessionStorageLocation {
+        guard let url = sessionURL else { return .unsaved }
+        if let cloudRoot = cloudRootURL {
+            let rootPath = cloudRoot.standardizedFileURL.path
+            let targetPath = url.standardizedFileURL.path
+            let normalizedPrefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+            return (targetPath == rootPath || targetPath.hasPrefix(normalizedPrefix)) ? .cloud : .local
+        }
+        return LibraryBrowserManager.isURLInCloudLibrary(url) ? .cloud : .local
+    }
+
+    public var currentSessionStorageLocation: SessionStorageLocation {
+        Self.sessionStorageLocation(
+            for: currentSessionURL,
+            cloudRootURL: LibraryBrowserManager.shared.cloudRootURL
+        )
+    }
+
+    public func activeSessionSongAndTrackIds() -> (songIds: Set<UUID>, trackIds: Set<UUID>) {
+        var songIds = Set(currentSetlist.songs.map(\.id))
+        songIds.insert(currentSong.id)
+        var trackIds = Set(tracks.map(\.id))
+        for (_, items) in songBuffersCache {
+            for item in items {
+                trackIds.insert(item.track.id)
+            }
+        }
+        for (_, backupTracks) in songTrackMetadataBackup {
+            for tr in backupTracks {
+                trackIds.insert(tr.id)
+            }
+        }
+        return (songIds, trackIds)
+    }
     
     // MARK: - Published Properties
     @Published public internal(set) var tracks: [StemTrack] = []
@@ -185,6 +229,9 @@ public final class MultitrackAudioEngine: ObservableObject {
     var hardwareDeviceCancellable: AnyCancellable? = nil
     var padStateCancellable: AnyCancellable? = nil
     var engineConfigObserver: NSObjectProtocol? = nil
+    var voiceCloneReadyObserver: NSObjectProtocol? = nil
+    var voiceClonePhraseObserver: NSObjectProtocol? = nil
+    var guidePreviewGeneration: UInt64 = 0
     var lastAppliedHardwareDeviceID: AudioDeviceID? = nil
     var lastAppliedHardwareChannelCount: Int = 0
     var lastConfiguredSampleRate: Double = 0.0
@@ -737,6 +784,20 @@ public final class MultitrackAudioEngine: ObservableObject {
     var cachedActivePostSongClickSpec: PostSongClickSpec? = nil
     var cachedActivePostSongClickBuffer: AVAudioPCMBuffer? = nil
 
+    @Published public internal(set) var isAnnouncingSong: Bool = false
+    struct CachedSongAnnouncement {
+        let phrase: String
+        let packId: String?
+        let voiceSignature: String
+        let usedAIClone: Bool
+        let sampleRateHz: Int
+        let buffer: AVAudioPCMBuffer
+    }
+    var songAnnouncementCache: [UUID: CachedSongAnnouncement] = [:]
+    var songAnnouncementWarmingKeys: Set<String> = []
+    var songAnnouncementRunGeneration: UInt64 = 0
+    var songAnnouncementTask: Task<Void, Never>? = nil
+
     // MARK: - Clock & Synchronization
     var activeManualFade: ActiveManualFade?
     var crossfadeTimer: Timer?
@@ -876,6 +937,21 @@ public final class MultitrackAudioEngine: ObservableObject {
         if let dev = deviceManager.selectedDevice {
             lastAppliedHardwareDeviceID = dev.id
             lastAppliedHardwareChannelCount = dev.outputChannelCount
+            if dev.id != deviceManager.getDefaultSystemDeviceID(),
+               let outputUnit = audioEngine.outputNode.audioUnit {
+                var devID = dev.id
+                let status = AudioUnitSetProperty(
+                    outputUnit,
+                    kAudioOutputUnitProperty_CurrentDevice,
+                    kAudioUnitScope_Global,
+                    0,
+                    &devID,
+                    UInt32(MemoryLayout<AudioDeviceID>.size)
+                )
+                if status != noErr {
+                    PeanutButterLog.hardware.error("Failed to bind restored audio device \(dev.name, privacy: .public) on init: OSStatus \(status)")
+                }
+            }
             loadBusRouting(for: dev)
         }
         setupSingleClockSourceNode()
@@ -887,7 +963,7 @@ public final class MultitrackAudioEngine: ObservableObject {
                 guard let self = self, let dev = newDevice else { return }
                 let didChange = (dev.id != self.lastAppliedHardwareDeviceID) || (dev.outputChannelCount != self.lastAppliedHardwareChannelCount)
                 guard didChange else { return }
-                self.setOutputDevice(dev, showBanner: true)
+                self.setOutputDevice(dev, showBanner: true, persistAsPreferred: false)
             }
         
         do {
@@ -905,6 +981,26 @@ public final class MultitrackAudioEngine: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.handleAudioEngineConfigurationChange()
+            }
+        }
+
+        voiceCloneReadyObserver = NotificationCenter.default.addObserver(
+            forName: VoiceCloneModelManager.didBecomeReadyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleVoiceCloneModelOrPhraseUpdated()
+            }
+        }
+
+        voiceClonePhraseObserver = NotificationCenter.default.addObserver(
+            forName: VoiceCloneService.didFinishBackgroundPhraseNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleVoiceCloneModelOrPhraseUpdated()
             }
         }
         
@@ -1481,7 +1577,7 @@ public final class MultitrackAudioEngine: ObservableObject {
     }
 
     func updatePlaybackActivityAssertion() {
-        let active = (playbackState == .playing) || isPadActive || isPostSongClickActive
+        let active = (playbackState == .playing) || isAnnouncingSong || isPadActive || isPostSongClickActive
         if active && playbackActivityToken == nil {
             playbackActivityToken = ProcessInfo.processInfo.beginActivity(
                 options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
@@ -1500,7 +1596,7 @@ public final class MultitrackAudioEngine: ObservableObject {
         timer.schedule(deadline: .now() + .milliseconds(25), repeating: .milliseconds(25), leeway: .milliseconds(5))
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
-            guard self.playbackState == .playing else {
+            guard self.playbackState == .playing || self.isAnnouncingSong else {
                 self.stopTransportWatchdogTimer()
                 return
             }
@@ -1529,7 +1625,7 @@ public final class MultitrackAudioEngine: ObservableObject {
     }
 
     func tickUIDisplayLink(dt: TimeInterval) {
-        if playbackState == .playing {
+        if playbackState == .playing || isAnnouncingSong {
             tickPlaybackClock()
         }
         if activeManualFade != nil {
@@ -1592,16 +1688,39 @@ public final class MultitrackAudioEngine: ObservableObject {
             updatePadMeter(dt: dt)
         }
         guard playbackState == .playing else {
+            if isAnnouncingSong {
+                let frames60 = Float(max(0.25, min(4.0, dt * 60.0)))
+                let trackAttack = 1.0 - powf(0.20, frames60)
+                let trackDecay = powf(0.82, frames60)
+                let trackPeaks = mixState.consumeTrackPeaks()
+                for track in tracks where !track.isClickTrackCached {
+                    let (rawL, rawR) = trackPeaks[track.id] ?? (0.0, 0.0)
+                    if rawL == 0.0 && rawR == 0.0 && track.peakLevelLeft == 0.0 && track.peakLevelRight == 0.0 && track.meter.left == 0.0 && track.meter.right == 0.0 {
+                        continue
+                    }
+                    let targetL: Float = rawL > 0.0005 ? min(1.0, pow(rawL, 0.62)) : 0.0
+                    let targetR: Float = (rawR == rawL) ? targetL : (rawR > 0.0005 ? min(1.0, pow(rawR, 0.62)) : 0.0)
+                    let nextL: Float = targetL >= track.peakLevelLeft
+                        ? (track.peakLevelLeft + (targetL - track.peakLevelLeft) * trackAttack)
+                        : (track.peakLevelLeft * trackDecay)
+                    let nextR: Float = targetR >= track.peakLevelRight
+                        ? (track.peakLevelRight + (targetR - track.peakLevelRight) * trackAttack)
+                        : (track.peakLevelRight * trackDecay)
+                    track.peakLevelLeft = nextL < 0.004 ? 0.0 : nextL
+                    track.peakLevelRight = nextR < 0.004 ? 0.0 : nextR
+                    track.meter.update(left: track.peakLevelLeft, right: track.peakLevelRight, dt: dt)
+                }
+            }
             if isPostSongClickActive {
                 updatePostSongClickMeters(dt: dt)
             } else {
                 resetClickMeters()
             }
-            let busNeedsUpdate = isPostSongClickActive || padNeedsUpdate || busses.contains { $0.peakLevelLeft > 0.0 || $0.peakLevelRight > 0.0 || $0.meter.left > 0.0 || $0.meter.right > 0.0 }
-            if busNeedsUpdate && (mixerMode == .busses || remoteServer.connectedClientCount > 0) {
+            let busNeedsUpdate = isPostSongClickActive || isAnnouncingSong || padNeedsUpdate || busses.contains { $0.peakLevelLeft > 0.0 || $0.peakLevelRight > 0.0 || $0.meter.left > 0.0 || $0.meter.right > 0.0 }
+            if busNeedsUpdate && (mixerMode == .busses || remoteServer.connectedClientCount > 0 || isAnnouncingSong) {
                 updateBusMeters(dt: dt)
             }
-            if !isPostSongClickActive && !padNeedsUpdate && !busNeedsUpdate && activeManualFade == nil {
+            if !isPostSongClickActive && !isAnnouncingSong && !padNeedsUpdate && !busNeedsUpdate && activeManualFade == nil {
                 stopUIDisplayLink()
             }
             return
@@ -2750,7 +2869,7 @@ public final class MultitrackAudioEngine: ObservableObject {
             )
         }
 
-        if playbackState == .playing {
+        if playbackState == .playing || isAnnouncingSong {
             mixState.updateAllTrackGains(gainsToUpdate)
         } else {
             syncMixState()
@@ -2802,7 +2921,7 @@ public final class MultitrackAudioEngine: ObservableObject {
             padPlayer.setBusGain(anyBusSoloed ? 0.0 : 1.0)
         }
         
-        if playbackState == .playing {
+        if playbackState == .playing || isAnnouncingSong {
             mixState.updateAllTrackGains(gainsToUpdate)
         } else {
             syncMixState()

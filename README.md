@@ -27,14 +27,15 @@ Every feature ships unlocked under the GNU General Public License v3.0 (`GPL-3.0
 ### Local-First Storage and Bring Your Own Cloud (BYOC)
 - Your songs (`.pbsong`) and setlists (`.pbsession`) stay on your Mac with no internet connection or sign-in required.
 - To share a library with your team, point PeanutButter at a folder in iCloud Drive, Google Drive, Dropbox, or OneDrive.
-- Audio stems are bundled into `<songId>.pbstems` packs for reliable cloud transfers. Saving prompts for optional release notes, and teammate Macs show a cyan Update badge with a preview of what changed before downloading.
+- Audio stems are bundled into `<songId>.pbstems` packs for reliable cloud transfers. When opening Cloud setlists, PeanutButter keeps Cloud song settings while automatically reusing matching local stems already on your Mac to save download time.
+- Setlist rows display **Local**, **Cloud**, or **Unsaved** location badges, with **Move to Cloud**, **Duplicate to Local**, and **Delete All Cloud Setlists From Device** actions (removing only downloaded Cloud setlists and cached Cloud stems while leaving all local files untouched). Saving prompts for optional release notes, and teammate Macs show a cyan Update badge with a preview of what changed before downloading.
 
 ### Your Own Stems, Pads, Click Sounds, and Guide Voices
 PeanutButter does not lock your audio library into a closed store.
 - Load `.wav`, `.m4a`, `.mp3`, `.aiff`, or `.flac` stems from any source. `Auto-Sort Stems` and role detection organize stems into your mix buses automatically.
 - The app ships with two stock 12-key pads (`Simple` and `Soft`) and lets you import any 12-key custom pad folder. Imported pads are RMS loudness-normalized so switching pad packs keeps stage volume consistent.
 - Seven synthesized click engines (*Classic*, *Woodblock*, *Beep / Synth*, *Sticks / Rimshot*, *Cowbell*, *Shaker*, *Tambourine*) are built in, or you can upload your own Accent, 1/4, 1/8, and 1/16 samples.
-- Seven bundled human guide voice packs (**Sam**, **Caleb**, **Claire**, **Daniel**, **Hannah**, **Marcus**, and **Maya**) are included. You can also upload your own recorded voice packs, and macOS system/Siri TTS handles any custom phrase as a fallback.
+- Seven bundled human guide voice packs (**Sam**, **Caleb**, **Claire**, **Daniel**, **Hannah**, **Marcus**, and **Maya**) are included. You can upload your own recorded voice packs, enable optional **Local AI Voice Cloning** (on-device CoreML LuxTTS on Apple Silicon, ~348 MB download) so custom cues and announcements speak in your active guide voice, and keep macOS system/Siri TTS as backup.
 
 ### Faster-Than-Real-Time Rehearsal and Practice Tracks
 Skip recording real-time reference tracks in an external DAW.
@@ -67,6 +68,8 @@ Use the built-in 4-step **Import from Playback...** wizard to read your local Mu
 - Add stemless **Click & Pad** items directly to a setlist, or insert **Blank Click Sections** and **Section-Mirrored Click Sections** (stems muted, Click, Guide, and Pad active) mid-song in two clicks.
 - Drag section handles to trim bars, reorder or repeat sections in **Setlist / Song Map**, and save multiple named arrangements per song without modifying audio files.
 - On Overlap/Crossfade transitions, outgoing Click and Guide automatically mute on the overlap downbeat so two clicks and two voices never collide.
+- Enable **Announce Song** per song (with a **Preview** button in the Song Menu) to speak the song title (skipping standalone `(Live)` tags automatically) and current transposed key right before the count-in, or inside the previous song's end section ahead of AutoLink, Overlap, and Crossfade transitions.
+- Clear a song's MIDI automation cleanly with **Delete All MIDI Cues** (`Edit > MIDI Cues` menu, scoped strictly to the current song), while saved audio interface selections, bus routing, and stage signal channels persist reliably across app updates.
 - Drop raw stems into **Song Builder**, detect BPM automatically, and let `GuideSectionDetector` analyze your guide track to place `Intro`, `Verse`, `Chorus`, and `Bridge` markers.
 - Click any transport button, section control, fader, mute, or solo to map MIDI notes/CCs or Mac keyboard keys, with conflict reassignment prompts and **Reset to Defaults**.
 - Send `F-1` / `F#-1` ProPresenter playlist and item triggers on song start, broadcast 24 PPQN MIDI Beat Clock per destination, output SMPTE LTC timecode (`24` to `30` fps), and run a continuous 1 kHz Redundancy pilot tone on any free mono output.
@@ -111,6 +114,7 @@ swift build -c release
 
 - Bundled royalty-free 12-key pads (`Simple`, `Soft`), 7 human guide voice packs, and 7 synthesized click engines work out of the box. Third-party commercial samples are excluded via `.gitignore`.
 - **Rubber Band Library (`Sources/CRubberBand`):** Used for pitch shifting and time stretching under GPLv2+ (`Sources/CRubberBand/vendor/COPYING`).
+- **LuxTTS CoreML & English G2P (`Sources/PeanutButter/Engine/VoiceClone`, [LuxTTS-LICENSE.md](ThirdPartyLicenses/LuxTTS-LICENSE.md)):** Optional on-device Apple Silicon voice cloning downloads the compiled CoreML model bundle on demand without bundling large weights inside the app.
 
 ---
 

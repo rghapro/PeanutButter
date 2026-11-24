@@ -71,6 +71,7 @@ extension MultitrackAudioEngine {
             return
         }
         guard !channels.isEmpty else { return }
+        cancelSongAnnouncement(stopClockIfIdle: false)
         closeEditMode()
         if isPostSongClickActive {
             mixState.stopPostSongClick()
@@ -174,13 +175,15 @@ extension MultitrackAudioEngine {
             return
         }
         if isSongSectionPreRollEnabled && !isSectionCountOff(section) {
+            cancelSongAnnouncement(stopClockIfIdle: false)
             startPreRollPlayback(for: section)
         } else {
+            cancelSongAnnouncement(stopClockIfIdle: false)
             mixState.cancelPreRoll()
             preRollTargetSectionId = nil
             seek(to: section.startTime)
             if playbackState != .playing {
-                play()
+                play(skipSongAnnouncement: true)
             }
         }
     }
@@ -600,6 +603,7 @@ extension MultitrackAudioEngine {
             nextSMPTEStartSeconds: nextStaged.nextSMPTEStartSeconds
         )
         syncStagedPostSongClickOnEnd(sampleRate: sampleRate, currentDuration: masterDuration)
+        syncStagedTransitionAnnouncement(sampleRate: sampleRate, currentDuration: masterDuration)
     }
     
     public var isCurrentSongTransposing: Bool {
@@ -612,7 +616,11 @@ extension MultitrackAudioEngine {
         downloadingSongProgress[currentSong.id] != nil
     }
 
-    public func play() {
+    public func play(skipSongAnnouncement: Bool = false) {
+        if isAnnouncingSong {
+            skipSongAnnouncementAndPlay()
+            return
+        }
         if isCurrentSongTransposing {
             showTranspositionWarning = true
             return
@@ -631,7 +639,152 @@ extension MultitrackAudioEngine {
         }
         guard !channels.isEmpty else { return }
         if playbackState == .playing { return }
-        
+
+        let shouldAnnounce = !skipSongAnnouncement
+            && playbackState == .stopped
+            && playbackOffsetSeconds <= 0.05
+            && currentSong.announceSongEnabled
+            && !currentSong.excludesClickAndGuide
+            && !currentSong.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        if shouldAnnounce {
+            startPreSongAnnouncementThenPlay()
+            return
+        }
+
+        startPlaybackImmediate(fromAnnouncementCompletion: false)
+    }
+
+    private func startPreSongAnnouncementThenPlay() {
+        closeEditMode()
+        if isPostSongClickActive {
+            mixState.stopPostSongClick()
+            isPostSongClickActive = false
+        }
+        mixState.cancelPreRoll()
+        preRollTargetSectionId = nil
+
+        if !audioEngine.isRunning {
+            do {
+                try audioEngine.start()
+                isEngineRunning = true
+            } catch {
+                isEngineRunning = false
+                PeanutButterLog.audio.error("Failed to start AVAudioEngine for song announcement: \(error.localizedDescription, privacy: .public)")
+                showAudioDeviceBanner("Audio engine failed to start: \(error.localizedDescription)")
+                return
+            }
+        }
+
+        syncMixState()
+        updateMatrix(persistBusRouting: false)
+
+        if currentSong.startPadWithSong {
+            if !isPadActive || !padPlayer.isPlaying {
+                startPadPlayer()
+            } else if isPadLinked {
+                syncActivePadToCurrentSongIfNeeded()
+            }
+        } else if isPadLinked && isPadActive {
+            syncActivePadToCurrentSongIfNeeded()
+        } else if isPadLinked, let lockedKey = linkedSongPadKey {
+            currentPadKey = lockedKey
+        }
+
+        songAnnouncementRunGeneration &+= 1
+        let gen = songAnnouncementRunGeneration
+        songAnnouncementTask?.cancel()
+        songAnnouncementTask = nil
+        isAnnouncingSong = true
+        updatePlaybackActivityAssertion()
+        startAudioClockTransportTimer()
+        startMeteringTimer()
+
+        let routing = resolveGuideTrackGainAndChannels(for: currentSong)
+        if let cachedBuf = cachedOrSyncCachedSongAnnouncementBuffer(for: currentSong) {
+            mixState.startPreSongAnnouncement(
+                buffer: cachedBuf,
+                trailingBreathSeconds: 0.20,
+                trackId: routing.trackId,
+                gainL: routing.gainL,
+                gainR: routing.gainR,
+                outL: routing.outL,
+                outR: routing.outR
+            )
+            return
+        }
+
+        let targetSong = currentSong
+        let canonicalFormat = getCanonicalProcessingFormat()
+        songAnnouncementTask = Task { [weak self, targetSong, canonicalFormat, gen] in
+            let resolved = await Task.detached(priority: .userInitiated) {
+                GuideAudioGenerator.shared.resolveSongAnnouncement(for: targetSong, targetFormat: canonicalFormat)
+            }.value
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                guard self.songAnnouncementRunGeneration == gen,
+                      self.isAnnouncingSong,
+                      self.playbackState != .playing,
+                      self.currentSong.id == targetSong.id else {
+                    return
+                }
+                self.songAnnouncementTask = nil
+                guard let resolved else {
+                    self.isAnnouncingSong = false
+                    self.startPlaybackImmediate(fromAnnouncementCompletion: true)
+                    return
+                }
+                let srHz = Int(round(max(1.0, canonicalFormat.sampleRate)))
+                let vSig = self.expectedAnnouncementVoiceSignature(for: targetSong)
+                self.songAnnouncementCache[targetSong.id] = CachedSongAnnouncement(
+                    phrase: GuideAudioGenerator.songAnnouncementPhrase(for: targetSong),
+                    packId: resolved.packId,
+                    voiceSignature: vSig,
+                    usedAIClone: resolved.usedAIClone,
+                    sampleRateHz: srHz,
+                    buffer: resolved.data.buffer
+                )
+                let latestRouting = self.resolveGuideTrackGainAndChannels(for: targetSong)
+                self.mixState.startPreSongAnnouncement(
+                    buffer: resolved.data.buffer,
+                    trailingBreathSeconds: 0.20,
+                    trackId: latestRouting.trackId,
+                    gainL: latestRouting.gainL,
+                    gainR: latestRouting.gainR,
+                    outL: latestRouting.outL,
+                    outR: latestRouting.outR
+                )
+            }
+        }
+    }
+
+    public func skipSongAnnouncementAndPlay() {
+        cancelSongAnnouncement(stopClockIfIdle: false)
+        startPlaybackImmediate(fromAnnouncementCompletion: true)
+    }
+
+    public func cancelSongAnnouncement(stopClockIfIdle: Bool = true) {
+        songAnnouncementRunGeneration &+= 1
+        songAnnouncementTask?.cancel()
+        songAnnouncementTask = nil
+        mixState.cancelPreSongAnnouncement()
+        if isAnnouncingSong {
+            isAnnouncingSong = false
+        }
+        if stopClockIfIdle && playbackState != .playing {
+            stopTransportClock()
+            updatePlaybackActivityAssertion()
+        }
+    }
+
+    private func startPlaybackImmediate(fromAnnouncementCompletion: Bool) {
+        guard !channels.isEmpty else { return }
+        if playbackState == .playing { return }
+        mixState.cancelPreSongAnnouncement()
+        if isAnnouncingSong {
+            isAnnouncingSong = false
+        }
+
         // Return UI to main page if in edit mode (just like pressing "DONE")
         closeEditMode()
         if isPostSongClickActive {
@@ -641,7 +794,8 @@ extension MultitrackAudioEngine {
         
         // If Song Section Pre-Roll is enabled and the playhead is currently at a section start (other than count off),
         // start playback with section pre-roll!
-        if isSongSectionPreRollEnabled,
+        if !fromAnnouncementCompletion,
+           isSongSectionPreRollEnabled,
            let targetSec = currentSong.sections.first(where: { abs(playbackOffsetSeconds - $0.startTime) <= 0.08 && !isSectionCountOff($0) }) {
             if isPadLinked && isPadActive {
                 syncActivePadToCurrentSongIfNeeded()
@@ -738,6 +892,7 @@ extension MultitrackAudioEngine {
     public func pause() {
         pendingPlayAfterHydration = false
         pendingPlaySectionAfterHydration = nil
+        cancelSongAnnouncement()
         guard playbackState == .playing else { return }
         mixState.cancelPreRoll()
         preRollTargetSectionId = nil
@@ -764,6 +919,7 @@ extension MultitrackAudioEngine {
     public func stop() {
         pendingPlayAfterHydration = false
         pendingPlaySectionAfterHydration = nil
+        cancelSongAnnouncement()
         let wasActivePlayback = (playbackState != .stopped)
         mixState.cancelPreRoll()
         preRollTargetSectionId = nil
@@ -823,6 +979,10 @@ extension MultitrackAudioEngine {
         if pendingPlayAfterHydration {
             pendingPlayAfterHydration = false
             pendingPlaySectionAfterHydration = nil
+            return
+        }
+        if isAnnouncingSong {
+            skipSongAnnouncementAndPlay()
             return
         }
         if playbackState == .playing {
@@ -948,6 +1108,7 @@ extension MultitrackAudioEngine {
     
     /// Instant 0ms lock-free sample-accurate seek across all 26+ tracks simultaneously (zero buffer slicing!)
     public func seek(to time: TimeInterval) {
+        cancelSongAnnouncement()
         browsedSectionStartTime = nil
         preRollTargetSectionId = nil
         hasTriggeredEarlyTransition = false
@@ -980,7 +1141,7 @@ extension MultitrackAudioEngine {
     func stopTransportClock() {
         stopTransportWatchdogTimer()
         let padNeedsMeters = padPlayer.isPlaying || padPlayer.isFadingOut || padMeterPeakL > 0.0 || padMeterPeakR > 0.0
-        if !padNeedsMeters && !isPostSongClickActive && activeManualFade == nil {
+        if !padNeedsMeters && !isPostSongClickActive && !isAnnouncingSong && activeManualFade == nil {
             stopUIDisplayLink()
         }
     }
@@ -991,6 +1152,16 @@ extension MultitrackAudioEngine {
     }
     
     func tickPlaybackClock() {
+        if isAnnouncingSong {
+            lastPlaybackClockTickTimestamp = CACurrentMediaTime()
+            if mixState.consumePreSongAnnouncementFinished() {
+                isAnnouncingSong = false
+                songAnnouncementTask?.cancel()
+                songAnnouncementTask = nil
+                startPlaybackImmediate(fromAnnouncementCompletion: true)
+            }
+            return
+        }
         guard playbackState == .playing else { return }
         
         let prevSec = playbackOffsetSeconds
@@ -1219,6 +1390,7 @@ extension MultitrackAudioEngine {
         } else if index == currentSongIndex + 1 {
             syncMixState()
         }
+        warmSongAnnouncementsForActiveWindow()
         markSessionChanged()
         objectWillChange.send()
     }
@@ -1247,6 +1419,7 @@ extension MultitrackAudioEngine {
         } else if index == currentSongIndex + 1 {
             syncMixState()
         }
+        warmSongAnnouncementsForActiveWindow()
         markSessionChanged()
         objectWillChange.send()
     }
@@ -1281,6 +1454,7 @@ extension MultitrackAudioEngine {
         } else if index == currentSongIndex + 1 {
             syncMixState()
         }
+        warmSongAnnouncementsForActiveWindow()
         markSessionChanged()
         objectWillChange.send()
     }
@@ -1368,6 +1542,24 @@ extension MultitrackAudioEngine {
             if !currentSong.endFadeOutEnabled && !currentSong.fadeEndSectionEnabled {
                 restoreSongEndFadeVolumesIfNeeded()
             }
+        }
+        markSessionChanged()
+        objectWillChange.send()
+    }
+
+    public func updateSongAnnounceSong(at index: Int, enabled: Bool) {
+        guard index >= 0 && index < currentSetlist.songs.count else { return }
+        currentSetlist.songs[index].announceSongEnabled = enabled
+        if index == currentSongIndex {
+            currentSong.announceSongEnabled = enabled
+        }
+        if enabled {
+            warmSongAnnouncementIfNeeded(for: currentSetlist.songs[index])
+        } else if index == currentSongIndex {
+            cancelSongAnnouncement()
+        }
+        if index == currentSongIndex || index == currentSongIndex + 1 {
+            syncMixState()
         }
         markSessionChanged()
         objectWillChange.send()
@@ -1757,8 +1949,8 @@ extension MultitrackAudioEngine {
         // Update mixer gains and stage the subsequent song (`currentSongIndex + 1`) without resetting `mixState` playhead!
         updateSMPTEState(persistDevicePreset: false)
         updateMatrix(persistBusRouting: false)
+        syncMixState()
         if isLoopActive {
-            syncMixState()
             if !currentSong.excludesClickAndGuide && currentSong.guideSource == .generated &&
                generatedGuideLoopStates[currentSong.id] != currentLiveGuideLoopState() {
                 regenerateGuideTrack()
@@ -1799,6 +1991,7 @@ extension MultitrackAudioEngine {
         updateTransportPosition(to: currentSeconds)
         updatePlaybackActivityAssertion()
         scheduleSlidingWindowRebalance()
+        warmSongAnnouncementsForActiveWindow()
     }
     
     // MARK: - Post-Song Continue Click Support
@@ -1936,6 +2129,359 @@ extension MultitrackAudioEngine {
         let gainR = effectivePan < 0.0 ? gain * (1.0 + effectivePan) : gain
         let (outL, outR) = resolvePhysicalOutputChannels(for: clickBus?.physicalOutputChannel ?? "Out 3/4", isMono: clickBus?.isMono ?? false)
         return (cachedTrack?.id, gainL, gainR, outL, outR)
+    }
+
+    func resolveGuideTrackGainAndChannels(for targetSong: Song) -> (trackId: UUID?, gainL: Float, gainR: Float, outL: Int, outR: Int) {
+        if targetSong.id == currentSong.id,
+           let gt = tracks.first(where: { Self.isGuideTrack($0) }),
+           let ch = channels[gt.id] {
+            let anyTrackSoloed = channels.values.contains { $0.track.isSoloed } || padChannelSoloed
+            let anyBusSoloed = busses.contains { $0.isSoloed }
+            let g = computeTrackOutputGain(track: gt, channel: ch, anyTrackSoloed: anyTrackSoloed, anyBusSoloed: anyBusSoloed)
+            return (gt.id, g.gainL, g.gainR, g.outL, g.outR)
+        }
+
+        let cachedTrack = songBuffersCache[targetSong.id]?.first(where: { Self.isGuideTrack($0.0) })?.0
+        let guideBus = busses.first { $0.name.lowercased() == (cachedTrack?.assignedBusName.lowercased() ?? "guide") }
+            ?? busses.first { $0.name.lowercased() == "guide" }
+        let anyBusSoloed = busses.contains { $0.isSoloed }
+        let busMuted: Bool = {
+            guard let b = guideBus else { return anyBusSoloed }
+            return anyBusSoloed ? ((!b.isSoloed && !b.isSoloSafe) || b.isMuted) : b.isMuted
+        }()
+        let trackMuted = cachedTrack?.isMuted ?? false
+        let effectiveMute = trackMuted || busMuted
+        var gain: Float = effectiveMute ? 0.0 : (cachedTrack?.linearGain ?? 1.0)
+        if let b = guideBus {
+            gain *= b.linearGain
+        }
+        let effectivePan: Float = (guideBus?.isMono == true) ? 0.0 : max(-1.0, min(1.0, cachedTrack?.pan ?? 0.0))
+        let gainL = effectivePan > 0.0 ? gain * (1.0 - effectivePan) : gain
+        let gainR = effectivePan < 0.0 ? gain * (1.0 + effectivePan) : gain
+        let (outL, outR) = resolvePhysicalOutputChannels(for: guideBus?.physicalOutputChannel ?? "Out 3/4", isMono: guideBus?.isMono ?? false)
+        return (cachedTrack?.id, gainL, gainR, outL, outR)
+    }
+
+    public nonisolated static func transitionAnnouncementStartTime(
+        from currentSong: Song,
+        currentDuration: TimeInterval,
+        to nextSong: Song,
+        announcementDuration: TimeInterval,
+        nextSongCueFirstBeatTime: TimeInterval?
+    ) -> TimeInterval? {
+        transitionAnnouncementTiming(
+            from: currentSong,
+            currentDuration: currentDuration,
+            to: nextSong,
+            announcementDuration: announcementDuration,
+            nextSongCueFirstBeatTime: nextSongCueFirstBeatTime
+        )?.startTime
+    }
+
+    public nonisolated static func transitionAnnouncementTiming(
+        from currentSong: Song,
+        currentDuration: TimeInterval,
+        to nextSong: Song,
+        announcementDuration: TimeInterval,
+        nextSongCueFirstBeatTime: TimeInterval?
+    ) -> (startTime: TimeInterval, deadline: TimeInterval)? {
+        let mode = currentSong.transitionType
+        guard mode == .autoLink || mode == .overlap || mode == .crossfade else { return nil }
+        guard nextSong.announceSongEnabled,
+              !nextSong.excludesClickAndGuide,
+              !nextSong.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              currentDuration > 0,
+              announcementDuration > 0 else {
+            return nil
+        }
+
+        let orderedSections = currentSong.sections.sorted { $0.startTime < $1.startTime }
+        let transitionStartTime: TimeInterval
+        switch mode {
+        case .autoLink:
+            transitionStartTime = orderedSections.last?.endTime ?? currentDuration
+        case .overlap:
+            transitionStartTime = Self.overlapTransitionStartTime(
+                from: currentSong,
+                currentDuration: currentDuration,
+                to: nextSong
+            )
+        case .crossfade:
+            let nextBPM = nextSong.bpm > 20.0 ? nextSong.bpm : 120.0
+            let beatsPerBar = Double(max(1, nextSong.timeSignatureNumerator))
+            let secPerBar = (60.0 / nextBPM) * (4.0 / Double(max(1, nextSong.timeSignatureDenominator))) * beatsPerBar
+            let twoBarsSec = max(0.5, secPerBar * 2.0)
+            let fadeSec = min(currentDuration, twoBarsSec)
+            transitionStartTime = max(0.0, currentDuration - fadeSec)
+        case .cueNextSong, .stayInSong, .cueFirstSong:
+            return nil
+        }
+
+        let hardDeadline = min(transitionStartTime, nextSongCueFirstBeatTime ?? transitionStartTime)
+        let breathSec: TimeInterval = 0.25
+        let desiredFinish = max(0.0, hardDeadline - breathSec)
+        let desiredStart = desiredFinish - announcementDuration
+        let effectiveDeadline = max(0.0, hardDeadline - 0.05)
+
+        if orderedSections.count >= 2,
+           let lastSec = orderedSections.last,
+           lastSec.playSectionGuideCue,
+           desiredStart < lastSec.startTime {
+            let beatGrid = currentSong.effectiveBeatGrid(totalDuration: currentDuration)
+            let endingCueBeats = GuideAudioGenerator.shared.cueMeasureTimestamps(
+                before: lastSec.startTime,
+                beatGrid: beatGrid,
+                bpm: currentSong.bpm,
+                timeSignatureNumerator: currentSong.timeSignatureNumerator,
+                timeSignatureDenominator: currentSong.timeSignatureDenominator
+            )
+            if let cueBarStart = endingCueBeats.first {
+                let shiftedStart = cueBarStart - breathSec - announcementDuration
+                if shiftedStart >= 0.0 {
+                    return (startTime: shiftedStart, deadline: effectiveDeadline)
+                }
+            }
+        }
+
+        return (startTime: max(0.0, desiredStart), deadline: effectiveDeadline)
+    }
+
+    func expectedAnnouncementVoiceSignature(for song: Song) -> String {
+        if VoiceCloneModelManager.isPlatformSupported,
+           VoiceCloneModelManager.isSharedModelReady,
+           let packId = guideAudioGenerator.resolveSongAnnouncementClonePackId(for: song) {
+            return "clone:\(packId)"
+        }
+        let fb = guideAudioGenerator.resolveSongAnnouncementFallbackVoice(for: song)
+        return "sys:\(guideAudioGenerator.systemVoiceIdentifier(for: fb))"
+    }
+
+    func cachedOrSyncCachedSongAnnouncementBuffer(for song: Song) -> AVAudioPCMBuffer? {
+        guard !song.excludesClickAndGuide else { return nil }
+        let phrase = GuideAudioGenerator.songAnnouncementPhrase(for: song)
+        guard !phrase.isEmpty else { return nil }
+        let canonicalFormat = getCanonicalProcessingFormat()
+        let srHz = Int(round(max(1.0, canonicalFormat.sampleRate)))
+        let vSig = expectedAnnouncementVoiceSignature(for: song)
+
+        if let cached = songAnnouncementCache[song.id],
+           cached.phrase == phrase,
+           cached.voiceSignature == vSig,
+           cached.sampleRateHz == srHz {
+            return cached.buffer
+        }
+        if let syncResolved = guideAudioGenerator.resolveSongAnnouncementSyncIfCached(for: song, targetFormat: canonicalFormat) {
+            songAnnouncementCache[song.id] = CachedSongAnnouncement(
+                phrase: phrase,
+                packId: syncResolved.packId,
+                voiceSignature: vSig,
+                usedAIClone: syncResolved.usedAIClone,
+                sampleRateHz: srHz,
+                buffer: syncResolved.data.buffer
+            )
+            return syncResolved.data.buffer
+        }
+        return nil
+    }
+
+    func warmSongAnnouncementIfNeeded(for song: Song, force: Bool = false) {
+        guard song.announceSongEnabled, !song.excludesClickAndGuide else { return }
+        let phrase = GuideAudioGenerator.songAnnouncementPhrase(for: song)
+        guard !phrase.isEmpty else { return }
+
+        let canonicalFormat = getCanonicalProcessingFormat()
+        let srHz = Int(round(max(1.0, canonicalFormat.sampleRate)))
+        let vSig = expectedAnnouncementVoiceSignature(for: song)
+
+        if !force,
+           let cached = songAnnouncementCache[song.id],
+           cached.phrase == phrase,
+           cached.voiceSignature == vSig,
+           cached.sampleRateHz == srHz {
+            return
+        }
+
+        let warmKey = "\(song.id.uuidString)|\(phrase)|\(vSig)|\(srHz)"
+        guard !songAnnouncementWarmingKeys.contains(warmKey) else { return }
+        songAnnouncementWarmingKeys.insert(warmKey)
+
+        Task { [weak self, song, phrase, vSig, srHz, warmKey, canonicalFormat] in
+            let resolved = await Task.detached(priority: .userInitiated) {
+                GuideAudioGenerator.shared.resolveSongAnnouncement(for: song, targetFormat: canonicalFormat)
+            }.value
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.songAnnouncementWarmingKeys.remove(warmKey)
+                guard let resolved else { return }
+                if let currentCopy = self.currentSetlist.songs.first(where: { $0.id == song.id }),
+                   GuideAudioGenerator.songAnnouncementPhrase(for: currentCopy) == phrase,
+                   self.expectedAnnouncementVoiceSignature(for: currentCopy) == vSig {
+                    self.songAnnouncementCache[song.id] = CachedSongAnnouncement(
+                        phrase: phrase,
+                        packId: resolved.packId,
+                        voiceSignature: vSig,
+                        usedAIClone: resolved.usedAIClone,
+                        sampleRateHz: srHz,
+                        buffer: resolved.data.buffer
+                    )
+                    let nextIdx = self.currentSongIndex + 1
+                    if nextIdx >= 0 && nextIdx < self.currentSetlist.songs.count,
+                       self.currentSetlist.songs[nextIdx].id == song.id {
+                        self.syncMixState()
+                    }
+                }
+            }
+        }
+    }
+
+    func warmSongAnnouncementsForActiveWindow() {
+        if currentSetlist.songs.indices.contains(currentSongIndex) {
+            warmSongAnnouncementIfNeeded(for: currentSetlist.songs[currentSongIndex])
+        } else if !currentSong.title.isEmpty {
+            warmSongAnnouncementIfNeeded(for: currentSong)
+        }
+        let nextIdx = currentSongIndex + 1
+        if currentSetlist.songs.indices.contains(nextIdx) {
+            let mode = currentSong.transitionType
+            if currentSetlist.songs[nextIdx].announceSongEnabled ||
+                mode == .autoLink || mode == .overlap || mode == .crossfade {
+                warmSongAnnouncementIfNeeded(for: currentSetlist.songs[nextIdx])
+            }
+        }
+    }
+
+    public func previewSongAnnouncement(forSongIndex index: Int? = nil) {
+        let idx = index ?? currentSongIndex
+        let targetSong: Song = {
+            if idx >= 0 && idx < currentSetlist.songs.count {
+                return currentSetlist.songs[idx]
+            }
+            return currentSong
+        }()
+        let phrase = GuideAudioGenerator.songAnnouncementPhrase(for: targetSong)
+        guard !phrase.isEmpty else { return }
+
+        guidePreviewGeneration &+= 1
+        let gen = guidePreviewGeneration
+        CustomSampleLibraryManager.shared.stopPreview()
+
+        let canonicalFormat = getCanonicalProcessingFormat()
+        let vSig = expectedAnnouncementVoiceSignature(for: targetSong)
+        let srHz = Int(round(max(1.0, canonicalFormat.sampleRate)))
+
+        Task { [weak self, targetSong, canonicalFormat, phrase, vSig, srHz, gen] in
+            let output = await Task.detached(priority: .userInitiated) { () -> (url: URL, data: GuideAudioGenerator.SpokenPhraseData, usedAIClone: Bool, packId: String?)? in
+                guard let resolved = GuideAudioGenerator.shared.resolveSongAnnouncement(for: targetSong, targetFormat: canonicalFormat) else {
+                    return nil
+                }
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent("pb_song_announce_preview.wav")
+                let buffer = resolved.data.buffer
+                let settings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: buffer.format.sampleRate,
+                    AVNumberOfChannelsKey: Int(buffer.format.channelCount),
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsNonInterleaved: false
+                ]
+                try? FileManager.default.removeItem(at: url)
+                do {
+                    let outFile = try AVAudioFile(
+                        forWriting: url,
+                        settings: settings,
+                        commonFormat: .pcmFormatFloat32,
+                        interleaved: false
+                    )
+                    try outFile.write(from: buffer)
+                    return (url, resolved.data, resolved.usedAIClone, resolved.packId)
+                } catch {
+                    return nil
+                }
+            }.value
+
+            guard let self, self.guidePreviewGeneration == gen, let output else { return }
+            self.songAnnouncementCache[targetSong.id] = CachedSongAnnouncement(
+                phrase: phrase,
+                packId: output.packId,
+                voiceSignature: vSig,
+                usedAIClone: output.usedAIClone,
+                sampleRateHz: srHz,
+                buffer: output.data.buffer
+            )
+            CustomSampleLibraryManager.shared.previewAudioFile(at: output.url)
+        }
+    }
+
+    func syncStagedTransitionAnnouncement(sampleRate: Double, currentDuration: TimeInterval) {
+        let mode = currentSong.transitionType
+        guard !currentSetlist.songs.isEmpty,
+              currentSongIndex >= 0,
+              currentSongIndex + 1 < currentSetlist.songs.count,
+              (mode == .autoLink || mode == .overlap || mode == .crossfade) else {
+            mixState.configureTransitionAnnouncement(enabled: false, buffer: nil, startFrame: 0, trackId: nil, gainL: 0, gainR: 0, outL: 2, outR: 3)
+            return
+        }
+
+        let nextSong = currentSetlist.songs[currentSongIndex + 1]
+        guard nextSong.announceSongEnabled,
+              !nextSong.excludesClickAndGuide,
+              !nextSong.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            mixState.configureTransitionAnnouncement(enabled: false, buffer: nil, startFrame: 0, trackId: nil, gainL: 0, gainR: 0, outL: 2, outR: 3)
+            return
+        }
+
+        guard let buf = cachedOrSyncCachedSongAnnouncementBuffer(for: nextSong),
+              buf.frameLength > 0 else {
+            warmSongAnnouncementIfNeeded(for: nextSong)
+            mixState.configureTransitionAnnouncement(enabled: false, buffer: nil, startFrame: 0, trackId: nil, gainL: 0, gainR: 0, outL: 2, outR: 3)
+            return
+        }
+
+        let sr = sampleRate > 0 ? sampleRate : 44100.0
+        let bufSr = buf.format.sampleRate > 0 ? buf.format.sampleRate : sr
+        let annDuration = Double(buf.frameLength) / bufSr
+
+        let nextCueFirstBeatTime: TimeInterval? = {
+            guard let nextCue = resolvedNextSongSectionCue(forSongAt: currentSongIndex, song: currentSong, duration: currentDuration) else {
+                return nil
+            }
+            let beatGrid = currentSong.effectiveBeatGrid(totalDuration: currentDuration)
+            let cueBeats = guideAudioGenerator.cueMeasureTimestamps(
+                before: nextCue.targetTime,
+                beatGrid: beatGrid,
+                bpm: currentSong.bpm,
+                timeSignatureNumerator: currentSong.timeSignatureNumerator,
+                timeSignatureDenominator: currentSong.timeSignatureDenominator
+            )
+            return cueBeats.first
+        }()
+
+        guard let timing = Self.transitionAnnouncementTiming(
+            from: currentSong,
+            currentDuration: currentDuration,
+            to: nextSong,
+            announcementDuration: annDuration,
+            nextSongCueFirstBeatTime: nextCueFirstBeatTime
+        ) else {
+            mixState.configureTransitionAnnouncement(enabled: false, buffer: nil, startFrame: 0, trackId: nil, gainL: 0, gainR: 0, outL: 2, outR: 3)
+            return
+        }
+
+        let startFrame = max(0, Int64(round(timing.startTime * sr)))
+        let deadlineFrame = max(0, Int64(round(timing.deadline * sr)))
+        let routing = resolveGuideTrackGainAndChannels(for: currentSong)
+        mixState.configureTransitionAnnouncement(
+            enabled: true,
+            buffer: buf,
+            startFrame: startFrame,
+            deadlineFrame: deadlineFrame,
+            trackId: routing.trackId,
+            gainL: routing.gainL,
+            gainR: routing.gainR,
+            outL: routing.outL,
+            outR: routing.outR
+        )
     }
 
     func syncStagedPostSongClickOnEnd(sampleRate: Double, currentDuration: TimeInterval) {
@@ -2137,7 +2683,7 @@ extension MultitrackAudioEngine {
         case .autoLink, .overlap, .crossfade:
             if currentSongIndex + 1 < currentSetlist.songs.count {
                 selectSongInSetlist(at: currentSongIndex + 1)
-                play()
+                play(skipSongAnnouncement: true)
             } else {
                 if !continuePad && (isPadActive || padPlayer.isPlaying) {
                     stopPadPlayer()

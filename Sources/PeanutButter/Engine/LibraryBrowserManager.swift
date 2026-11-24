@@ -535,56 +535,9 @@ public final class LibraryBrowserManager: ObservableObject {
         let cloudDir = cloudSetlistsDirectory
 
         Task.detached(priority: .userInitiated) {
-            let localItems = Self.scanSetlistsSync(in: localDir, source: .local)
-            var localModByKey: [String: Date] = [:]
-            var localRevByKey: [String: UUID] = [:]
-            for local in localItems {
-                let key = Self.sanitizedPackageFilename(local.name, ext: "pbsession").lowercased()
-                let prevMod = localModByKey[key] ?? .distantPast
-                if local.modifiedDate >= prevMod {
-                    localModByKey[key] = local.modifiedDate
-                    if let rev = local.lastSavedRevisionId {
-                        localRevByKey[key] = rev
-                    }
-                }
-            }
-
-            let currentDeviceId = PlaybackFileManager.currentDeviceInstanceId
-            var combined = localItems
+            var combined = Self.scanSetlistsSync(in: localDir, source: .local)
             if let cDir = cloudDir {
-                let cloudItems = Self.scanSetlistsSync(in: cDir, source: .cloud).map { item -> SetlistLibraryItem in
-                    let key = Self.sanitizedPackageFilename(item.name, ext: "pbsession").lowercased()
-                    let isSelfAuthored = (item.lastSavedByDeviceId != nil && item.lastSavedByDeviceId == currentDeviceId) && !item.hasUnresolvedServerUpdate
-                    let isNewerThanLocal: Bool = {
-                        guard !isSelfAuthored, let localMod = localModByKey[key] else { return false }
-                        if let cRev = item.lastSavedRevisionId, let lRev = localRevByKey[key] {
-                            return (cRev != lRev) && (item.modifiedDate > localMod)
-                        }
-                        return item.modifiedDate.timeIntervalSince(localMod) > 2.0
-                    }()
-                    let resolvedHasUpdate = item.hasUnresolvedServerUpdate || isNewerThanLocal
-                    if resolvedHasUpdate != item.hasCloudUpdate {
-                        return SetlistLibraryItem(
-                            id: item.id,
-                            url: item.url,
-                            name: item.name,
-                            songCount: item.songCount,
-                            formattedDate: item.formattedDate,
-                            formattedDuration: item.formattedDuration,
-                            artworks: item.artworks,
-                            modifiedDate: item.modifiedDate,
-                            source: item.source,
-                            isDownloaded: item.isDownloaded,
-                            hasCloudUpdate: resolvedHasUpdate,
-                            changeDescription: item.changeDescription,
-                            hasUnresolvedServerUpdate: item.hasUnresolvedServerUpdate,
-                            lastSavedRevisionId: item.lastSavedRevisionId,
-                            lastSavedByDeviceId: item.lastSavedByDeviceId
-                        )
-                    }
-                    return item
-                }
-                combined.append(contentsOf: cloudItems)
+                combined.append(contentsOf: Self.scanSetlistsSync(in: cDir, source: .cloud))
             }
             combined.sort { $0.modifiedDate > $1.modifiedDate }
             let finalItems = combined
@@ -643,10 +596,128 @@ public final class LibraryBrowserManager: ObservableObject {
         }
     }
 
+    /// Generates a unique setlist display name ending in `(Local)` / `(Local N)` that does not collide in `directory`.
+    public nonisolated static func uniqueLocalCopyName(baseName: String, in directory: URL) -> String {
+        let fm = FileManager.default
+        var clean = baseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.isEmpty { clean = "Untitled Session" }
+        if let range = clean.range(of: #"\s+\(Local(?:\s+\d+)?\)$"#, options: .regularExpression) {
+            clean.removeSubrange(range)
+        }
+        var attempt = "\(clean) (Local)"
+        var counter = 2
+        while fm.fileExists(atPath: directory.appendingPathComponent(sanitizedPackageFilename(attempt, ext: "pbsession")).path) {
+            attempt = "\(clean) (Local \(counter))"
+            counter += 1
+        }
+        return attempt
+    }
+
+    /// Scans Local Setlists and Local Songs libraries to collect song and track UUIDs that must be kept in `StemCache`.
+    public nonisolated static func collectLocalProtectedIds(
+        localSetlistsDir: URL,
+        localSongsDir: URL
+    ) -> (songIds: Set<UUID>, trackIds: Set<UUID>) {
+        let fm = FileManager.default
+        var songIds = Set<UUID>()
+        var trackIds = Set<UUID>()
+
+        if let setlistURLs = try? fm.contentsOfDirectory(
+            at: localSetlistsDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) {
+            for url in setlistURLs where url.pathExtension.lowercased() == "pbsession" {
+                if let meta = readSessionMetadata(at: url) {
+                    for song in meta.songEntries {
+                        songIds.insert(song.id)
+                        for track in song.tracks {
+                            trackIds.insert(track.id)
+                        }
+                    }
+                }
+            }
+        }
+
+        let decoder = JSONDecoder()
+        if let songURLs = try? fm.contentsOfDirectory(
+            at: localSongsDir,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for url in songURLs where url.pathExtension.lowercased() == "pbsong" {
+                let songJSON = url.appendingPathComponent("song.json")
+                if let data = try? Data(contentsOf: songJSON),
+                   let meta = try? decoder.decode(SongPackageMetadata.self, from: data) {
+                    songIds.insert(meta.id)
+                    for track in meta.tracks {
+                        trackIds.insert(track.id)
+                    }
+                }
+            }
+        }
+
+        return (songIds, trackIds)
+    }
+
+    /// Removes only Cloud-only stem and transposed caches inside `stemCacheDir` while strictly preserving
+    /// every song/track referenced by Local Setlists, Local `.pbsong` packages, or `additionalProtected*`.
+    /// Removes `autoSaveURL` only when `shouldRemoveAutoSave` is true.
+    public nonisolated static func pruneCloudOnlyDeviceCaches(
+        stemCacheDir: URL,
+        localSetlistsDir: URL,
+        localSongsDir: URL,
+        autoSaveURL: URL?,
+        shouldRemoveAutoSave: Bool,
+        additionalProtectedSongIds: Set<UUID> = [],
+        additionalProtectedTrackIds: Set<UUID> = []
+    ) {
+        let fm = FileManager.default
+        let localProtected = collectLocalProtectedIds(
+            localSetlistsDir: localSetlistsDir,
+            localSongsDir: localSongsDir
+        )
+        let protectedSongIds = localProtected.songIds.union(additionalProtectedSongIds)
+        let protectedTrackIds = localProtected.trackIds.union(additionalProtectedTrackIds)
+        let protectedSongIdStrings = protectedSongIds.map(\.uuidString)
+
+        if let cachedItems = try? fm.contentsOfDirectory(
+            at: stemCacheDir,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for itemURL in cachedItems {
+                let name = itemURL.lastPathComponent
+                if name.hasPrefix("transposed_") {
+                    let isProtectedSong = protectedSongIdStrings.contains {
+                        name.localizedCaseInsensitiveContains($0)
+                    }
+                    if !isProtectedSong {
+                        try? fm.removeItem(at: itemURL)
+                    }
+                } else if let trackUUID = UUID(uuidString: itemURL.deletingPathExtension().lastPathComponent) {
+                    if !protectedTrackIds.contains(trackUUID) {
+                        try? fm.removeItem(at: itemURL)
+                    }
+                } else if name.hasPrefix("tmp_") {
+                    try? fm.removeItem(at: itemURL)
+                }
+            }
+        }
+
+        if shouldRemoveAutoSave, let autoURL = autoSaveURL, fm.fileExists(atPath: autoURL.path) {
+            try? fm.removeItem(at: autoURL)
+        }
+    }
+
     /// Evicts all downloaded Cloud Library content from this device (iCloud ubiquitous items across
-    /// Setlists, Songs, Stems, Pads, Clicks, Guides) and clears local downloaded caches (StemCache
-    /// and AutoSaveSession), while leaving saved local library files and cloud-stored files intact.
-    public func deleteAllCloudSetlistsFromDevice() {
+    /// Setlists, Songs, Stems, Pads, Clicks, Guides) and clears Cloud-only downloaded caches in `StemCache`,
+    /// strictly preserving all Local Setlists, Local Songs, and their cached stems.
+    public func deleteAllCloudSetlistsFromDevice(
+        additionalProtectedSongIds: Set<UUID> = [],
+        additionalProtectedTrackIds: Set<UUID> = [],
+        isActiveSessionCloud: Bool = true
+    ) {
         let cloudDirs = [
             cloudSetlistsDirectory,
             cloudSongsDirectory,
@@ -655,33 +726,36 @@ public final class LibraryBrowserManager: ObservableObject {
             cloudClicksDirectory,
             cloudGuidesDirectory
         ].compactMap { $0 }
+        let localSetlistsDir = setlistsDirectory
+        let localSongsDir = songsDirectory
         let stemCacheDir = PlaybackFileManager.shared.stemCacheDirectory
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let fm = FileManager.default
 
-            // 1. Instant StemCache swap: move aside and recreate empty cache dir, then delete old folder in background
-            var trashCacheURL: URL? = nil
-            if fm.fileExists(atPath: stemCacheDir.path) {
-                let trashURL = stemCacheDir.deletingLastPathComponent()
-                    .appendingPathComponent("StemCache_trash_\(UUID().uuidString)", isDirectory: true)
-                if (try? fm.moveItem(at: stemCacheDir, to: trashURL)) != nil {
-                    try? fm.createDirectory(at: stemCacheDir, withIntermediateDirectories: true)
-                    trashCacheURL = trashURL
-                } else if let cachedItems = try? fm.contentsOfDirectory(at: stemCacheDir, includingPropertiesForKeys: nil) {
-                    for url in cachedItems {
-                        try? fm.removeItem(at: url)
-                    }
+            let autoSaveURL = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("PeanutButter/AutoSaveSession.pbsession")
+            let shouldRemoveAutoSave: Bool = {
+                if isActiveSessionCloud { return true }
+                guard let autoURL = autoSaveURL,
+                      let associated = PlaybackFileManager.shared.peekAssociatedSessionPath(at: autoURL),
+                      !associated.isEmpty else {
+                    return false
                 }
-            }
+                return Self.isURLInCloudLibrary(URL(fileURLWithPath: associated))
+            }()
 
-            // 2. Clear AutoSaveSession.pbsession (unsaved local session changes on device)
-            if let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-                let autoSaveURL = appSupport.appendingPathComponent("PeanutButter/AutoSaveSession.pbsession")
-                if fm.fileExists(atPath: autoSaveURL.path) {
-                    try? fm.removeItem(at: autoSaveURL)
-                }
-            }
+            // 1 & 2. Prune only Cloud-only StemCache / transposed caches (and Cloud AutoSave if applicable),
+            // leaving all Local Setlist / Local Song stems intact.
+            Self.pruneCloudOnlyDeviceCaches(
+                stemCacheDir: stemCacheDir,
+                localSetlistsDir: localSetlistsDir,
+                localSongsDir: localSongsDir,
+                autoSaveURL: autoSaveURL,
+                shouldRemoveAutoSave: shouldRemoveAutoSave,
+                additionalProtectedSongIds: additionalProtectedSongIds,
+                additionalProtectedTrackIds: additionalProtectedTrackIds
+            )
 
             // 3. Collect only downloaded, non-directory ubiquitous files (skip .notDownloaded & .icloud placeholders)
             let keys: Set<URLResourceKey> = [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey, .isDirectoryKey]
@@ -728,10 +802,6 @@ public final class LibraryBrowserManager: ObservableObject {
                 DispatchQueue.concurrentPerform(iterations: urlsToEvict.count) { idx in
                     try? FileManager.default.evictUbiquitousItem(at: urlsToEvict[idx])
                 }
-            }
-
-            if let trashURL = trashCacheURL {
-                try? fm.removeItem(at: trashURL)
             }
 
             await MainActor.run {
@@ -1404,9 +1474,13 @@ public final class LibraryBrowserManager: ObservableObject {
         // 1. Read this setlist's songEntries before evicting it
         let targetMeta = Self.readSessionMetadata(at: url)
 
-        // 2. Collect song/track IDs still referenced by other downloaded cloud setlists
-        var stillNeededSongIds = Set<UUID>()
-        var stillNeededTrackIds = Set<UUID>()
+        // 2. Collect song/track IDs still referenced by Local Setlists, Local Songs, and other downloaded Cloud Setlists
+        let localProtected = Self.collectLocalProtectedIds(
+            localSetlistsDir: setlistsDirectory,
+            localSongsDir: songsDirectory
+        )
+        var stillNeededSongIds = localProtected.songIds
+        var stillNeededTrackIds = localProtected.trackIds
         if let cloudDir = cloudSetlistsDirectory,
            let siblings = try? fm.contentsOfDirectory(at: cloudDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
             for sibling in siblings where sibling.pathExtension.lowercased() == "pbsession" {

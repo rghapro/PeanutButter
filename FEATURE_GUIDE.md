@@ -52,9 +52,9 @@ PeanutButter stores songs (`.pbsong`) and setlists (`.pbsession`) locally at:
 
 ### Key Actions (Top-Right Setlists Button)
 - **New Setlist:** Name your set, pick a service date/time and service type, and start fresh.
-- **Open Setlist:** Search and filter Local and Cloud setlists, preview song lists, duplicate or copy between Local and Cloud, or load a set with full-setlist RAM hydration.
+- **Open Setlist:** Search and filter **Local**, **Cloud**, and **Unsaved** setlists (with location badges), preview song lists, use **Move to Cloud** or **Duplicate to Local**, load a set with full-setlist RAM hydration, or choose **Delete All Cloud Setlists From Device** (leaves all local setlists, local songs, and local files untouched).
 - **Save / Save As New / Restore From Previous Save:** Saves your session asynchronously without audio glitches, and keeps an automatic local crash-recovery backup in `AutoSaveSession.pbsession`.
-- **Song Card 3-Dots Menu (`...`):** Open the **Song Menu** (Key, Tempo, Arrangements, Pad, **SONG END** options for **5 Second Fade Out** or **Fade End**, ProPresenter, Save/Refresh MIDI Cues, Export Practice Tracks), **Edit Song**, or remove and reorder songs by dragging cards left or right.
+- **Song Card 3-Dots Menu (`...`):** Open the **Song Menu** (Key, Tempo, Arrangements, **Announce Song**, Pad, **SONG END** options for **5 Second Fade Out** or **Fade End**, ProPresenter, Save/Refresh MIDI Cues, Export Practice Tracks), **Edit Song**, or remove and reorder songs by dragging cards left or right.
   - **5 Second Fade Out:** Smoothly cosine-fades music stems out over the final 5 seconds of the song while keeping Click and Guide clean.
   - **Fade End:** Smoothly cosine-fades music stems out over the exact duration of the section labeled `"End"` / `"Ending"` (mutually exclusive with 5 Second Fade Out), restoring stem volumes cleanly if stopped, handed over, or scrubbed back earlier.
 
@@ -72,6 +72,8 @@ Sync across laptops using iCloud Drive, Google Drive, Dropbox, or OneDrive witho
 
 ### How It Works
 - Audio stems are packed per song into `<songId>.pbstems` archives so already-uploaded stems are skipped on future setlist saves, preventing missing-file links across computers.
+- When opening Cloud setlists, PeanutButter retains Cloud song settings and arrangements while automatically reusing matching local stems already on your Mac to speed up loading.
+- Use **Delete All Cloud Setlists From Device** in the Setlists menu to clear downloaded Cloud setlists, Cloud stems, and Cloud audio caches without touching any local setlists or songs.
 - When you click **Save** or **Save to Cloud Setlists**, you can enter an optional short note (e.g., *"Dropped Praise to Bb, fixed lyric cues"*).
 - Teammates with the same Cloud setlist open see **Update Available** in the Setlists menu and can read your note before clicking **Download Update**.
 
@@ -134,6 +136,7 @@ Click the transition icon between any two setlist cards (or on the last card) to
 - **AutoLink:** Starts the next song automatically the instant the current song ends, cleanly restoring any outgoing Fade End volumes and resetting previous-song VU meters to zero on handover.
 - **Overlap & Crossfade:** Starts the next song over the outgoing tail (`End` / `Outro`). On the downbeat where an Overlap begins, PeanutButter mutes the outgoing song's Click and Guide tracks while letting music stems ring out so two clicks or guide voices never collide.
 - **Cue Next Song Section (Toggle):** Available on automatic transitions (**AutoLink**, **Overlap**, and **Crossfade**) so the Guide speaks and counts into the next song's opening section across seamless song medleys (including overlaying cues onto an Uploaded Guide track).
+- **Transition Song Announcements:** When **Announce Song** is enabled on the incoming song, PeanutButter speaks the incoming song title and key inside the outgoing song's end section before **AutoLink**, **Overlap**, or **Crossfade** begins.
 
 ---
 
@@ -207,6 +210,8 @@ Guide cues are aligned by perceptual vowel onset with consonant-safe tails so nu
   - In **App Generated** guide mode: **Sections** (including count-ins), **Directions**, and **Fallback** faders.
   - In **Uploaded Guide** mode: **Guide** and **Fallback** faders.
 - **7 Bundled Human Voices + Siri/System Fallback:** Includes **Sam (Male)** (default), **Caleb (Male)**, **Claire (Female)**, **Daniel (Male)**, **Hannah (Female)**, **Marcus (Male)**, and **Maya (Female)**, plus macOS Siri/system voices if a phrase isn't pre-recorded.
+- **Local AI Voice Cloning (Apple Silicon):** Optional on-device CoreML LuxTTS model download (~348 MB) managed in Settings and Guide Options. Supports **Match Guide Voice** or selecting a specific pack to clone, **AI Voice Clone by Default** with per-song overrides (**Apply to All** / **Reset**), system backup voice fallback, and live **Test** auditioning.
+- **Announce Song (`Song Menu → Announce Song`):** Speaks the song title (automatically omitting standalone `(Live)` / `[Live]` tags) and current transposed key right before count-in (showing an `ANNOUNCING` badge on the timeline) or inside the outgoing song's end section on automatic transitions, with a **Preview** button right in the Song Menu.
 - **Upload Custom Guide Voice Packs & Cue Kind Labeling:** In **Settings (`≡`) → Upload / Manage Guide Samples...**, import a folder of recordings (auto-mapped across standard cues and labeled as **Section** or **Direction**) or record/upload one phrase at a time, and switch any custom sample between **Section** and **Direction** per cue so the Guide tray routes levels accurately.
 - **Toggle Numbers in Section Names:** Turn **Include Numbers in Guide** on/off globally in Settings or per section (`"Verse 2"` vs. `"Verse"`).
 - **Custom Spoken Directional Cues (`Edit → Directional Cues`):** Click `+` at the playhead to drop preset cues (*Build, Breakdown, All In, Band Out, Drums In, Softly, Hits, Hold, A Cappella*, etc.) or type any custom phrase (`"Pastor Speaks"`, `"Modulate to G"`). Drag directional cues on the timeline to snap to beats, click to edit text, or nudge in `1/16`-note increments. Directional cues can also speak over an Uploaded Guide track (toggleable per song).
@@ -229,7 +234,7 @@ Keep ambient drones running between songs or beneath prayers:
 - Reorder stems by dragging strips, double-click faders or adjust Pan dials, and toggle Solo (`S`), Mute (`M`), and **Solo Safe** (so Click and Guide never mute when you solo an instrument).
 - **Solo-Aware Waveform Preview & `CLEAR SOLOS`:** Soloing one or more stems or buses immediately updates the timeline waveform to preview only the soloed mix (always excluding Click and Guide) while preserving the full-mix waveform cache so un-soloing snaps right back. Whenever any track or bus is soloed, a **`CLEAR SOLOS`** button appears at the top of the master action bar.
 - Switch the bottom view between **Faders** and **Buses** (`Click, Guide, Drums, Percussion, Loops, Bass, Piano, Keys, Electric Guitars, Acoustic Guitars, Strings, Horns, Pad, Vocals, FX, Aux`).
-- Open **Settings → Configure Buses, Routing, & MIDI...** to pick your CoreAudio interface, inspect detected hardware output channels, route each of the 16 buses to any Stereo Pair (`Out 1/2`, `Out 3/4`, etc.) or Mono output (`Out 1`, `Out 2`, etc.), and reassign any stem's bus.
+- Open **Settings → Configure Buses, Routing, & MIDI...** to pick your CoreAudio interface, inspect detected hardware output channels, route each of the 16 buses to any Stereo Pair (`Out 1/2`, `Out 3/4`, etc.) or Mono output (`Out 1`, `Out 2`, etc.), and reassign any stem's bus. Preferred interface selections, bus routing, and SMPTE/Redundancy channel assignments persist reliably across app updates and CoreAudio UID changes via both UID and device-name matching.
 
 ---
 
@@ -237,7 +242,7 @@ Keep ambient drones running between songs or beneath prayers:
 
 Automate lighting, lyric slides, patch changes, and external gear across **8 color-coded MIDI Buses** (*Lyrics, Lights 1, Lights 2, Patches 1, Patches 2, Guitar, Aux 1, Aux 2*, defaulting to Channels `1–8`):
 
-- In **Edit → MIDI Cues**, add **Note**, **Control Change (`CC`)**, or **Program Change (`PC`)** events on the timeline, drag them along the beat grid, nudge in `1/16`-note steps, test cues live, or set **Disable Loop** on any cue so it fires even during active loops.
+- In **Edit → MIDI Cues**, add **Note**, **Control Change (`CC`)**, or **Program Change (`PC`)** events on the timeline, drag them along the beat grid, nudge in `1/16`-note steps, test cues live, set **Disable Loop** on any cue so it fires even during active loops, or open the **Edit → MIDI Cues** three-dots menu to choose **Delete All MIDI Cues** (with confirmation, clearing MIDI cues only for the current song).
 - Click a section's cue menu to **Copy MIDI Cues**, then jump to another section (e.g., `Chorus 2`) and choose **Paste & Auto-Adjust Velocity** (increments Note velocities `N+1, N+2...` continuing from the previous cue on the same bus for ProPresenter slide triggers) or **Paste Original Velocities**.
 - Push updated MIDI cues and ProPresenter settings back to the master `.pbsong` (Local or Cloud) or pull updates from the library via **Song Menu**.
 - Configure **Playlist** (`F-1`, Note `17`) and **Playlist Item** (`F#-1`, Note `18`) in **Song Menu** to trigger ProPresenter slides when a song starts.
@@ -285,7 +290,7 @@ Click any highlighted control on screen (Transport buttons, Song cards `1–10`,
 
 ### Software Updates & Builds
 - Open **Settings (`≡`) → Check for Updates...** (or let the automatic startup check notify you) to download, verify (`Developer ID` + notarization), and install new GitHub Releases in place. If launched from `Downloads`, PeanutButter also offers to move itself into `/Applications`.
-- Developer builds run with `./build.sh --dev` automatically stamp `-dev.N` build numbers (`1.2.0-dev.1`), while GitHub Releases ship as universal notarized `.dmg` and `.zip` packages.
+- Developer builds run with `./build.sh --dev` automatically stamp `-dev.N` build numbers (`1.3.0-dev.1`), while GitHub Releases ship as universal notarized `.dmg` and `.zip` packages.
 
 ### Default Keyboard Shortcuts Reference
 

@@ -217,6 +217,41 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
     private var activePostClickOutChL: Int = 2
     private var activePostClickOutChR: Int = 3
 
+    // Lock-free Pre-Song Manual Announcement State (plays while isPlaying == false before Bar 1)
+    private var preSongAnnouncementActive: Bool = false
+    private var preSongAnnouncementGeneration: UInt64 = 0
+    private var preSongAnnouncementBufferRef: AVAudioPCMBuffer? = nil
+    private var preSongAnnouncementLeftPtr: UnsafePointer<Float> = RealTimeMixEngineState.emptyFloatPtr
+    private var preSongAnnouncementRightPtr: UnsafePointer<Float> = RealTimeMixEngineState.emptyFloatPtr
+    private var preSongAnnouncementAudioFrames: Int64 = 0
+    private var preSongAnnouncementTotalFrames: Int64 = 0
+    private var preSongAnnouncementFrame: Int64 = 0
+    private var preSongAnnouncementTrackId: UUID? = nil
+    private var preSongAnnouncementPeakIndex: Int = -1
+    private var preSongAnnouncementGainL: Float = 0.0
+    private var preSongAnnouncementGainR: Float = 0.0
+    private var preSongAnnouncementOutChL: Int = 2
+    private var preSongAnnouncementOutChR: Int = 3
+    private var didFinishPreSongAnnouncement: Bool = false
+
+    // Lock-free Transition Song Announcement State (plays in outgoing song's End section before transition)
+    private var transitionAnnouncementEnabled: Bool = false
+    private var transitionAnnouncementGeneration: UInt64 = 0
+    private var transitionAnnouncementBufferRef: AVAudioPCMBuffer? = nil
+    private var transitionAnnouncementLeftPtr: UnsafePointer<Float> = RealTimeMixEngineState.emptyFloatPtr
+    private var transitionAnnouncementRightPtr: UnsafePointer<Float> = RealTimeMixEngineState.emptyFloatPtr
+    private var transitionAnnouncementLengthFrames: Int64 = 0
+    private var transitionAnnouncementStartFrame: Int64 = 0
+    private var transitionAnnouncementScheduledStartFrame: Int64 = 0
+    private var transitionAnnouncementDeadlineFrame: Int64 = 0
+    private var transitionAnnouncementTrackId: UUID? = nil
+    private var transitionAnnouncementPeakIndex: Int = -1
+    private var transitionAnnouncementGainL: Float = 0.0
+    private var transitionAnnouncementGainR: Float = 0.0
+    private var transitionAnnouncementOutChL: Int = 2
+    private var transitionAnnouncementOutChR: Int = 3
+    private var transitionAnnouncementArmed: Bool = true
+
     public init() {
         let tc = 512
         let sc = 1024
@@ -354,6 +389,7 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
         self.preRollTargetDownbeatFrame = targetDownbeatFrame
         self.currentTimelineFrame = preRollStartFrame
         self.seekGeneration &+= 1
+        armTransitionAnnouncementForCurrentPlayheadLocked()
         os_unfair_lock_unlock(&lock)
     }
     
@@ -520,6 +556,177 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
         let res = (postSongClickActive && activePostClickLengthFrames > 0, activePostClickFrame, activePostClickLengthFrames)
         os_unfair_lock_unlock(&lock)
         return res
+    }
+
+    public func startPreSongAnnouncement(
+        buffer: AVAudioPCMBuffer,
+        trailingBreathSeconds: TimeInterval = 0.20,
+        trackId: UUID?,
+        gainL: Float,
+        gainR: Float,
+        outL: Int,
+        outR: Int
+    ) {
+        guard buffer.frameLength > 0, let ptrs = buffer.floatChannelData else { return }
+        let leftPtr = UnsafePointer(ptrs[0])
+        let rightPtr = buffer.format.channelCount > 1 ? UnsafePointer(ptrs[1]) : leftPtr
+        let audioLen = Int64(buffer.frameLength)
+        let sr = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 44100.0
+        let breathFrames = max(0, Int64(round(max(0.0, trailingBreathSeconds) * sr)))
+        let totalLen = audioLen + breathFrames
+
+        var retiredToRelease: [RetiredGeneration] = []
+        os_unfair_lock_lock(&lock)
+        if let oldBuf = preSongAnnouncementBufferRef, oldBuf !== buffer, oldBuf !== transitionAnnouncementBufferRef {
+            pendingRetirement.append(RetiredGeneration(epoch: renderEpoch, buffers: [oldBuf], releaseOldStorage: []))
+        }
+        preSongAnnouncementBufferRef = buffer
+        preSongAnnouncementLeftPtr = leftPtr
+        preSongAnnouncementRightPtr = rightPtr
+        preSongAnnouncementAudioFrames = audioLen
+        preSongAnnouncementTotalFrames = totalLen
+        preSongAnnouncementFrame = 0
+        preSongAnnouncementTrackId = trackId
+        preSongAnnouncementPeakIndex = trackId.flatMap { trackPeakIds.firstIndex(of: $0) } ?? -1
+        preSongAnnouncementGainL = gainL
+        preSongAnnouncementGainR = gainR
+        preSongAnnouncementOutChL = outL
+        preSongAnnouncementOutChR = outR
+        didFinishPreSongAnnouncement = false
+        preSongAnnouncementActive = true
+        preSongAnnouncementGeneration &+= 1
+        retiredToRelease = collectRetiredGenerationsLocked()
+        os_unfair_lock_unlock(&lock)
+        for gen in retiredToRelease {
+            for fn in gen.releaseOldStorage { fn() }
+        }
+        _ = retiredToRelease
+    }
+
+    public func cancelPreSongAnnouncement() {
+        var retiredToRelease: [RetiredGeneration] = []
+        os_unfair_lock_lock(&lock)
+        if let oldBuf = preSongAnnouncementBufferRef, oldBuf !== transitionAnnouncementBufferRef {
+            pendingRetirement.append(RetiredGeneration(epoch: renderEpoch, buffers: [oldBuf], releaseOldStorage: []))
+        }
+        preSongAnnouncementActive = false
+        preSongAnnouncementBufferRef = nil
+        preSongAnnouncementLeftPtr = Self.emptyFloatPtr
+        preSongAnnouncementRightPtr = Self.emptyFloatPtr
+        preSongAnnouncementAudioFrames = 0
+        preSongAnnouncementTotalFrames = 0
+        preSongAnnouncementFrame = 0
+        preSongAnnouncementTrackId = nil
+        preSongAnnouncementPeakIndex = -1
+        preSongAnnouncementGainL = 0.0
+        preSongAnnouncementGainR = 0.0
+        didFinishPreSongAnnouncement = false
+        preSongAnnouncementGeneration &+= 1
+        retiredToRelease = collectRetiredGenerationsLocked()
+        os_unfair_lock_unlock(&lock)
+        for gen in retiredToRelease {
+            for fn in gen.releaseOldStorage { fn() }
+        }
+        _ = retiredToRelease
+    }
+
+    public func consumePreSongAnnouncementFinished() -> Bool {
+        os_unfair_lock_lock(&lock)
+        let finished = didFinishPreSongAnnouncement
+        didFinishPreSongAnnouncement = false
+        os_unfair_lock_unlock(&lock)
+        return finished
+    }
+
+    private func armTransitionAnnouncementForCurrentPlayheadLocked() {
+        guard transitionAnnouncementEnabled && transitionAnnouncementLengthFrames > 0 else {
+            transitionAnnouncementArmed = true
+            return
+        }
+        let sr = sampleRate > 0 ? sampleRate : 44100.0
+        let tol = Int64(round(0.05 * sr))
+        if currentTimelineFrame <= transitionAnnouncementScheduledStartFrame + tol {
+            transitionAnnouncementStartFrame = transitionAnnouncementScheduledStartFrame
+            transitionAnnouncementArmed = true
+        } else if currentTimelineFrame + transitionAnnouncementLengthFrames <= transitionAnnouncementDeadlineFrame {
+            transitionAnnouncementStartFrame = currentTimelineFrame
+            transitionAnnouncementArmed = true
+        } else {
+            transitionAnnouncementStartFrame = transitionAnnouncementScheduledStartFrame
+            transitionAnnouncementArmed = false
+        }
+    }
+
+    public func configureTransitionAnnouncement(
+        enabled: Bool,
+        buffer: AVAudioPCMBuffer?,
+        startFrame: Int64,
+        deadlineFrame: Int64? = nil,
+        trackId: UUID?,
+        gainL: Float,
+        gainR: Float,
+        outL: Int,
+        outR: Int
+    ) {
+        var retiredToRelease: [RetiredGeneration] = []
+        os_unfair_lock_lock(&lock)
+        let oldBuf = transitionAnnouncementBufferRef
+        if enabled, let buf = buffer, buf.frameLength > 0, let ptrs = buf.floatChannelData {
+            let leftPtr = UnsafePointer(ptrs[0])
+            let rightPtr = buf.format.channelCount > 1 ? UnsafePointer(ptrs[1]) : leftPtr
+            if let old = oldBuf, old !== buf, old !== preSongAnnouncementBufferRef {
+                pendingRetirement.append(RetiredGeneration(epoch: renderEpoch, buffers: [old], releaseOldStorage: []))
+            }
+            let safeStart = max(0, startFrame)
+            let len = Int64(buf.frameLength)
+            let safeDeadline = deadlineFrame.map { max(0, $0) } ?? (safeStart + len)
+            let keepInProgress = transitionAnnouncementEnabled
+                && oldBuf === buf
+                && transitionAnnouncementScheduledStartFrame == safeStart
+                && transitionAnnouncementArmed
+                && currentTimelineFrame > transitionAnnouncementStartFrame
+                && currentTimelineFrame < transitionAnnouncementStartFrame + len
+            transitionAnnouncementEnabled = true
+            transitionAnnouncementBufferRef = buf
+            transitionAnnouncementLeftPtr = leftPtr
+            transitionAnnouncementRightPtr = rightPtr
+            transitionAnnouncementLengthFrames = len
+            transitionAnnouncementScheduledStartFrame = safeStart
+            transitionAnnouncementDeadlineFrame = safeDeadline
+            transitionAnnouncementTrackId = trackId
+            transitionAnnouncementPeakIndex = trackId.flatMap { trackPeakIds.firstIndex(of: $0) } ?? -1
+            transitionAnnouncementGainL = gainL
+            transitionAnnouncementGainR = gainR
+            transitionAnnouncementOutChL = outL
+            transitionAnnouncementOutChR = outR
+            if !keepInProgress {
+                armTransitionAnnouncementForCurrentPlayheadLocked()
+            }
+        } else {
+            if let old = oldBuf, old !== preSongAnnouncementBufferRef {
+                pendingRetirement.append(RetiredGeneration(epoch: renderEpoch, buffers: [old], releaseOldStorage: []))
+            }
+            transitionAnnouncementEnabled = false
+            transitionAnnouncementBufferRef = nil
+            transitionAnnouncementLeftPtr = Self.emptyFloatPtr
+            transitionAnnouncementRightPtr = Self.emptyFloatPtr
+            transitionAnnouncementLengthFrames = 0
+            transitionAnnouncementStartFrame = 0
+            transitionAnnouncementScheduledStartFrame = 0
+            transitionAnnouncementDeadlineFrame = 0
+            transitionAnnouncementTrackId = nil
+            transitionAnnouncementPeakIndex = -1
+            transitionAnnouncementGainL = 0.0
+            transitionAnnouncementGainR = 0.0
+            transitionAnnouncementArmed = true
+        }
+        transitionAnnouncementGeneration &+= 1
+        retiredToRelease = collectRetiredGenerationsLocked()
+        os_unfair_lock_unlock(&lock)
+        for gen in retiredToRelease {
+            for fn in gen.releaseOldStorage { fn() }
+        }
+        _ = retiredToRelease
     }
 
     /// Must be called strictly while holding `lock`. Moves retired epochs ready to drop outside `lock`.
@@ -719,6 +926,8 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
 
         self.trackPeakIds = buildPeakIds
         self.trackPeakCount = buildPeakIds.count
+        self.preSongAnnouncementPeakIndex = preSongAnnouncementTrackId.flatMap { buildPeakIds.firstIndex(of: $0) } ?? -1
+        self.transitionAnnouncementPeakIndex = transitionAnnouncementTrackId.flatMap { buildPeakIds.firstIndex(of: $0) } ?? -1
         for (idx, id) in buildPeakIds.enumerated() {
             let preserved = preservedPeaks[id] ?? (0.0, 0.0)
             accumTrackPeaksL[idx] = preserved.0
@@ -796,6 +1005,18 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
             if let chL = outChannelL { stagedPostClickOutChL = chL }
             if let chR = outChannelR { stagedPostClickOutChR = chR }
         }
+        if preSongAnnouncementTrackId == trackId {
+            preSongAnnouncementGainL = gainL
+            preSongAnnouncementGainR = gainR
+            if let chL = outChannelL { preSongAnnouncementOutChL = chL }
+            if let chR = outChannelR { preSongAnnouncementOutChR = chR }
+        }
+        if transitionAnnouncementTrackId == trackId {
+            transitionAnnouncementGainL = gainL
+            transitionAnnouncementGainR = gainR
+            if let chL = outChannelL { transitionAnnouncementOutChL = chL }
+            if let chR = outChannelR { transitionAnnouncementOutChR = chR }
+        }
         os_unfair_lock_unlock(&lock)
     }
     
@@ -831,6 +1052,18 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
             stagedPostClickOutChL = g.outL
             stagedPostClickOutChR = g.outR
         }
+        if let preId = preSongAnnouncementTrackId, let g = gains[preId] {
+            preSongAnnouncementGainL = g.gainL
+            preSongAnnouncementGainR = g.gainR
+            preSongAnnouncementOutChL = g.outL
+            preSongAnnouncementOutChR = g.outR
+        }
+        if let transId = transitionAnnouncementTrackId, let g = gains[transId] {
+            transitionAnnouncementGainL = g.gainL
+            transitionAnnouncementGainR = g.gainR
+            transitionAnnouncementOutChL = g.outL
+            transitionAnnouncementOutChR = g.outR
+        }
         os_unfair_lock_unlock(&lock)
     }
     
@@ -842,6 +1075,9 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
             self.didTransitionToNextSong = false
             self.postSongClickActive = false
             self.postSongClickGeneration &+= 1
+            self.preSongAnnouncementActive = false
+            self.didFinishPreSongAnnouncement = false
+            self.preSongAnnouncementGeneration &+= 1
         } else {
             self.hasQueuedJump = false
             self.queuedBoundaryFrame = -1
@@ -861,6 +1097,9 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
             self.isPlaying = true
             self.postSongClickActive = false
             self.postSongClickGeneration &+= 1
+            self.preSongAnnouncementActive = false
+            self.didFinishPreSongAnnouncement = false
+            self.preSongAnnouncementGeneration &+= 1
         }
         self.hasQueuedJump = false
         self.queuedBoundaryFrame = -1
@@ -869,6 +1108,7 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
         self.preRollActive = false
         self.preRollStartFrame = 0
         self.preRollTargetDownbeatFrame = 0
+        armTransitionAnnouncementForCurrentPlayheadLocked()
         os_unfair_lock_unlock(&lock)
     }
     
@@ -984,8 +1224,9 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
             let playing = isPlaying
             let localIsRedundancy = isRedundancyEnabled
             let localPostClickActive = postSongClickActive && activePostClickLengthFrames > 0
+            let localPreAnnounceActive = preSongAnnouncementActive && preSongAnnouncementTotalFrames > 0
             let localPad = padEngine
-            if !playing && !localIsRedundancy && !localPostClickActive && !(localPad?.hasActiveAudioToRender ?? false) {
+            if !playing && !localIsRedundancy && !localPostClickActive && !localPreAnnounceActive && !(localPad?.hasActiveAudioToRender ?? false) {
                 rawMasterPeakL = 0.0
                 rawMasterPeakR = 0.0
                 os_unfair_lock_unlock(&lock)
@@ -1084,6 +1325,33 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
             let localStagedPostClickGainR = stagedPostClickGainR
             let localStagedPostClickOutL = stagedPostClickOutChL
             let localStagedPostClickOutR = stagedPostClickOutChR
+            let localPreAnnounceGen = preSongAnnouncementGeneration
+            let localPreAnnounceLeft = preSongAnnouncementLeftPtr
+            let localPreAnnounceRight = preSongAnnouncementRightPtr
+            let localPreAnnounceAudioFrames = preSongAnnouncementAudioFrames
+            let localPreAnnounceTotalFrames = preSongAnnouncementTotalFrames
+            let localPreAnnounceFrame = preSongAnnouncementFrame
+            let localPreAnnounceTrackId = preSongAnnouncementTrackId
+            let localPreAnnouncePeakIdx = preSongAnnouncementPeakIndex
+            let localPreAnnounceGainL = preSongAnnouncementGainL
+            let localPreAnnounceGainR = preSongAnnouncementGainR
+            let localPreAnnounceOutL = preSongAnnouncementOutChL
+            let localPreAnnounceOutR = preSongAnnouncementOutChR
+            let localTransAnnounceEnabled = transitionAnnouncementEnabled && transitionAnnouncementLengthFrames > 0
+            let localTransAnnounceGen = transitionAnnouncementGeneration
+            let localTransAnnounceLeft = transitionAnnouncementLeftPtr
+            let localTransAnnounceRight = transitionAnnouncementRightPtr
+            let localTransAnnounceLen = transitionAnnouncementLengthFrames
+            var localTransAnnounceStart = transitionAnnouncementStartFrame
+            let localTransAnnounceScheduledStart = transitionAnnouncementScheduledStartFrame
+            let localTransAnnounceDeadline = transitionAnnouncementDeadlineFrame
+            let localTransAnnounceTrackId = transitionAnnouncementTrackId
+            let localTransAnnouncePeakIdx = transitionAnnouncementPeakIndex
+            let localTransAnnounceGainL = transitionAnnouncementGainL
+            let localTransAnnounceGainR = transitionAnnouncementGainR
+            let localTransAnnounceOutL = transitionAnnouncementOutChL
+            let localTransAnnounceOutR = transitionAnnouncementOutChR
+            var localTransAnnounceArmed = transitionAnnouncementArmed
             os_unfair_lock_unlock(&lock)
 
             if localPeakCount > 0 {
@@ -1256,6 +1524,19 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
                             playhead = localQueuedTargetFrame
                             localHasQueuedJump = false
                             queuedJumpOccurred = true
+                            if localTransAnnounceEnabled && localTransAnnounceLen > 0 {
+                                let transJumpTol = Int64(round(0.05 * max(1.0, localSampleRate)))
+                                if playhead <= localTransAnnounceScheduledStart + transJumpTol {
+                                    localTransAnnounceStart = localTransAnnounceScheduledStart
+                                    localTransAnnounceArmed = true
+                                } else if playhead + localTransAnnounceLen <= localTransAnnounceDeadline {
+                                    localTransAnnounceStart = playhead
+                                    localTransAnnounceArmed = true
+                                } else {
+                                    localTransAnnounceStart = localTransAnnounceScheduledStart
+                                    localTransAnnounceArmed = false
+                                }
+                            }
                         }
 
                         // 1. Sample-accurate section loop boundary check
@@ -1527,6 +1808,8 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
                 }
 
                 // 8. Second Micro-Pass: Mix Click & Guide tracks cleanly onto hardware outputs after Master VU measurement
+                let dummyAnnounceId = UUID(uuid: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0))
+                let transArmToleranceFrames = Int64(round(0.05 * max(1.0, localSampleRate)))
                 if segCount > 0 {
                     for sIdx in 0..<segCount {
                         let seg = segAlloc[sIdx]
@@ -1547,6 +1830,55 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
                                 gainR: entry.gainR,
                                 markMusic: false
                             )
+                        }
+
+                        if !seg.isPostPromotion && !seg.isDualMix && localTransAnnounceEnabled && localTransAnnounceLen > 0 {
+                            if !localLoopActive && !localHasQueuedJump {
+                                if seg.playhead <= localTransAnnounceStart + transArmToleranceFrames {
+                                    localTransAnnounceArmed = true
+                                }
+                                if localTransAnnounceArmed {
+                                    let segStart = seg.playhead
+                                    let segEnd = segStart + Int64(seg.stepFrames)
+                                    let annStart = localTransAnnounceStart
+                                    let annEnd = annStart + localTransAnnounceLen
+                                    let interStart = max(segStart, annStart)
+                                    let interEnd = min(segEnd, annEnd)
+                                    if interEnd > interStart {
+                                        let readOffset = interStart - annStart
+                                        let outDelta = Int(interStart - segStart)
+                                        let overlapFrames = Int(interEnd - interStart)
+                                        let transEntry = RenderTrackEntry(
+                                            trackId: localTransAnnounceTrackId ?? dummyAnnounceId,
+                                            peakIndex: localTransAnnouncePeakIdx,
+                                            leftPtr: localTransAnnounceLeft,
+                                            rightPtr: localTransAnnounceRight,
+                                            frameLength: localTransAnnounceLen,
+                                            gainL: localTransAnnounceGainL,
+                                            gainR: localTransAnnounceGainR,
+                                            isClickOrGuide: true,
+                                            isTimelineAligned: true,
+                                            outChannelL: localTransAnnounceOutL,
+                                            outChannelR: localTransAnnounceOutR
+                                        )
+                                        let gainL = localTransAnnounceGainL * 0.95
+                                        let gainR = localTransAnnounceGainR * 0.95
+                                        mixStereoEntry(
+                                            transEntry,
+                                            readFrame: readOffset,
+                                            stepFrames: overlapFrames,
+                                            outOffset: seg.outOffset + outDelta,
+                                            preMasterGL: gainL,
+                                            preMasterGR: gainR,
+                                            gainL: gainL,
+                                            gainR: gainR,
+                                            markMusic: false
+                                        )
+                                    }
+                                }
+                            } else if localLoopActive && seg.playhead >= localTransAnnounceStart {
+                                localTransAnnounceArmed = false
+                            }
                         }
 
                         if seg.isDualMix && !seg.isPostPromotion {
@@ -1653,6 +1985,46 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
                         outL: localStagedPostClickOutL,
                         outR: localStagedPostClickOutR
                     )
+                }
+
+                // 8.3. Pre-Song Manual Announcement Rendering (when stopped before Bar 1)
+                var nextPreAnnounceFrame: Int64? = nil
+                var finishedPreAnnounce = false
+                if !playing && localPreAnnounceActive && localPreAnnounceTotalFrames > 0 {
+                    if localPreAnnounceFrame < localPreAnnounceAudioFrames {
+                        let chunk = min(frameCount, Int(localPreAnnounceAudioFrames - localPreAnnounceFrame))
+                        if chunk > 0 {
+                            let preEntry = RenderTrackEntry(
+                                trackId: localPreAnnounceTrackId ?? dummyAnnounceId,
+                                peakIndex: localPreAnnouncePeakIdx,
+                                leftPtr: localPreAnnounceLeft,
+                                rightPtr: localPreAnnounceRight,
+                                frameLength: localPreAnnounceAudioFrames,
+                                gainL: localPreAnnounceGainL,
+                                gainR: localPreAnnounceGainR,
+                                isClickOrGuide: true,
+                                isTimelineAligned: true,
+                                outChannelL: localPreAnnounceOutL,
+                                outChannelR: localPreAnnounceOutR
+                            )
+                            let gL = localPreAnnounceGainL * 0.95
+                            let gR = localPreAnnounceGainR * 0.95
+                            mixStereoEntry(
+                                preEntry,
+                                readFrame: localPreAnnounceFrame,
+                                stepFrames: chunk,
+                                outOffset: 0,
+                                preMasterGL: gL,
+                                preMasterGR: gR,
+                                gainL: gL,
+                                gainR: gR,
+                                markMusic: false
+                            )
+                        }
+                    }
+                    let advanced = localPreAnnounceFrame + Int64(frameCount)
+                    nextPreAnnounceFrame = advanced
+                    finishedPreAnnounce = (advanced >= localPreAnnounceTotalFrames)
                 }
 
                 // 8.5. Safety Output Soft-Clipper & NaN/Inf Scrubber (Music/Pad/Click/Guide outputs ONLY, before Redundancy & SMPTE)
@@ -1854,8 +2226,19 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
                             nextSMPTECueTimelineFrame = 0
                             nextSMPTEStartSeconds = 0.0
                             transitionMode = .cueNextSong
+                            transitionAnnouncementEnabled = false
+                            transitionAnnouncementLengthFrames = 0
+                            transitionAnnouncementStartFrame = 0
+                            transitionAnnouncementScheduledStartFrame = 0
+                            transitionAnnouncementDeadlineFrame = 0
+                            transitionAnnouncementArmed = true
+                            transitionAnnouncementGeneration &+= 1
                             didTransitionToNextSong = true
                         }
+                    }
+                    if localTransAnnounceGen == transitionAnnouncementGeneration && seekGeneration == localSeekGen && !promotedToNextSong {
+                        transitionAnnouncementArmed = localTransAnnounceArmed
+                        transitionAnnouncementStartFrame = localTransAnnounceStart
                     }
                     if singleLoopJumpOccurred {
                         singleLoopRemainingCount = localSingleRemaining
@@ -1897,10 +2280,23 @@ public final class RealTimeMixEngineState: @unchecked Sendable {
                             postSongClickGeneration &+= 1
                         }
                     }
-                } else if !playing, let nextPostFrame = updatedPostClickFrame,
-                          localActivePostClickGen == postSongClickGeneration,
-                          postSongClickActive {
-                    activePostClickFrame = nextPostFrame
+                } else if !playing {
+                    if let nextPostFrame = updatedPostClickFrame,
+                       localActivePostClickGen == postSongClickGeneration,
+                       postSongClickActive {
+                        activePostClickFrame = nextPostFrame
+                    }
+                    if let nextPreFrame = nextPreAnnounceFrame,
+                       localPreAnnounceGen == preSongAnnouncementGeneration,
+                       preSongAnnouncementActive {
+                        if finishedPreAnnounce {
+                            preSongAnnouncementActive = false
+                            preSongAnnouncementFrame = preSongAnnouncementTotalFrames
+                            didFinishPreSongAnnouncement = true
+                        } else {
+                            preSongAnnouncementFrame = nextPreFrame
+                        }
+                    }
                 }
                 if let newPhase = updatedRedundancyPhase {
                     self.redundancyPhase = newPhase

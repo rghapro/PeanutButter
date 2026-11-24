@@ -782,6 +782,70 @@ public struct SongMenuPopoverView: View {
                 .cornerRadius(10)
             }
             
+            // 4B. SONG START SECTION
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    sectionHeader("SONG START")
+                    Spacer()
+                    if targetSong.announceSongEnabled && !isPreAddMode && !targetSong.excludesClickAndGuide {
+                        Button("Preview") {
+                            engine.previewSongAnnouncement(forSongIndex: effectiveSongIndex)
+                        }
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(Color(red: 0.25, green: 0.75, blue: 1.0))
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                VStack(spacing: 0) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Announce Song")
+                                .font(.system(size: 13, weight: .regular))
+                                .foregroundColor(.white)
+                            let previewPhrase = GuideAudioGenerator.songAnnouncementPhrase(
+                                for: targetSong,
+                                overrideTransposeSemitones: pendingTransposeSemitones
+                            )
+                            if targetSong.excludesClickAndGuide {
+                                Text("Disabled while Click & Guide are excluded")
+                                    .font(.system(size: 9.5))
+                                    .foregroundColor(Color(white: 0.45))
+                            } else if !previewPhrase.isEmpty {
+                                Text("Says \"\(previewPhrase)\" before count-in")
+                                    .font(.system(size: 9.5))
+                                    .foregroundColor(Color(white: 0.45))
+                                    .lineLimit(2)
+                            } else {
+                                Text("Speaks song title and key before count-in")
+                                    .font(.system(size: 9.5))
+                                    .foregroundColor(Color(white: 0.45))
+                            }
+                        }
+
+                        Spacer()
+
+                        Toggle("", isOn: Binding(
+                            get: { targetSong.announceSongEnabled },
+                            set: { newValue in
+                                if isPreAddMode {
+                                    stagedSong?.announceSongEnabled = newValue
+                                } else {
+                                    engine.updateSongAnnounceSong(at: effectiveSongIndex, enabled: newValue)
+                                }
+                            }
+                        ))
+                        .toggleStyle(SwitchToggleStyle(tint: Color(red: 0.25, green: 0.75, blue: 1.0)))
+                        .labelsHidden()
+                        .disabled(targetSong.excludesClickAndGuide)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                }
+                .background(cardBackground)
+                .cornerRadius(10)
+            }
+            
             // 5. SONG END FADE OPTIONS SECTION
             VStack(alignment: .leading, spacing: 5) {
                 sectionHeader("SONG END")

@@ -120,6 +120,60 @@ public struct MusicalKeyHelper: Sendable {
         let newRoot = list[newIdx]
         return isMinor ? "\(newRoot)m" : newRoot
     }
+
+    public static func spokenKeyName(for rawKey: String) -> String? {
+        var working = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !working.isEmpty else { return nil }
+
+        let lowerInitial = working.lowercased()
+        if lowerInitial == "—" || lowerInitial == "-" || lowerInitial == "–"
+            || lowerInitial == "n/a" || lowerInitial == "none" || lowerInitial == "unknown" {
+            return nil
+        }
+
+        if lowerInitial.hasPrefix("key of ") {
+            working = String(working.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !working.isEmpty else { return nil }
+
+        var isMinor = false
+        let lowerWorking = working.lowercased()
+        if lowerWorking.hasSuffix(" minor") {
+            isMinor = true
+            working = String(working.dropLast(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if lowerWorking.hasSuffix(" min") {
+            isMinor = true
+            working = String(working.dropLast(4)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if lowerWorking.hasSuffix(" major") {
+            working = String(working.dropLast(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if lowerWorking.hasSuffix(" maj") {
+            working = String(working.dropLast(4)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if lowerWorking.hasSuffix("m"), working.count >= 2 {
+            isMinor = true
+            working = String(working.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard let firstScalar = working.unicodeScalars.first,
+              ("A"..."G").contains(String(firstScalar).uppercased()) else {
+            return nil
+        }
+        let noteLetter = String(firstScalar).uppercased()
+        let remainder = String(working.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        let accidental: String
+        switch remainder {
+        case "":
+            accidental = ""
+        case "#", "♯", "sharp":
+            accidental = " sharp"
+        case "b", "♭", "flat":
+            accidental = " flat"
+        default:
+            return nil
+        }
+
+        return "\(noteLetter)\(accidental)\(isMinor ? " minor" : "")"
+    }
 }
 
 /// Represents a single beat or measure downbeat marker in a dynamic click-derived beat grid
@@ -488,6 +542,8 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     public var continueClick: Bool = false
     /// Whether the guide track should count in the opening section of the following song across an automatic transition
     public var cueNextSongSection: Bool = false
+    /// Whether the guide voice should speak the song title and key when starting playback
+    public var announceSongEnabled: Bool = false
     /// Whether the song should automatically fade out non-click/guide tracks over the final 5 seconds
     public var endFadeOutEnabled: Bool = false
     /// Whether the song should automatically fade out non-click/guide tracks over the section labeled "End"
@@ -529,6 +585,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     public var clickSound: ClickSoundType = ClickSoundType.defaultSound
     public var usesDefaultClickSound: Bool = true
     public var usesDefaultGuideVoice: Bool = true
+    public var usesDefaultGuideFallback: Bool = true
     public var clickAccentEnabled: Bool = true
     public var clickQuarterEnabled: Bool = true
     public var clickEighthEnabled: Bool = true
@@ -1423,6 +1480,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         continuePad: Bool = false,
         continueClick: Bool = false,
         cueNextSongSection: Bool = false,
+        announceSongEnabled: Bool = false,
         endFadeOutEnabled: Bool = false,
         fadeEndSectionEnabled: Bool = false,
         startPadWithSong: Bool = false,
@@ -1436,6 +1494,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         clickSound: ClickSoundType = ClickSoundType.defaultSound,
         usesDefaultClickSound: Bool = true,
         usesDefaultGuideVoice: Bool = true,
+        usesDefaultGuideFallback: Bool = true,
         clickAccentEnabled: Bool = true,
         clickQuarterEnabled: Bool = true,
         clickEighthEnabled: Bool = true,
@@ -1487,6 +1546,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.continuePad = continuePad
         self.continueClick = continueClick
         self.cueNextSongSection = cueNextSongSection
+        self.announceSongEnabled = announceSongEnabled
         self.endFadeOutEnabled = endFadeOutEnabled
         self.fadeEndSectionEnabled = fadeEndSectionEnabled
         self.startPadWithSong = startPadWithSong
@@ -1500,6 +1560,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.clickSound = clickSound
         self.usesDefaultClickSound = usesDefaultClickSound
         self.usesDefaultGuideVoice = usesDefaultGuideVoice
+        self.usesDefaultGuideFallback = usesDefaultGuideFallback
         self.clickAccentEnabled = clickAccentEnabled
         self.clickQuarterEnabled = clickQuarterEnabled
         self.clickEighthEnabled = clickEighthEnabled
@@ -1525,8 +1586,8 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
     }
     
     enum CodingKeys: String, CodingKey {
-        case id, title, artist, bpm, originalBPM, timeSignatureNumerator, timeSignatureDenominator, timeSignatureChanges, tempoEvents, musicalKey, transposeSemitones, preserveVocalFormants, sections, defaultSections, savedArrangements, activeArrangementId, defaultMidiCues, defaultDirectionalCues, defaultAutomationPoints, defaultSmpteCue, stemURLs, beatGrid, midiCues, directionalCues, automationPoints, smpteCue, proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, cueNextSongSection, endFadeOutEnabled, fadeEndSectionEnabled, startPadWithSong, padPresetId, padIntroOutroOnly
-        case clickSource, guideSource, guideVoice, guideFallbackVoice, clickSound, usesDefaultClickSound, usesDefaultGuideVoice, clickAccentEnabled, clickQuarterEnabled, clickEighthEnabled, clickSixteenthEnabled, clickAccentVolume, clickQuarterVolume, clickEighthVolume, clickSixteenthVolume, guideCountInEnabled, speakDirectionalCuesOnUploadedGuide, guideSectionsVolume, guideSectionsEnabled, guideDirectionsVolume, guideDirectionsEnabled, guideFallbackVolume, guideFallbackEnabled, autoInfiniteLoop, excludesClickAndGuide
+        case id, title, artist, bpm, originalBPM, timeSignatureNumerator, timeSignatureDenominator, timeSignatureChanges, tempoEvents, musicalKey, transposeSemitones, preserveVocalFormants, sections, defaultSections, savedArrangements, activeArrangementId, defaultMidiCues, defaultDirectionalCues, defaultAutomationPoints, defaultSmpteCue, stemURLs, beatGrid, midiCues, directionalCues, automationPoints, smpteCue, proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, cueNextSongSection, announceSongEnabled, endFadeOutEnabled, fadeEndSectionEnabled, startPadWithSong, padPresetId, padIntroOutroOnly
+        case clickSource, guideSource, guideVoice, guideFallbackVoice, clickSound, usesDefaultClickSound, usesDefaultGuideVoice, usesDefaultGuideFallback, clickAccentEnabled, clickQuarterEnabled, clickEighthEnabled, clickSixteenthEnabled, clickAccentVolume, clickQuarterVolume, clickEighthVolume, clickSixteenthVolume, guideCountInEnabled, speakDirectionalCuesOnUploadedGuide, guideSectionsVolume, guideSectionsEnabled, guideDirectionsVolume, guideDirectionsEnabled, guideFallbackVolume, guideFallbackEnabled, autoInfiniteLoop, excludesClickAndGuide
     }
     
     public init(from decoder: Decoder) throws {
@@ -1564,6 +1625,7 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         self.continuePad = try container.decodeIfPresent(Bool.self, forKey: .continuePad) ?? false
         self.continueClick = try container.decodeIfPresent(Bool.self, forKey: .continueClick) ?? false
         self.cueNextSongSection = try container.decodeIfPresent(Bool.self, forKey: .cueNextSongSection) ?? false
+        self.announceSongEnabled = try container.decodeIfPresent(Bool.self, forKey: .announceSongEnabled) ?? false
         self.endFadeOutEnabled = try container.decodeIfPresent(Bool.self, forKey: .endFadeOutEnabled) ?? false
         self.fadeEndSectionEnabled = try container.decodeIfPresent(Bool.self, forKey: .fadeEndSectionEnabled) ?? false
         self.startPadWithSong = try container.decodeIfPresent(Bool.self, forKey: .startPadWithSong) ?? false
@@ -1574,7 +1636,12 @@ public struct Song: Identifiable, Hashable, Sendable, Codable {
         let decodedGuideVoice = try container.decodeIfPresent(GuideVoice.self, forKey: .guideVoice)
         let decodedClickSound = try container.decodeIfPresent(ClickSoundType.self, forKey: .clickSound)
         self.guideVoice = decodedGuideVoice ?? GuideVoice.defaultVoice
-        self.guideFallbackVoice = try container.decodeIfPresent(GuideVoice.self, forKey: .guideFallbackVoice) ?? CustomSampleLibraryManager.shared.defaultGuideFallbackVoice
+        let decodedFallback = try container.decodeIfPresent(GuideVoice.self, forKey: .guideFallbackVoice)
+        let defaultFallback = CustomSampleLibraryManager.shared.defaultGuideFallbackVoice
+        let resolvedUsesDefaultFallback = try container.decodeIfPresent(Bool.self, forKey: .usesDefaultGuideFallback)
+            ?? (decodedFallback == nil || decodedFallback == .zoe || decodedFallback == defaultFallback)
+        self.usesDefaultGuideFallback = resolvedUsesDefaultFallback
+        self.guideFallbackVoice = resolvedUsesDefaultFallback ? defaultFallback : (decodedFallback ?? defaultFallback)
         self.clickSound = decodedClickSound ?? ClickSoundType.defaultSound
         self.usesDefaultClickSound = try container.decodeIfPresent(Bool.self, forKey: .usesDefaultClickSound) ?? (decodedClickSound == nil)
         self.usesDefaultGuideVoice = try container.decodeIfPresent(Bool.self, forKey: .usesDefaultGuideVoice) ?? (decodedGuideVoice == nil)

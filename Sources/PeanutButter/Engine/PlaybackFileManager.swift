@@ -143,6 +143,7 @@ public struct SongPackageMetadata: Codable, Sendable {
     public var continuePad: Bool = false
     public var continueClick: Bool = false
     public var cueNextSongSection: Bool = false
+    public var announceSongEnabled: Bool = false
     public var endFadeOutEnabled: Bool = false
     public var fadeEndSectionEnabled: Bool = false
     public var startPadWithSong: Bool = false
@@ -158,6 +159,7 @@ public struct SongPackageMetadata: Codable, Sendable {
     public var clickSound: ClickSoundType? = nil
     public var usesDefaultClickSound: Bool? = nil
     public var usesDefaultGuideVoice: Bool? = nil
+    public var usesDefaultGuideFallback: Bool? = nil
     public var clickAccentEnabled: Bool? = nil
     public var clickQuarterEnabled: Bool? = nil
     public var clickEighthEnabled: Bool? = nil
@@ -211,6 +213,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         continuePad: Bool = false,
         continueClick: Bool = false,
         cueNextSongSection: Bool = false,
+        announceSongEnabled: Bool = false,
         endFadeOutEnabled: Bool = false,
         fadeEndSectionEnabled: Bool = false,
         startPadWithSong: Bool = false,
@@ -224,6 +227,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         clickSound: ClickSoundType? = nil,
         usesDefaultClickSound: Bool? = nil,
         usesDefaultGuideVoice: Bool? = nil,
+        usesDefaultGuideFallback: Bool? = nil,
         clickAccentEnabled: Bool? = nil,
         clickQuarterEnabled: Bool? = nil,
         clickEighthEnabled: Bool? = nil,
@@ -276,6 +280,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.continuePad = continuePad
         self.continueClick = continueClick
         self.cueNextSongSection = cueNextSongSection
+        self.announceSongEnabled = announceSongEnabled
         self.endFadeOutEnabled = endFadeOutEnabled
         self.fadeEndSectionEnabled = fadeEndSectionEnabled
         self.startPadWithSong = startPadWithSong
@@ -289,6 +294,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.clickSound = clickSound
         self.usesDefaultClickSound = usesDefaultClickSound
         self.usesDefaultGuideVoice = usesDefaultGuideVoice
+        self.usesDefaultGuideFallback = usesDefaultGuideFallback
         self.clickAccentEnabled = clickAccentEnabled
         self.clickQuarterEnabled = clickQuarterEnabled
         self.clickEighthEnabled = clickEighthEnabled
@@ -314,8 +320,8 @@ public struct SongPackageMetadata: Codable, Sendable {
         case musicalKey, transposeSemitones, preserveVocalFormants, sections, defaultSections, savedArrangements, activeArrangementId, tracks
         case beatGrid, timeSignatureChanges, tempoEvents, midiCues, directionalCues, automationPoints, smpteCue
         case defaultMidiCues, defaultDirectionalCues, defaultAutomationPoints, defaultSmpteCue
-        case proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, cueNextSongSection, endFadeOutEnabled, fadeEndSectionEnabled, startPadWithSong, padPresetId, padIntroOutroOnly, artworkData
-        case clickSource, guideSource, guideVoice, guideFallbackVoice, clickSound, usesDefaultClickSound, usesDefaultGuideVoice
+        case proPresenterPlaylist, proPresenterPlaylistItem, transitionType, continuePad, continueClick, cueNextSongSection, announceSongEnabled, endFadeOutEnabled, fadeEndSectionEnabled, startPadWithSong, padPresetId, padIntroOutroOnly, artworkData
+        case clickSource, guideSource, guideVoice, guideFallbackVoice, clickSound, usesDefaultClickSound, usesDefaultGuideVoice, usesDefaultGuideFallback
         case clickAccentEnabled, clickQuarterEnabled, clickEighthEnabled, clickSixteenthEnabled
         case clickAccentVolume, clickQuarterVolume, clickEighthVolume, clickSixteenthVolume
         case guideCountInEnabled, speakDirectionalCuesOnUploadedGuide, guideSectionsVolume, guideSectionsEnabled, guideDirectionsVolume, guideDirectionsEnabled, guideFallbackVolume, guideFallbackEnabled, autoInfiniteLoop, excludesClickAndGuide
@@ -358,6 +364,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.continuePad = try container.decodeIfPresent(Bool.self, forKey: .continuePad) ?? false
         self.continueClick = try container.decodeIfPresent(Bool.self, forKey: .continueClick) ?? false
         self.cueNextSongSection = try container.decodeIfPresent(Bool.self, forKey: .cueNextSongSection) ?? false
+        self.announceSongEnabled = try container.decodeIfPresent(Bool.self, forKey: .announceSongEnabled) ?? false
         self.endFadeOutEnabled = try container.decodeIfPresent(Bool.self, forKey: .endFadeOutEnabled) ?? false
         self.fadeEndSectionEnabled = try container.decodeIfPresent(Bool.self, forKey: .fadeEndSectionEnabled) ?? false
         self.startPadWithSong = try container.decodeIfPresent(Bool.self, forKey: .startPadWithSong) ?? false
@@ -371,6 +378,7 @@ public struct SongPackageMetadata: Codable, Sendable {
         self.clickSound = try container.decodeIfPresent(ClickSoundType.self, forKey: .clickSound)
         self.usesDefaultClickSound = try container.decodeIfPresent(Bool.self, forKey: .usesDefaultClickSound)
         self.usesDefaultGuideVoice = try container.decodeIfPresent(Bool.self, forKey: .usesDefaultGuideVoice)
+        self.usesDefaultGuideFallback = try container.decodeIfPresent(Bool.self, forKey: .usesDefaultGuideFallback)
         self.clickAccentEnabled = try container.decodeIfPresent(Bool.self, forKey: .clickAccentEnabled)
         self.clickQuarterEnabled = try container.decodeIfPresent(Bool.self, forKey: .clickQuarterEnabled)
         self.clickEighthEnabled = try container.decodeIfPresent(Bool.self, forKey: .clickEighthEnabled)
@@ -1478,11 +1486,14 @@ public final class PlaybackFileManager: @unchecked Sendable {
     public func unpackCloudStemPackIfNeeded(
         for songEntry: SongPackageMetadata,
         rootFolder: URL,
+        satisfiedTrackIds: Set<UUID> = [],
         isCancelled: (() -> Bool)? = nil,
         progressHandler: ((Double) -> Void)? = nil
     ) -> Bool {
         let fm = FileManager.default
-        let missingTracks = songEntry.tracks.filter { !$0.relativeAudioPath.isEmpty && !hasValidCachedStem(for: $0.id) }
+        let missingTracks = songEntry.tracks.filter {
+            !$0.relativeAudioPath.isEmpty && !hasValidCachedStem(for: $0.id) && !satisfiedTrackIds.contains($0.id)
+        }
         guard !missingTracks.isEmpty else { return true }
 
         // Collect candidate cloud Stems root directories and song IDs
@@ -1670,7 +1681,12 @@ public final class PlaybackFileManager: @unchecked Sendable {
     /// Copies a `.pbsong` or `.pbsession` package between Local and Cloud libraries without decoding PCM stems into CoreAudio.
     /// When targeting Cloud, heavy `.m4a` stems are deduplicated into `<CloudRoot>/Stems/<songId>/<trackId>.m4a`;
     /// when targeting Local, stems are materialized back inside the package so local exports stay 100% self-contained.
-    public func copyLibraryPackage(from sourceURL: URL, to destinationURL: URL, isSong: Bool) throws {
+    public func copyLibraryPackage(
+        from sourceURL: URL,
+        to destinationURL: URL,
+        isSong: Bool,
+        overrideSetlistName: String? = nil
+    ) throws {
         let fm = FileManager.default
         LibraryBrowserManager.ensureCloudItemDownloaded(at: sourceURL)
 
@@ -1797,8 +1813,11 @@ public final class PlaybackFileManager: @unchecked Sendable {
 
             var updatedEntries: [SongPackageMetadata] = []
             var usedDestSongFolders = Set<String>()
+            let localLibraryIndex = buildLocalLibraryStemIndex()
             for (songIndex, songEntry) in meta.songEntries.enumerated() {
-                _ = unpackCloudStemPackIfNeeded(for: songEntry, rootFolder: rootFolder)
+                let localStems = resolveLocalLibraryStemURLs(for: songEntry, localLibraryIndex: localLibraryIndex)
+                let satisfiedTrackIds = locallyAvailableTrackIds(for: songEntry, localLibraryIndex: localLibraryIndex)
+                _ = unpackCloudStemPackIfNeeded(for: songEntry, rootFolder: rootFolder, satisfiedTrackIds: satisfiedTrackIds)
                 let destFolderName = Self.sessionSongFolderName(for: songEntry.id, usedNames: &usedDestSongFolders, fallbackIndex: songIndex)
                 let songSubDir = songsDir.appendingPathComponent(destFolderName, isDirectory: true)
                 try fm.createDirectory(at: songSubDir, withIntermediateDirectories: true)
@@ -1823,6 +1842,10 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     let resolvedAudioURL: URL? = {
                         if hasValidCachedStem(for: tm.id) {
                             return cachedStemURL(for: tm.id)
+                        }
+                        if let localStemURL = localStems.byId[tm.id] ?? localStems.byName[tm.name.lowercased()],
+                           hasValidStemFile(at: localStemURL) {
+                            return localStemURL
                         }
                         if !tm.relativeAudioPath.isEmpty,
                            let pkgAudio = resolvePackageStemURL(relativePath: tm.relativeAudioPath, rootFolder: rootFolder, triggerDownload: true),
@@ -1886,6 +1909,10 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 }
             }
 
+            if let overrideName = overrideSetlistName?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !overrideName.isEmpty {
+                meta.name = overrideName
+            }
             meta.associatedSessionPath = nil
             if isCloudDest {
                 if meta.lastSavedRevisionId == nil {
@@ -3056,6 +3083,8 @@ public final class PlaybackFileManager: @unchecked Sendable {
             
             let resolvedClickSource: ClickSource = hasUploadedClickFile ? (songEntry.clickSource ?? .uploaded) : .generated
             let resolvedGuideSource: GuideSource = hasUploadedGuideFile ? (songEntry.guideSource ?? .uploaded) : .generated
+            let resolvedGuide = Self.resolvedGuideVoiceSettings(for: songEntry)
+            let resolvedFallback = Self.resolvedFallbackSettings(for: songEntry)
             
             var song = Song(
                 id: songEntry.id,
@@ -3090,6 +3119,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 continuePad: songEntry.continuePad,
                 continueClick: songEntry.continueClick,
                 cueNextSongSection: songEntry.cueNextSongSection,
+                announceSongEnabled: songEntry.announceSongEnabled,
                 endFadeOutEnabled: songEntry.endFadeOutEnabled,
                 fadeEndSectionEnabled: songEntry.fadeEndSectionEnabled,
                 startPadWithSong: songEntry.startPadWithSong,
@@ -3098,11 +3128,12 @@ public final class PlaybackFileManager: @unchecked Sendable {
                 artworkData: loadedArtwork,
                 clickSource: resolvedClickSource,
                 guideSource: resolvedGuideSource,
-                guideVoice: (songEntry.usesDefaultGuideVoice == true) ? GuideVoice.defaultVoice : (songEntry.guideVoice ?? GuideVoice.defaultVoice),
-                guideFallbackVoice: songEntry.guideFallbackVoice ?? CustomSampleLibraryManager.shared.defaultGuideFallbackVoice,
+                guideVoice: resolvedGuide.voice,
+                guideFallbackVoice: resolvedFallback.voice,
                 clickSound: (songEntry.usesDefaultClickSound == true) ? ClickSoundType.defaultSound : (songEntry.clickSound ?? ClickSoundType.defaultSound),
                 usesDefaultClickSound: songEntry.usesDefaultClickSound ?? (songEntry.clickSound == nil),
-                usesDefaultGuideVoice: songEntry.usesDefaultGuideVoice ?? (songEntry.guideVoice == nil),
+                usesDefaultGuideVoice: resolvedGuide.usesDefault,
+                usesDefaultGuideFallback: resolvedFallback.usesDefault,
                 clickAccentEnabled: songEntry.clickAccentEnabled ?? true,
                 clickQuarterEnabled: songEntry.clickQuarterEnabled ?? true,
                 clickEighthEnabled: songEntry.clickEighthEnabled ?? true,
@@ -3186,12 +3217,17 @@ public final class PlaybackFileManager: @unchecked Sendable {
         public let packageURL: URL
     }
 
-    public func buildLocalLibraryStemIndex() -> [LocalLibrarySongEntry] {
+    public func buildLocalLibraryStemIndex(in songsDirectoryOverride: URL? = nil) -> [LocalLibrarySongEntry] {
         let fm = FileManager.default
-        guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return []
+        let localSongsDir: URL
+        if let override = songsDirectoryOverride {
+            localSongsDir = override
+        } else {
+            guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+                return []
+            }
+            localSongsDir = appSupport.appendingPathComponent("PeanutButter/Songs", isDirectory: true)
         }
-        let localSongsDir = appSupport.appendingPathComponent("PeanutButter/Songs", isDirectory: true)
         guard let entries = try? fm.contentsOfDirectory(
             at: localSongsDir,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -3212,10 +3248,35 @@ public final class PlaybackFileManager: @unchecked Sendable {
         return index
     }
 
+    /// Returns the set of track IDs for `songEntry` already available locally in `StemCache`
+    /// or inside a matching local `.pbsong` package in the user's Local Songs library.
+    public func locallyAvailableTrackIds(
+        for songEntry: SongPackageMetadata,
+        localLibraryIndex: [LocalLibrarySongEntry]? = nil
+    ) -> Set<UUID> {
+        let localStems = resolveLocalLibraryStemURLs(for: songEntry, localLibraryIndex: localLibraryIndex)
+        var satisfied = Set<UUID>()
+        for tm in songEntry.tracks where !tm.relativeAudioPath.isEmpty {
+            if hasValidCachedStem(for: tm.id) {
+                satisfied.insert(tm.id)
+            } else if let localURL = localStems.byId[tm.id] ?? localStems.byName[tm.name.lowercased()],
+                      hasValidStemFile(at: localURL) {
+                satisfied.insert(tm.id)
+            }
+        }
+        return satisfied
+    }
+
     /// Fires non-blocking iCloud download requests for all uncached stems across the ordered song entries
     /// so macOS FileProvider / bird pipelines downloads in the background while earlier songs decode.
-    public func prefetchCloudStems(for songEntries: [SongPackageMetadata], rootFolder: URL) {
+    /// Tracks already satisfied by a local `.pbsong` or `StemCache` are skipped completely.
+    public func prefetchCloudStems(
+        for songEntries: [SongPackageMetadata],
+        rootFolder: URL,
+        localLibraryIndex: [LocalLibrarySongEntry]? = nil
+    ) {
         let fm = FileManager.default
+        let resolvedLocalIndex = localLibraryIndex ?? buildLocalLibraryStemIndex()
         let inferredStemsRoot = rootFolder
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -3223,7 +3284,10 @@ public final class PlaybackFileManager: @unchecked Sendable {
         let stemsRoots = [LibraryBrowserManager.cloudStemsDirectoryURL, inferredStemsRoot].compactMap { $0 }
 
         for entry in songEntries {
-            let hasUncached = entry.tracks.contains { !$0.relativeAudioPath.isEmpty && !hasValidCachedStem(for: $0.id) }
+            let satisfied = locallyAvailableTrackIds(for: entry, localLibraryIndex: resolvedLocalIndex)
+            let hasUncached = entry.tracks.contains {
+                !$0.relativeAudioPath.isEmpty && !hasValidCachedStem(for: $0.id) && !satisfied.contains($0.id)
+            }
             guard hasUncached else { continue }
 
             // 1. Trigger download of the single atomic `<songId>.pbstems` pack if present
@@ -3238,7 +3302,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             }
 
             // 2. Also trigger any legacy loose stem files if present
-            for tm in entry.tracks where !tm.relativeAudioPath.isEmpty && !hasValidCachedStem(for: tm.id) {
+            for tm in entry.tracks where !tm.relativeAudioPath.isEmpty && !hasValidCachedStem(for: tm.id) && !satisfied.contains(tm.id) {
                 if let url = resolvePackageStemURL(relativePath: tm.relativeAudioPath, rootFolder: rootFolder, triggerDownload: false) {
                     if !LibraryBrowserManager.checkIsDownloaded(at: url) {
                         LibraryBrowserManager.triggerCloudDownload(at: url)
@@ -3336,6 +3400,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
         let fm = FileManager.default
         let trackCount = songEntry.tracks.count
         let localStems = resolveLocalLibraryStemURLs(for: songEntry, localLibraryIndex: localLibraryIndex)
+        let satisfiedTrackIds = locallyAvailableTrackIds(for: songEntry, localLibraryIndex: localLibraryIndex)
         
         struct DecodedTrackItem {
             let track: StemTrack
@@ -3360,7 +3425,13 @@ public final class PlaybackFileManager: @unchecked Sendable {
         if trackCount > 0 {
             var packReportedProgress = false
             // Unpack the single atomic `<songId>.pbstems` pack (if present) directly into StemCache first
-            _ = self.unpackCloudStemPackIfNeeded(for: songEntry, rootFolder: rootFolder, isCancelled: isCancelled) { packFrac in
+            // unless all tracks are already satisfied by local .pbsong packages or StemCache.
+            _ = self.unpackCloudStemPackIfNeeded(
+                for: songEntry,
+                rootFolder: rootFolder,
+                satisfiedTrackIds: satisfiedTrackIds,
+                isCancelled: isCancelled
+            ) { packFrac in
                 packReportedProgress = true
                 if let progressHandler = progressHandler {
                     let scaled = max(0, min(800, Int((packFrac * 800.0).rounded())))
@@ -3369,7 +3440,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             }
 
             // Queue any remaining uncached cloud stems upfront so FileProvider / Google Drive pipelines them immediately
-            for tm in songEntry.tracks where !tm.relativeAudioPath.isEmpty && !self.hasValidCachedStem(for: tm.id) {
+            for tm in songEntry.tracks where !tm.relativeAudioPath.isEmpty && !self.hasValidCachedStem(for: tm.id) && !satisfiedTrackIds.contains(tm.id) {
                 if let u = self.resolvePackageStemURL(relativePath: tm.relativeAudioPath, rootFolder: rootFolder, triggerDownload: false),
                    !LibraryBrowserManager.checkIsDownloaded(at: u) {
                     LibraryBrowserManager.triggerCloudDownload(at: u)
@@ -3427,7 +3498,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
                     sourceAudioURL = cachedURL
                     usedCachedStem = true
                 } else if let localStemURL = localStems.byId[tm.id] ?? localStems.byName[tm.name.lowercased()],
-                          fm.fileExists(atPath: localStemURL.path) {
+                          self.hasValidStemFile(at: localStemURL) {
                     sourceAudioURL = localStemURL
                 } else if let pkgURL = packageAudioURL {
                     if !LibraryBrowserManager.checkIsDownloaded(at: pkgURL) {
@@ -3682,6 +3753,38 @@ public final class PlaybackFileManager: @unchecked Sendable {
         return (song, loadedTracks, loadedTransposed)
     }
 
+    private static func resolvedGuideVoiceSettings(for songEntry: SongPackageMetadata) -> (voice: GuideVoice, usesDefault: Bool) {
+        if songEntry.usesDefaultGuideVoice == true || songEntry.guideVoice == nil {
+            return (GuideVoice.defaultVoice, true)
+        }
+        let saved = songEntry.guideVoice!
+        if let customId = saved.customPackId,
+           CustomSampleLibraryManager.shared.guidePack(forId: customId) == nil {
+            return (GuideVoice.defaultVoice, true)
+        }
+        if (saved == .rita || saved.rawValue.caseInsensitiveCompare("rita") == .orderedSame),
+           !AudioSampleBank.shared.hasSampledGuides {
+            if CustomSampleLibraryManager.shared.guidePack(forId: "rita") != nil {
+                return (.custom(packId: "rita"), false)
+            }
+            return (GuideVoice.defaultVoice, true)
+        }
+        return (saved, false)
+    }
+
+    private static func resolvedFallbackSettings(for songEntry: SongPackageMetadata) -> (voice: GuideVoice, usesDefault: Bool) {
+        let defaultFb = CustomSampleLibraryManager.shared.defaultGuideFallbackVoice
+        let resolvedUsesDefaultFallback = songEntry.usesDefaultGuideFallback
+            ?? (songEntry.guideFallbackVoice == nil || songEntry.guideFallbackVoice == .zoe || songEntry.guideFallbackVoice == defaultFb)
+        var resolvedFallbackVoice = resolvedUsesDefaultFallback ? defaultFb : (songEntry.guideFallbackVoice ?? defaultFb)
+        if let clonedId = resolvedFallbackVoice.clonedPackId,
+           CustomSampleLibraryManager.shared.guidePack(forId: clonedId) == nil,
+           !(clonedId.caseInsensitiveCompare("rita") == .orderedSame && AudioSampleBank.shared.hasSampledGuides) {
+            resolvedFallbackVoice = .cloneActive
+        }
+        return (resolvedFallbackVoice, resolvedUsesDefaultFallback)
+    }
+
     private func buildSong(
         from songEntry: SongPackageMetadata,
         artworkOverride: Data?,
@@ -3689,7 +3792,9 @@ public final class PlaybackFileManager: @unchecked Sendable {
         resolvedClickSource: ClickSource,
         resolvedGuideSource: GuideSource
     ) -> Song {
-        Song(
+        let resolvedGuide = Self.resolvedGuideVoiceSettings(for: songEntry)
+        let resolvedFallback = Self.resolvedFallbackSettings(for: songEntry)
+        return Song(
             id: songEntry.id,
             title: songEntry.title,
             artist: songEntry.artist,
@@ -3722,6 +3827,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             continuePad: songEntry.continuePad,
             continueClick: songEntry.continueClick,
             cueNextSongSection: songEntry.cueNextSongSection,
+            announceSongEnabled: songEntry.announceSongEnabled,
             endFadeOutEnabled: songEntry.endFadeOutEnabled,
             fadeEndSectionEnabled: songEntry.fadeEndSectionEnabled,
             startPadWithSong: songEntry.startPadWithSong,
@@ -3730,11 +3836,12 @@ public final class PlaybackFileManager: @unchecked Sendable {
             artworkData: artworkOverride ?? songEntry.artworkData,
             clickSource: resolvedClickSource,
             guideSource: resolvedGuideSource,
-            guideVoice: (songEntry.usesDefaultGuideVoice == true) ? GuideVoice.defaultVoice : (songEntry.guideVoice ?? GuideVoice.defaultVoice),
-            guideFallbackVoice: songEntry.guideFallbackVoice ?? CustomSampleLibraryManager.shared.defaultGuideFallbackVoice,
+            guideVoice: resolvedGuide.voice,
+            guideFallbackVoice: resolvedFallback.voice,
             clickSound: (songEntry.usesDefaultClickSound == true) ? ClickSoundType.defaultSound : (songEntry.clickSound ?? ClickSoundType.defaultSound),
             usesDefaultClickSound: songEntry.usesDefaultClickSound ?? (songEntry.clickSound == nil),
-            usesDefaultGuideVoice: songEntry.usesDefaultGuideVoice ?? (songEntry.guideVoice == nil),
+            usesDefaultGuideVoice: resolvedGuide.usesDefault,
+            usesDefaultGuideFallback: resolvedFallback.usesDefault,
             clickAccentEnabled: songEntry.clickAccentEnabled ?? true,
             clickQuarterEnabled: songEntry.clickQuarterEnabled ?? true,
             clickEighthEnabled: songEntry.clickEighthEnabled ?? true,
@@ -3795,6 +3902,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             continuePad: song.continuePad,
             continueClick: song.continueClick,
             cueNextSongSection: song.cueNextSongSection,
+            announceSongEnabled: song.announceSongEnabled,
             endFadeOutEnabled: song.endFadeOutEnabled,
             fadeEndSectionEnabled: song.fadeEndSectionEnabled,
             startPadWithSong: song.startPadWithSong,
@@ -3808,6 +3916,7 @@ public final class PlaybackFileManager: @unchecked Sendable {
             clickSound: song.clickSound,
             usesDefaultClickSound: song.usesDefaultClickSound,
             usesDefaultGuideVoice: song.usesDefaultGuideVoice,
+            usesDefaultGuideFallback: song.usesDefaultGuideFallback,
             clickAccentEnabled: song.clickAccentEnabled,
             clickQuarterEnabled: song.clickQuarterEnabled,
             clickEighthEnabled: song.clickEighthEnabled,

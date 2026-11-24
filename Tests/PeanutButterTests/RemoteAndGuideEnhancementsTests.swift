@@ -2123,4 +2123,1091 @@ struct RemoteAndGuideEnhancementsTests {
         #expect(AppUpdateManager.isVersion("1.2.0", newerThan: "1.1.1-dev.12") == true)
         #expect(AppUpdateManager.isVersion("1.1.1", newerThan: "1.1.1-beta.1") == true)
     }
+
+    @Test
+    func sessionStorageLocationDetectsCloudLocalAndUnsaved() {
+        let cloudRoot = URL(fileURLWithPath: "/tmp/PeanutButterCloud", isDirectory: true)
+        let cloudSetlist = URL(fileURLWithPath: "/tmp/PeanutButterCloud/Setlists/Sunday.pbsession", isDirectory: true)
+        let localSetlist = URL(fileURLWithPath: "/tmp/LocalSetlists/Sunday.pbsession", isDirectory: true)
+        let siblingPrefixSetlist = URL(fileURLWithPath: "/tmp/PeanutButterCloudBackup/Setlists/Sunday.pbsession", isDirectory: true)
+
+        #expect(MultitrackAudioEngine.sessionStorageLocation(for: nil, cloudRootURL: cloudRoot) == .unsaved)
+        #expect(MultitrackAudioEngine.sessionStorageLocation(for: cloudSetlist, cloudRootURL: cloudRoot) == .cloud)
+        #expect(MultitrackAudioEngine.sessionStorageLocation(for: localSetlist, cloudRootURL: cloudRoot) == .local)
+        #expect(MultitrackAudioEngine.sessionStorageLocation(for: siblingPrefixSetlist, cloudRootURL: cloudRoot) == .local)
+    }
+
+    @Test
+    @MainActor
+    func localSetlistNeverShowsCloudUpdateAlertWhileCloudSetlistDoes() {
+        let engine = MultitrackAudioEngine()
+        let localURL = URL(fileURLWithPath: "/tmp/PBLocalSetlists/Sunday.pbsession", isDirectory: true)
+        let cloudItemURL = (LibraryBrowserManager.shared.cloudSetlistsDirectory
+            ?? URL(fileURLWithPath: "/tmp/PBCloud/Setlists", isDirectory: true))
+            .appendingPathComponent("Sunday.pbsession", isDirectory: true)
+
+        let cloudUpdateItem = SetlistLibraryItem(
+            id: cloudItemURL,
+            url: cloudItemURL,
+            name: "Sunday",
+            songCount: 1,
+            formattedDate: "Nov 22, 2026",
+            formattedDuration: "4:00",
+            artworks: [],
+            modifiedDate: Date().addingTimeInterval(300),
+            source: .cloud,
+            isDownloaded: true,
+            hasCloudUpdate: true,
+            changeDescription: "Updated key",
+            hasUnresolvedServerUpdate: true,
+            lastSavedRevisionId: UUID(),
+            lastSavedByDeviceId: "other-mac"
+        )
+
+        // Open session is Local: even with the same filename ("Sunday.pbsession"), Cloud update alert must stay off
+        engine.currentSessionURL = localURL
+        engine.updateCloudSetlistUpdateFlag(from: [cloudUpdateItem])
+        #expect(engine.hasCloudSetlistUpdate == false)
+
+        // Open session is Cloud at the exact Cloud URL: update alert activates
+        if let cloudDir = LibraryBrowserManager.shared.cloudSetlistsDirectory {
+            let liveCloudURL = cloudDir.appendingPathComponent("Sunday.pbsession", isDirectory: true)
+            let liveCloudItem = SetlistLibraryItem(
+                id: liveCloudURL,
+                url: liveCloudURL,
+                name: "Sunday",
+                songCount: 1,
+                formattedDate: "Nov 22, 2026",
+                formattedDuration: "4:00",
+                artworks: [],
+                modifiedDate: Date().addingTimeInterval(300),
+                source: .cloud,
+                isDownloaded: true,
+                hasCloudUpdate: true,
+                changeDescription: "Updated key",
+                hasUnresolvedServerUpdate: true,
+                lastSavedRevisionId: UUID(),
+                lastSavedByDeviceId: "other-mac"
+            )
+            engine.currentSessionURL = liveCloudURL
+            #expect(engine.shouldShowCloudUpdate(for: liveCloudItem) == true)
+            engine.updateCloudSetlistUpdateFlag(from: [liveCloudItem])
+            #expect(engine.hasCloudSetlistUpdate == true)
+        }
+    }
+
+    @Test
+    func cloudSetlistReusesLocalSongStemsBeforeCloudUnpack() throws {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent("pb_local_stem_reuse_\(UUID().uuidString)", isDirectory: true)
+        let tempSongsDir = tempRoot.appendingPathComponent("Songs", isDirectory: true)
+        let localSongPkg = tempSongsDir.appendingPathComponent("AmazingGrace.pbsong", isDirectory: true)
+        let localStemsDir = localSongPkg.appendingPathComponent("stems", isDirectory: true)
+        try fm.createDirectory(at: localStemsDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        let localSongId = UUID()
+        let localKickId = UUID()
+        let dummyAudio = Data(repeating: 0x2A, count: 2048)
+        try dummyAudio.write(to: localStemsDir.appendingPathComponent("kick.m4a"))
+
+        let localMeta = SongPackageMetadata(
+            id: localSongId,
+            title: "Amazing Grace",
+            artist: "Test Band",
+            bpm: 72.0,
+            originalBPM: 72.0,
+            tracks: [
+                TrackFileMetadata(
+                    id: localKickId,
+                    name: "Kick",
+                    role: .stem,
+                    relativeAudioPath: "stems/kick.m4a"
+                )
+            ]
+        )
+        try JSONEncoder().encode(localMeta).write(to: localSongPkg.appendingPathComponent("song.json"))
+
+        let localIndex = PlaybackFileManager.shared.buildLocalLibraryStemIndex(in: tempSongsDir)
+        #expect(localIndex.count == 1)
+
+        // Cloud setlist entry has different song/track UUIDs, matching Title + Artist + BPM + Track Name
+        let cloudSongId = UUID()
+        let cloudKickId = UUID()
+        let cloudEntry = SongPackageMetadata(
+            id: cloudSongId,
+            title: "Amazing Grace",
+            artist: "Test Band",
+            bpm: 72.0,
+            originalBPM: 72.0,
+            tracks: [
+                TrackFileMetadata(
+                    id: cloudKickId,
+                    name: "Kick",
+                    role: .stem,
+                    relativeAudioPath: "cloudstems/\(cloudSongId.uuidString)/\(cloudKickId.uuidString).m4a"
+                )
+            ]
+        )
+
+        let satisfied = PlaybackFileManager.shared.locallyAvailableTrackIds(
+            for: cloudEntry,
+            localLibraryIndex: localIndex
+        )
+        #expect(satisfied == [cloudKickId])
+
+        let cloudPkgPlaceholder = tempRoot.appendingPathComponent("CloudSetlists/Sunday.pbsession", isDirectory: true)
+        #expect(
+            PlaybackFileManager.shared.unpackCloudStemPackIfNeeded(
+                for: cloudEntry,
+                rootFolder: cloudPkgPlaceholder,
+                satisfiedTrackIds: satisfied
+            ) == true
+        )
+    }
+
+    @Test
+    func pruneCloudOnlyDeviceCachesPreservesLocalFilesAndStems() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("pb_prune_cloud_\(UUID().uuidString)", isDirectory: true)
+        let stemCache = root.appendingPathComponent("StemCache", isDirectory: true)
+        let localSetlists = root.appendingPathComponent("Setlists", isDirectory: true)
+        let localSongs = root.appendingPathComponent("Songs", isDirectory: true)
+        let autoSave = root.appendingPathComponent("AutoSaveSession.pbsession", isDirectory: true)
+        try fm.createDirectory(at: stemCache, withIntermediateDirectories: true)
+        try fm.createDirectory(at: localSetlists.appendingPathComponent("LocalShow.pbsession", isDirectory: true), withIntermediateDirectories: true)
+        try fm.createDirectory(at: localSongs.appendingPathComponent("LocalSong.pbsong", isDirectory: true), withIntermediateDirectories: true)
+        try fm.createDirectory(at: autoSave, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let localSetSongId = UUID()
+        let localSetTrackId = UUID()
+        let localLibSongId = UUID()
+        let localLibTrackId = UUID()
+        let cloudOnlySongId = UUID()
+        let cloudOnlyTrackId = UUID()
+
+        let encoder = JSONEncoder()
+        let sessionMeta = SessionPackageMetadata(
+            name: "LocalShow",
+            songEntries: [
+                SongPackageMetadata(
+                    id: localSetSongId,
+                    title: "Local Set Song",
+                    artist: "Band",
+                    bpm: 120.0,
+                    tracks: [TrackFileMetadata(id: localSetTrackId, name: "Drums", role: .stem, relativeAudioPath: "songs/s/stems/drums.m4a")]
+                )
+            ]
+        )
+        try encoder.encode(sessionMeta).write(to: localSetlists.appendingPathComponent("LocalShow.pbsession/session.json"))
+
+        let songMeta = SongPackageMetadata(
+            id: localLibSongId,
+            title: "Local Lib Song",
+            artist: "Band",
+            bpm: 120.0,
+            tracks: [TrackFileMetadata(id: localLibTrackId, name: "Bass", role: .stem, relativeAudioPath: "stems/bass.m4a")]
+        )
+        try encoder.encode(songMeta).write(to: localSongs.appendingPathComponent("LocalSong.pbsong/song.json"))
+        try Data("autosave".utf8).write(to: autoSave.appendingPathComponent("session.json"))
+
+        let localSetStem = stemCache.appendingPathComponent("\(localSetTrackId.uuidString).m4a")
+        let localLibStem = stemCache.appendingPathComponent("\(localLibTrackId.uuidString).m4a")
+        let cloudOnlyStem = stemCache.appendingPathComponent("\(cloudOnlyTrackId.uuidString).m4a")
+        let localSetTransposed = stemCache.appendingPathComponent("transposed_rb32_\(localSetSongId.uuidString)_2_vf1", isDirectory: true)
+        let localLibTransposed = stemCache.appendingPathComponent("transposed_rb32_\(localLibSongId.uuidString)_-1_vf1", isDirectory: true)
+        let cloudOnlyTransposed = stemCache.appendingPathComponent("transposed_rb32_\(cloudOnlySongId.uuidString)_2_vf1", isDirectory: true)
+
+        try Data("local1".utf8).write(to: localSetStem)
+        try Data("local2".utf8).write(to: localLibStem)
+        try Data("cloud".utf8).write(to: cloudOnlyStem)
+        for dir in [localSetTransposed, localLibTransposed, cloudOnlyTransposed] {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Data("wav".utf8).write(to: dir.appendingPathComponent("t.wav"))
+        }
+
+        // Case A: Non-cloud active session keeps local AutoSave + local caches, removes Cloud-only caches
+        LibraryBrowserManager.pruneCloudOnlyDeviceCaches(
+            stemCacheDir: stemCache,
+            localSetlistsDir: localSetlists,
+            localSongsDir: localSongs,
+            autoSaveURL: autoSave,
+            shouldRemoveAutoSave: false
+        )
+
+        #expect(fm.fileExists(atPath: localSetStem.path))
+        #expect(fm.fileExists(atPath: localLibStem.path))
+        #expect(fm.fileExists(atPath: localSetTransposed.path))
+        #expect(fm.fileExists(atPath: localLibTransposed.path))
+        #expect(fm.fileExists(atPath: localSetlists.appendingPathComponent("LocalShow.pbsession/session.json").path))
+        #expect(fm.fileExists(atPath: localSongs.appendingPathComponent("LocalSong.pbsong/song.json").path))
+        #expect(fm.fileExists(atPath: autoSave.path))
+        #expect(!fm.fileExists(atPath: cloudOnlyStem.path))
+        #expect(!fm.fileExists(atPath: cloudOnlyTransposed.path))
+
+        // Case B: Cloud active session also removes Cloud AutoSave while leaving local files untouched
+        LibraryBrowserManager.pruneCloudOnlyDeviceCaches(
+            stemCacheDir: stemCache,
+            localSetlistsDir: localSetlists,
+            localSongsDir: localSongs,
+            autoSaveURL: autoSave,
+            shouldRemoveAutoSave: true
+        )
+        #expect(!fm.fileExists(atPath: autoSave.path))
+        #expect(fm.fileExists(atPath: localSetStem.path))
+        #expect(fm.fileExists(atPath: localLibStem.path))
+    }
+
+    @Test
+    func uniqueLocalCopyNameAvoidsCollisions() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("pb_unique_local_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        #expect(LibraryBrowserManager.uniqueLocalCopyName(baseName: "RR - 11.22.26", in: dir) == "RR - 11.22.26 (Local)")
+        try fm.createDirectory(at: dir.appendingPathComponent("RR - 11.22.26 (Local).pbsession", isDirectory: true), withIntermediateDirectories: true)
+        #expect(LibraryBrowserManager.uniqueLocalCopyName(baseName: "RR - 11.22.26", in: dir) == "RR - 11.22.26 (Local 2)")
+        #expect(LibraryBrowserManager.uniqueLocalCopyName(baseName: "RR - 11.22.26 (Local)", in: dir) == "RR - 11.22.26 (Local 2)")
+    }
+
+    @Test
+    func songAnnouncementPhraseFormatsKeysAndAllCapsTitles() {
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "Holy Forever", key: "B") == "Holy Forever, Key of B")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "WASHED", key: "Bb") == "Washed, Key of B flat")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "Spirit & Truth", key: "F#m") == "Spirit and Truth, Key of F sharp minor")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "GREAT ARE YOU LORD", key: "C#m") == "Great Are You Lord, Key of C sharp minor")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "No Key Anthem", key: "") == "No Key Anthem")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "No Key Anthem", key: "—") == "No Key Anthem")
+        #expect(MusicalKeyHelper.spokenKeyName(for: "A") == "A")
+        #expect(MusicalKeyHelper.spokenKeyName(for: "Ab") == "A flat")
+        #expect(MusicalKeyHelper.spokenKeyName(for: "Am") == "A minor")
+
+        var song = Song(
+            title: "Holy Forever",
+            artist: "Chris Tomlin",
+            bpm: 72.0,
+            musicalKey: "B",
+            transposeSemitones: 2,
+            sections: []
+        )
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(for: song) == "Holy Forever, Key of D flat")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(for: song, overrideTransposeSemitones: 0) == "Holy Forever, Key of B")
+        song.musicalKey = "F#"
+        song.transposeSemitones = 2
+        #expect(song.title == "Holy Forever" || !song.title.isEmpty)
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(for: song) == "Holy Forever, Key of G sharp")
+
+        // Skip standalone "(Live)" / "[Live]" tags in song title announcements
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "Who Else (Live)", key: "Ab") == "Who Else, Key of A flat")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "WHO ELSE (LIVE)", key: "Ab") == "Who Else, Key of A flat")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "Praise You [Live]", key: "B") == "Praise You, Key of B")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "Who Else - (Live)", key: "Ab") == "Who Else, Key of A flat")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "I Live For You (Live)", key: "G") == "I Live For You, Key of G")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "Who Else (Live at Red Rocks)", key: "Ab") == "Who Else (Live at Red Rocks), Key of A flat")
+        #expect(GuideAudioGenerator.songAnnouncementPhrase(title: "(Live)", key: "") == "(Live)")
+    }
+
+    @Test
+    func luxTtsG2pPronouncesMusicalKeyOfAAsLetterName() throws {
+        let g2p = try LuxTtsG2p()
+
+        let keyOfAFlat = g2p.phonemize(text: "Holy Forever, Key of A flat.")
+        #expect(keyOfAFlat.contains("kˈiː ʌv ˈeeɪ flˌæt"))
+        #expect(!keyOfAFlat.contains("ˈeeɪ flˈæt"))
+        #expect(!keyOfAFlat.contains("əvə"))
+        #expect(!keyOfAFlat.contains("ɐ"))
+
+        let keyOfAMinor = g2p.phonemize(text: "Song Two, Key of A minor.")
+        #expect(keyOfAMinor.contains("kˈiː ʌv ˈeeɪ mˌaɪnɚ"))
+
+        let keyOfASharp = g2p.phonemize(text: "Praise, Key of A sharp.")
+        #expect(keyOfASharp.contains("kˈiː ʌv ˈeeɪ ʃˌɑːɹp"))
+
+        let keyOfAFlatMinor = g2p.phonemize(text: "Praise, Key of A flat minor.")
+        #expect(keyOfAFlatMinor.contains("kˈiː ʌv ˈeeɪ flˌæt mˈaɪnɚ"))
+
+        let keyOfAPlain = g2p.phonemize(text: "Goodness of God, Key of A.")
+        #expect(keyOfAPlain.contains("kˈiː ʌv ˈeɪ."))
+        #expect(!keyOfAPlain.contains("ˈeeɪ"))
+        #expect(!keyOfAPlain.contains("əvə"))
+
+        let articleSong = g2p.phonemize(text: "A Thousand Hallelujahs.")
+        #expect(!articleSong.hasPrefix("ˈeɪ"))
+        #expect(!articleSong.hasPrefix("ˈeeɪ"))
+
+        let lowercaseArticle = g2p.phonemize(text: "I have a flat tire.")
+        #expect(!lowercaseArticle.contains("ˈeeɪ"))
+
+        let normalOfA = g2p.phonemize(text: "Heart of a Servant.")
+        #expect(normalOfA.contains("əvə"))
+
+        // Other musical keys retain exact letter phonemes and secondary-stressed modifiers
+        #expect(g2p.phonemize(text: "Who Else, Key of B flat.").contains("kˈiː ʌv bˈiː flˌæt"))
+        #expect(g2p.phonemize(text: "Who Else, Key of C sharp minor.").contains("kˈiː ʌv sˈiː ʃˌɑːɹp mˈaɪnɚ"))
+        #expect(g2p.phonemize(text: "Who Else, Key of D flat.").contains("kˈiː ʌv dˈiː flˌæt"))
+        #expect(g2p.phonemize(text: "Who Else, Key of E flat.").contains("kˈiː ʌv ˈiː flˌæt"))
+        #expect(g2p.phonemize(text: "Who Else, Key of F sharp minor.").contains("kˈiː ʌv ˈɛf ʃˌɑːɹp mˈaɪnɚ"))
+        #expect(g2p.phonemize(text: "Who Else, Key of G.").contains("kˈiː ʌv dʒˈiː."))
+    }
+
+    @Test
+    func transitionAnnouncementTimingRespectsAutoLinkOverlapCrossfadeAndCueNextSection() {
+        let endLongSections = [
+            SongSection(name: "Chorus", abbreviation: "C", startTime: 0.0, audioStartTime: 0.0, duration: 60.0, startMeasure: 1, measureCount: 30, playSectionGuideCue: true),
+            SongSection(name: "Ending", abbreviation: "E", startTime: 60.0, audioStartTime: 60.0, duration: 12.0, startMeasure: 31, measureCount: 6, playSectionGuideCue: true)
+        ]
+        var nextSong = Song(
+            title: "Holy Forever",
+            artist: "Band",
+            bpm: 120.0,
+            timeSignatureNumerator: 4,
+            timeSignatureDenominator: 4,
+            musicalKey: "B",
+            sections: [
+                SongSection(name: "Count In", abbreviation: "Co", startTime: 0.0, audioStartTime: 0.0, duration: 2.0, startMeasure: 1, measureCount: 1)
+            ],
+            announceSongEnabled: true
+        )
+
+        // 1. Auto-Link (no Cue Next Section): finishes 0.25s before 72.0s -> starts at 69.75s inside Ending
+        var songA = Song(
+            title: "Song A",
+            artist: "Band",
+            bpm: 120.0,
+            timeSignatureNumerator: 4,
+            timeSignatureDenominator: 4,
+            musicalKey: "G",
+            sections: endLongSections,
+            transitionType: .autoLink
+        )
+        let autoStart = MultitrackAudioEngine.transitionAnnouncementStartTime(
+            from: songA,
+            currentDuration: 72.0,
+            to: nextSong,
+            announcementDuration: 2.0,
+            nextSongCueFirstBeatTime: nil
+        )
+        #expect(autoStart != nil)
+        #expect(abs((autoStart ?? -1) - 69.75) < 0.001)
+
+        // 2. Auto-Link + Cue Next Section cue bar starting at 70.0s: finishes 0.25s before 70.0s -> 67.75s
+        let autoWithCueStart = MultitrackAudioEngine.transitionAnnouncementStartTime(
+            from: songA,
+            currentDuration: 72.0,
+            to: nextSong,
+            announcementDuration: 2.0,
+            nextSongCueFirstBeatTime: 70.0
+        )
+        #expect(autoWithCueStart != nil)
+        #expect(abs((autoWithCueStart ?? -1) - 67.75) < 0.001)
+
+        // 3. Overlap (1-bar Count In = 2.0s -> overlap starts at 70.0s): finishes 0.25s before 70.0s -> 67.75s
+        songA.transitionType = .overlap
+        let overlapStart = MultitrackAudioEngine.transitionAnnouncementStartTime(
+            from: songA,
+            currentDuration: 72.0,
+            to: nextSong,
+            announcementDuration: 2.0,
+            nextSongCueFirstBeatTime: nil
+        )
+        #expect(overlapStart != nil)
+        #expect(abs((overlapStart ?? -1) - 67.75) < 0.001)
+
+        // 4. Overlap with short Ending (69..72): shifts earlier before Ending's own guide cue bar (67..69)
+        var shortEndSongA = songA
+        shortEndSongA.sections = [
+            SongSection(name: "Chorus", abbreviation: "C", startTime: 0.0, audioStartTime: 0.0, duration: 69.0, startMeasure: 1, measureCount: 34, playSectionGuideCue: true),
+            SongSection(name: "Ending", abbreviation: "E", startTime: 69.0, audioStartTime: 69.0, duration: 3.0, startMeasure: 35, measureCount: 2, playSectionGuideCue: true)
+        ]
+        let shortOverlapStart = MultitrackAudioEngine.transitionAnnouncementStartTime(
+            from: shortEndSongA,
+            currentDuration: 72.0,
+            to: nextSong,
+            announcementDuration: 2.5,
+            nextSongCueFirstBeatTime: nil
+        )
+        #expect(shortOverlapStart != nil)
+        #expect(abs((shortOverlapStart ?? -1) - 64.25) < 0.02)
+
+        // 5. Crossfade (2 bars of 120 BPM 4/4 = 4.0s -> fade starts at 68.0s): finishes 0.25s before 68.0s -> 65.75s
+        songA.transitionType = .crossfade
+        let crossfadeStart = MultitrackAudioEngine.transitionAnnouncementStartTime(
+            from: songA,
+            currentDuration: 72.0,
+            to: nextSong,
+            announcementDuration: 2.0,
+            nextSongCueFirstBeatTime: nil
+        )
+        #expect(crossfadeStart != nil)
+        #expect(abs((crossfadeStart ?? -1) - 65.75) < 0.001)
+
+        // 6. Non-automatic transitions & disabled toggle return nil
+        for manualMode in [SongTransitionType.cueNextSong, .stayInSong, .cueFirstSong] {
+            songA.transitionType = manualMode
+            #expect(MultitrackAudioEngine.transitionAnnouncementStartTime(
+                from: songA,
+                currentDuration: 72.0,
+                to: nextSong,
+                announcementDuration: 2.0,
+                nextSongCueFirstBeatTime: nil
+            ) == nil)
+        }
+        songA.transitionType = .autoLink
+        nextSong.announceSongEnabled = false
+        #expect(MultitrackAudioEngine.transitionAnnouncementStartTime(
+            from: songA,
+            currentDuration: 72.0,
+            to: nextSong,
+            announcementDuration: 2.0,
+            nextSongCueFirstBeatTime: nil
+        ) == nil)
+    }
+
+    @Test
+    func realTimeMixEngineRendersPreSongAndTransitionAnnouncementsOnGuideChannelsOnly() throws {
+        let sampleRate = 48_000.0
+        let annBuf = try makeTestPCMBuffer(frequency: 660.0, frameCount: 1_024, sampleRate: sampleRate)
+        let guideTrackId = UUID()
+        let mixState = RealTimeMixEngineState()
+
+        let dummySilent = try makeTestPCMBuffer(frequency: 0.0, frameCount: 256, sampleRate: sampleRate)
+        if let d0 = dummySilent.floatChannelData?[0], let d1 = dummySilent.floatChannelData?[1] {
+            for i in 0..<256 { d0[i] = 0; d1[i] = 0 }
+        }
+        let dummyEntry = RenderTrackEntry(
+            trackId: guideTrackId,
+            peakIndex: 0,
+            leftPtr: dummySilent.floatChannelData![0],
+            rightPtr: dummySilent.floatChannelData![1],
+            frameLength: 256,
+            gainL: 0.0,
+            gainR: 0.0,
+            isClickOrGuide: true,
+            isTimelineAligned: true,
+            outChannelL: 2,
+            outChannelR: 3
+        )
+        mixState.configure(
+            sampleRate: sampleRate,
+            totalDuration: 1.0,
+            slices: [RenderTimelineSlice(timelineStartFrame: 0, timelineEndFrame: 48_000, sourceStartFrame: 0)],
+            tracks: [dummyEntry],
+            retainedBuffers: [dummySilent],
+            loopActive: false,
+            loopIsSingle: false,
+            loopStart: 0.0,
+            loopEnd: 0.0,
+            masterGain: 1.0
+        )
+
+        func renderBlocks(blockCount: Int, frameCount: Int = 512) -> [Float] {
+            var maxPerChannel = [Float](repeating: 0.0, count: 4)
+            var c0 = [Float](repeating: 0.0, count: frameCount)
+            var c1 = [Float](repeating: 0.0, count: frameCount)
+            var c2 = [Float](repeating: 0.0, count: frameCount)
+            var c3 = [Float](repeating: 0.0, count: frameCount)
+            let ablSize = MemoryLayout<AudioBufferList>.size + 3 * MemoryLayout<AudioBuffer>.size
+            let rawABL = UnsafeMutableRawPointer.allocate(byteCount: ablSize, alignment: MemoryLayout<AudioBufferList>.alignment)
+            defer { rawABL.deallocate() }
+            let abl = rawABL.bindMemory(to: AudioBufferList.self, capacity: 1)
+
+            for _ in 0..<blockCount {
+                for i in 0..<frameCount { c0[i] = 0; c1[i] = 0; c2[i] = 0; c3[i] = 0 }
+                abl.pointee.mNumberBuffers = 4
+                c0.withUnsafeMutableBufferPointer { p0 in
+                    c1.withUnsafeMutableBufferPointer { p1 in
+                        c2.withUnsafeMutableBufferPointer { p2 in
+                            c3.withUnsafeMutableBufferPointer { p3 in
+                                let ablPtr = UnsafeMutableAudioBufferListPointer(abl)
+                                let ptrs = [p0.baseAddress!, p1.baseAddress!, p2.baseAddress!, p3.baseAddress!]
+                                for ch in 0..<4 {
+                                    ablPtr[ch].mNumberChannels = 1
+                                    ablPtr[ch].mDataByteSize = UInt32(frameCount * MemoryLayout<Float>.size)
+                                    ablPtr[ch].mData = UnsafeMutableRawPointer(ptrs[ch])
+                                }
+                                var isSil: ObjCBool = false
+                                _ = mixState.render(isSilence: &isSil, frameCount: frameCount, audioBufferList: abl)
+                            }
+                        }
+                    }
+                }
+                let chArr = [c0, c1, c2, c3]
+                for ch in 0..<4 {
+                    for s in chArr[ch] {
+                        let a = abs(s)
+                        if a > maxPerChannel[ch] { maxPerChannel[ch] = a }
+                    }
+                }
+            }
+            return maxPerChannel
+        }
+
+        // Case A: Pre-song manual announcement while stopped renders ONLY on Guide channels (2, 3) and fires completion after breath
+        mixState.startPreSongAnnouncement(
+            buffer: annBuf,
+            trailingBreathSeconds: 0.02, // 960 frames; total = 1024 + 960 = 1984 frames (4 blocks of 512)
+            trackId: guideTrackId,
+            gainL: 1.0,
+            gainR: 1.0,
+            outL: 2,
+            outR: 3
+        )
+        let preFirstBlocks = renderBlocks(blockCount: 2, frameCount: 512)
+        #expect(preFirstBlocks[0] == 0.0)
+        #expect(preFirstBlocks[1] == 0.0)
+        #expect(preFirstBlocks[2] > 0.05)
+        #expect(preFirstBlocks[3] > 0.05)
+        #expect(mixState.consumePreSongAnnouncementFinished() == false)
+
+        let preFinishBlocks = renderBlocks(blockCount: 2, frameCount: 512)
+        #expect(preFinishBlocks[0] == 0.0)
+        #expect(preFinishBlocks[1] == 0.0)
+        #expect(mixState.consumePreSongAnnouncementFinished() == true)
+
+        let postSilent = renderBlocks(blockCount: 1, frameCount: 512)
+        #expect(postSilent == [0.0, 0.0, 0.0, 0.0])
+
+        // Case B: Transition announcement is suppressed when loopActive == true
+        mixState.configure(
+            sampleRate: sampleRate,
+            totalDuration: 1.0,
+            slices: [RenderTimelineSlice(timelineStartFrame: 0, timelineEndFrame: 48_000, sourceStartFrame: 0)],
+            tracks: [dummyEntry],
+            retainedBuffers: [dummySilent],
+            loopActive: true,
+            loopIsSingle: false,
+            loopStart: 0.05,
+            loopEnd: 0.25,
+            masterGain: 1.0
+        )
+        mixState.configureTransitionAnnouncement(
+            enabled: true,
+            buffer: annBuf,
+            startFrame: 4_800,
+            trackId: guideTrackId,
+            gainL: 1.0,
+            gainR: 1.0,
+            outL: 2,
+            outR: 3
+        )
+        mixState.setPlayhead(seconds: 0.0, resumePlaying: true)
+        let loopPeaks = renderBlocks(blockCount: 16, frameCount: 512)
+        #expect(loopPeaks == [0.0, 0.0, 0.0, 0.0])
+
+        // Case C: With loopActive == false, transition announcement renders ONLY on Guide channels at startFrame = 4800
+        mixState.configure(
+            sampleRate: sampleRate,
+            totalDuration: 1.0,
+            slices: [RenderTimelineSlice(timelineStartFrame: 0, timelineEndFrame: 48_000, sourceStartFrame: 0)],
+            tracks: [dummyEntry],
+            retainedBuffers: [dummySilent],
+            loopActive: false,
+            loopIsSingle: false,
+            loopStart: 0.0,
+            loopEnd: 0.0,
+            masterGain: 1.0
+        )
+        mixState.setPlayhead(seconds: 0.0, resumePlaying: true)
+        let transPeaks = renderBlocks(blockCount: 16, frameCount: 512)
+        #expect(transPeaks[0] == 0.0)
+        #expect(transPeaks[1] == 0.0)
+        #expect(transPeaks[2] > 0.05)
+        #expect(transPeaks[3] > 0.05)
+    }
+
+    @Test
+    func announceSongEnabledPersistsAcrossSongAndSongEntryCodable() throws {
+        let song = Song(
+            title: "Holy Forever",
+            artist: "Chris Tomlin",
+            bpm: 72.0,
+            musicalKey: "B",
+            sections: [],
+            announceSongEnabled: true
+        )
+        let songData = try JSONEncoder().encode(song)
+        let decodedSong = try JSONDecoder().decode(Song.self, from: songData)
+        #expect(decodedSong.announceSongEnabled == true)
+
+        let entry = SongPackageMetadata(
+            title: "Holy Forever",
+            artist: "Chris Tomlin",
+            bpm: 72.0,
+            musicalKey: "B",
+            announceSongEnabled: true
+        )
+        let entryData = try JSONEncoder().encode(entry)
+        let decodedEntry = try JSONDecoder().decode(SongPackageMetadata.self, from: entryData)
+        #expect(decodedEntry.announceSongEnabled == true)
+
+        // Backward compatibility when field is absent in older .pbsong / .pbsession files
+        var rawSongObj = try #require(try JSONSerialization.jsonObject(with: songData) as? [String: Any])
+        rawSongObj.removeValue(forKey: "announceSongEnabled")
+        let legacySongData = try JSONSerialization.data(withJSONObject: rawSongObj)
+        let decodedLegacySong = try JSONDecoder().decode(Song.self, from: legacySongData)
+        #expect(decodedLegacySong.announceSongEnabled == false)
+
+        var rawEntryObj = try #require(try JSONSerialization.jsonObject(with: entryData) as? [String: Any])
+        rawEntryObj.removeValue(forKey: "announceSongEnabled")
+        let legacyEntryData = try JSONSerialization.data(withJSONObject: rawEntryObj)
+        let decodedLegacyEntry = try JSONDecoder().decode(SongPackageMetadata.self, from: legacyEntryData)
+        #expect(decodedLegacyEntry.announceSongEnabled == false)
+    }
+
+    @Test
+    @MainActor
+    func audioDeviceSelectionPersistsPreferredInterfaceAcrossRelaunchAndPortChanges() throws {
+        let macSpeakers = AudioOutputDevice(id: 10, uid: "BuiltInSpeakerDevice", name: "MacBook Pro Speakers", outputChannelCount: 2)
+        let x32Port1 = AudioOutputDevice(id: 20, uid: "AppleUSBAudioEngine:BEHRINGER:X-USB:14100000", name: "X-USB", outputChannelCount: 16)
+        let x32Port2 = AudioOutputDevice(id: 21, uid: "AppleUSBAudioEngine:BEHRINGER:X-USB:02100000", name: "X-USB", outputChannelCount: 16)
+
+        let suiteName = "com.peanutbutter.tests.deviceref.\(UUID().uuidString)"
+        let suite = try #require(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+
+        // 1. Without a saved preference, resolution picks the macOS System Default
+        let initialResolved = AudioDeviceManager.resolveTargetDevice(
+            from: [macSpeakers, x32Port1],
+            currentSelected: nil,
+            preferredUID: suite.string(forKey: AudioDeviceManager.preferredDeviceUIDKey),
+            preferredName: suite.string(forKey: AudioDeviceManager.preferredDeviceNameKey),
+            systemDefaultID: macSpeakers.id
+        )
+        #expect(initialResolved?.id == macSpeakers.id)
+
+        // 2. Persist X-USB and simulate app relaunch where macOS System Default is still MacBook Speakers
+        AudioDeviceManager.shared.persistPreferredDevice(x32Port1, defaults: suite)
+        let relaunchResolved = AudioDeviceManager.resolveTargetDevice(
+            from: [macSpeakers, x32Port1],
+            currentSelected: nil,
+            preferredUID: suite.string(forKey: AudioDeviceManager.preferredDeviceUIDKey),
+            preferredName: suite.string(forKey: AudioDeviceManager.preferredDeviceNameKey),
+            systemDefaultID: macSpeakers.id
+        )
+        #expect(relaunchResolved?.uid == x32Port1.uid)
+
+        // 3. Port swap (new UID on X-USB) still resolves to X-USB via case-insensitive name fallback
+        let portSwapResolved = AudioDeviceManager.resolveTargetDevice(
+            from: [macSpeakers, AudioOutputDevice(id: 21, uid: x32Port2.uid, name: "x-usb", outputChannelCount: 16)],
+            currentSelected: macSpeakers,
+            preferredUID: suite.string(forKey: AudioDeviceManager.preferredDeviceUIDKey),
+            preferredName: suite.string(forKey: AudioDeviceManager.preferredDeviceNameKey),
+            systemDefaultID: macSpeakers.id
+        )
+        #expect(portSwapResolved?.id == x32Port2.id)
+
+        // 4. Unplugging X-USB temporarily falls back to macOS System Default, then snapping back restores X-USB when reconnected
+        let unpluggedResolved = AudioDeviceManager.resolveTargetDevice(
+            from: [macSpeakers],
+            currentSelected: x32Port1,
+            preferredUID: suite.string(forKey: AudioDeviceManager.preferredDeviceUIDKey),
+            preferredName: suite.string(forKey: AudioDeviceManager.preferredDeviceNameKey),
+            systemDefaultID: macSpeakers.id
+        )
+        #expect(unpluggedResolved?.id == macSpeakers.id)
+
+        let reconnectedResolved = AudioDeviceManager.resolveTargetDevice(
+            from: [macSpeakers, x32Port2],
+            currentSelected: macSpeakers,
+            preferredUID: suite.string(forKey: AudioDeviceManager.preferredDeviceUIDKey),
+            preferredName: suite.string(forKey: AudioDeviceManager.preferredDeviceNameKey),
+            systemDefaultID: macSpeakers.id
+        )
+        #expect(reconnectedResolved?.id == x32Port2.id)
+    }
+
+    @Test
+    @MainActor
+    func busRoutingAndStageSignalsSurviveUIDChangeAndDeviceSwitches() throws {
+        let suiteName = "com.peanutbutter.tests.busrouting.\(UUID().uuidString)"
+        let suite = try #require(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+
+        let engine = MultitrackAudioEngine()
+        engine.cancelAllSessionBackgroundTasks()
+        defer {
+            engine.playbackState = .stopped
+            engine.clearAllTracks()
+        }
+
+        let x32Port1 = AudioOutputDevice(id: 101, uid: "AppleUSB:X32:14200000", name: "X-USB", outputChannelCount: 16)
+        let x32Port2 = AudioOutputDevice(id: 102, uid: "AppleUSB:X32:02100000", name: "X-USB", outputChannelCount: 16)
+        let macSpeakers = AudioOutputDevice(id: 50, uid: "BuiltInSpeakerDevice", name: "MacBook Pro Speakers", outputChannelCount: 2)
+
+        let clickBus = try #require(engine.busses.first(where: { $0.name == "Click" }))
+        let guideBus = try #require(engine.busses.first(where: { $0.name == "Guide" }))
+        let drumsBus = try #require(engine.busses.first(where: { $0.name == "Drums" }))
+        let vocalsBus = try #require(engine.busses.first(where: { $0.name == "Vocals" }))
+
+        clickBus.physicalOutputChannel = "Out 3/4"
+        clickBus.isMono = false
+        guideBus.physicalOutputChannel = "Out 3/4"
+        guideBus.isMono = false
+        drumsBus.physicalOutputChannel = "Out 5/6"
+        drumsBus.isMono = false
+        vocalsBus.physicalOutputChannel = "Out 9"
+        vocalsBus.isMono = true
+
+        engine.isRedundancyEnabled = true
+        engine.redundancyOutputChannel = "Out 15"
+        engine.isSMPTEEnabled = true
+        engine.smpteOutputChannel = "Out 16"
+        engine.smpteFrameRate = .fps25
+
+        engine.saveBusRouting(for: x32Port1, defaults: suite)
+        engine.saveStageSignalPreset(for: x32Port1, defaults: suite)
+
+        // Switching onto 2-ch MacBook Speakers resets active busses for that device without wiping X-USB storage
+        engine.loadBusRouting(for: macSpeakers, defaults: suite)
+        engine.loadStageSignalPreset(for: macSpeakers, defaults: suite)
+        #expect(drumsBus.physicalOutputChannel == "Out 1/2")
+        #expect(vocalsBus.physicalOutputChannel == "Out 1/2")
+        #expect(vocalsBus.isMono == false)
+        #expect(engine.isRedundancyEnabled == false)
+        #expect(engine.isSMPTEEnabled == false)
+
+        // Reconnecting X-USB under a brand-new USB port UID restores every bus & stage signal via name fallback
+        engine.loadBusRouting(for: x32Port2, defaults: suite)
+        engine.loadStageSignalPreset(for: x32Port2, defaults: suite)
+        #expect(clickBus.physicalOutputChannel == "Out 3/4")
+        #expect(guideBus.physicalOutputChannel == "Out 3/4")
+        #expect(drumsBus.physicalOutputChannel == "Out 5/6")
+        #expect(drumsBus.isMono == false)
+        #expect(vocalsBus.physicalOutputChannel == "Out 9")
+        #expect(vocalsBus.isMono == true)
+        #expect(engine.isRedundancyEnabled == true)
+        #expect(engine.redundancyOutputChannel == "Out 15")
+        #expect(engine.isSMPTEEnabled == true)
+        #expect(engine.smpteOutputChannel == "Out 16")
+        #expect(engine.smpteFrameRate == .fps25)
+
+        // Primary UID keys should now also be populated for the new port UID
+        #expect(suite.data(forKey: "Playback_BusRouting_\(x32Port2.uid)") != nil)
+        #expect(suite.data(forKey: "Playback_StageSignals_\(x32Port2.uid)") != nil)
+    }
+
+    @Test
+    @MainActor
+    func clearAllMIDICuesClearsCurrentSongSetlistAndSelection() throws {
+        let engine = MultitrackAudioEngine()
+        engine.cancelAllSessionBackgroundTasks()
+        defer { engine.clearAllTracks() }
+
+        let cue1 = MIDICue(time: 1.0, bus: .lyrics, messageType: .note, primaryValue: 19, secondaryValue: 1)
+        let cue2 = MIDICue(time: 4.0, bus: .lights1, messageType: .note, primaryValue: 24, secondaryValue: 127)
+        let song = Song(
+            title: "Cue Test Song",
+            artist: "Band",
+            bpm: 120.0,
+            musicalKey: "C",
+            sections: [SongSection(name: "Intro", startTime: 0.0, duration: 8.0)],
+            defaultMidiCues: [cue1, cue2],
+            midiCues: [cue1, cue2]
+        )
+
+        engine.currentSetlist = Setlist(name: "MIDI Clear Set", songs: [song])
+        engine.currentSongIndex = 0
+        engine.currentSong = song
+        engine.selectedMIDICueId = cue1.id
+        engine.isNudgingMIDICue = true
+        engine.requestedEditMIDICueId = cue2.id
+
+        engine.clearAllMIDICues()
+
+        #expect(engine.currentSong.midiCues.isEmpty)
+        #expect(engine.currentSong.defaultMidiCues.isEmpty)
+        #expect(engine.currentSetlist.songs[0].midiCues.isEmpty)
+        #expect(engine.currentSetlist.songs[0].defaultMidiCues.isEmpty)
+        #expect(engine.selectedMIDICueId == nil)
+        #expect(engine.isNudgingMIDICue == false)
+        #expect(engine.requestedEditMIDICueId == nil)
+
+        // Calling again when already empty is a clean no-op
+        engine.clearAllMIDICues()
+        #expect(engine.currentSong.midiCues.isEmpty)
+        #expect(engine.selectedMIDICueId == nil)
+        #expect(engine.isNudgingMIDICue == false)
+        #expect(engine.requestedEditMIDICueId == nil)
+    }
+
+    @Test
+    func luxTtsG2pPronouncesParentheticalLiveAsLivePerformance() throws {
+        let g2p = try LuxTtsG2p()
+
+        let whoElseLive = g2p.phonemize(text: "Who Else (Live), Key of A flat.")
+        #expect(whoElseLive.contains("ˈɛls lˈaaɪv,"))
+        #expect(!whoElseLive.contains("ˈɛls, lˈaaɪv"))
+        #expect(!whoElseLive.contains("lˈɪv"))
+        #expect(whoElseLive.contains("ˈeeɪ flˌæt"))
+        #expect(!whoElseLive.contains("ˈeeɪ flˈæt"))
+
+        let praiseYouLive = g2p.phonemize(text: "Praise You (Live), Key of B.")
+        #expect(praiseYouLive.contains("juː lˈaaɪv,"))
+        #expect(!praiseYouLive.contains("lˈɪv"))
+
+        let liveAtShow = g2p.phonemize(text: "Who (Live at Sunset), Key of C.")
+        #expect(liveAtShow.contains("lˈaɪv"))
+        #expect(!liveAtShow.contains("lˈɪv"))
+
+        let mixedVerbAndLive = g2p.phonemize(text: "I Live For You (Live), Key of G.")
+        #expect(mixedVerbAndLive.contains("lˈɪv"))
+        #expect(mixedVerbAndLive.contains("lˈaaɪv"))
+
+        let pureVerb = g2p.phonemize(text: "To Live Is Christ.")
+        #expect(pureVerb.contains("lˈɪv"))
+        #expect(!pureVerb.contains("lˈaɪv"))
+        #expect(!pureVerb.contains("lˈaaɪv"))
+    }
+
+    @Test
+    func voiceCloneTrimRemovesLeadingClickAndDetachedTrailingGruntWhileKeepingSpeech() {
+        let sr = 48_000.0
+        func toneSamples(seconds: Double, amplitude: Float, freq: Double = 220.0) -> [Float] {
+            let count = Int(round(seconds * sr))
+            return (0..<count).map { i in
+                amplitude * Float(sin(2.0 * Double.pi * freq * Double(i) / sr))
+            }
+        }
+        func silenceSamples(seconds: Double) -> [Float] {
+            [Float](repeating: 0.0, count: Int(round(seconds * sr)))
+        }
+        func rmsPeak(_ samples: [Float], from sSec: Double, to eSec: Double) -> Float {
+            let s = max(0, min(samples.count, Int(round(sSec * sr))))
+            let e = max(s, min(samples.count, Int(round(eSec * sr))))
+            guard e > s else { return 0.0 }
+            var peak: Float = 0.0
+            for i in s..<e { peak = max(peak, abs(samples[i])) }
+            return peak
+        }
+
+        // 0.00..0.06s leading blip (-16 dB) -> 0.16s silence -> 0.22..1.20s real speech (-8 dB) -> 0.50s silence -> 1.70..1.84s trailing "mm" grunt (-15 dB)
+        var rawWithBothArtifacts: [Float] = []
+        rawWithBothArtifacts.append(contentsOf: toneSamples(seconds: 0.06, amplitude: 0.15, freq: 140.0))
+        rawWithBothArtifacts.append(contentsOf: silenceSamples(seconds: 0.16))
+        rawWithBothArtifacts.append(contentsOf: toneSamples(seconds: 0.98, amplitude: 0.40, freq: 310.0))
+        rawWithBothArtifacts.append(contentsOf: silenceSamples(seconds: 0.50))
+        rawWithBothArtifacts.append(contentsOf: toneSamples(seconds: 0.14, amplitude: 0.18, freq: 130.0))
+        rawWithBothArtifacts.append(contentsOf: silenceSamples(seconds: 0.10))
+
+        #expect(VoiceCloneService.countBoundaryArtifactIslands(rawWithBothArtifacts, sampleRate: sr) == 2)
+        let cleaned = VoiceCloneService.trimCleanHeadPreserveTail(rawWithBothArtifacts, sampleRate: sr)
+        let cleanedDur = Double(cleaned.count) / sr
+        #expect(cleanedDur > 0.90 && cleanedDur < 1.25)
+        // Main speech peak is preserved; leading blip and trailing grunt were stripped
+        #expect(rmsPeak(cleaned, from: 0.05, to: cleanedDur - 0.05) > 0.35)
+        #expect(VoiceCloneService.countBoundaryArtifactIslands(cleaned, sampleRate: sr) == 0)
+
+        // Short pause between title word ("Key of A") and final word ("Flat", 0.10s gap, 0.26s word) must NOT be dropped
+        var legitimateTwoWords: [Float] = []
+        legitimateTwoWords.append(contentsOf: silenceSamples(seconds: 0.20))
+        legitimateTwoWords.append(contentsOf: toneSamples(seconds: 0.70, amplitude: 0.35, freq: 280.0))
+        legitimateTwoWords.append(contentsOf: silenceSamples(seconds: 0.10))
+        legitimateTwoWords.append(contentsOf: toneSamples(seconds: 0.26, amplitude: 0.32, freq: 340.0))
+        legitimateTwoWords.append(contentsOf: silenceSamples(seconds: 0.15))
+
+        #expect(VoiceCloneService.countBoundaryArtifactIslands(legitimateTwoWords, sampleRate: sr) == 0)
+        let keptLegit = VoiceCloneService.trimCleanHeadPreserveTail(legitimateTwoWords, sampleRate: sr)
+        let keptDur = Double(keptLegit.count) / sr
+        #expect(keptDur > 1.00)
+        #expect(rmsPeak(keptLegit, from: keptDur - 0.25, to: keptDur - 0.05) > 0.25)
+    }
+
+    @Test
+    @MainActor
+    func transitionAnnouncementsRenderAcrossAutoLinkOverlapCrossfadeSeekPreRollAndExcludedSong() throws {
+        let sampleRate = 48_000.0
+        let blockFrames = 512
+
+        func renderRange(mixState: RealTimeMixEngineState, totalSeconds: TimeInterval) -> [Float] {
+            var maxPerChannel = [Float](repeating: 0.0, count: 4)
+            let blocks = max(1, Int(ceil((totalSeconds * sampleRate) / Double(blockFrames))))
+            var c0 = [Float](repeating: 0.0, count: blockFrames)
+            var c1 = [Float](repeating: 0.0, count: blockFrames)
+            var c2 = [Float](repeating: 0.0, count: blockFrames)
+            var c3 = [Float](repeating: 0.0, count: blockFrames)
+            let ablSize = MemoryLayout<AudioBufferList>.size + 3 * MemoryLayout<AudioBuffer>.size
+            let rawABL = UnsafeMutableRawPointer.allocate(byteCount: ablSize, alignment: MemoryLayout<AudioBufferList>.alignment)
+            defer { rawABL.deallocate() }
+            let abl = rawABL.bindMemory(to: AudioBufferList.self, capacity: 1)
+
+            for _ in 0..<blocks {
+                for i in 0..<blockFrames { c0[i] = 0; c1[i] = 0; c2[i] = 0; c3[i] = 0 }
+                abl.pointee.mNumberBuffers = 4
+                c0.withUnsafeMutableBufferPointer { p0 in
+                    c1.withUnsafeMutableBufferPointer { p1 in
+                        c2.withUnsafeMutableBufferPointer { p2 in
+                            c3.withUnsafeMutableBufferPointer { p3 in
+                                let ablPtr = UnsafeMutableAudioBufferListPointer(abl)
+                                let ptrs = [p0.baseAddress!, p1.baseAddress!, p2.baseAddress!, p3.baseAddress!]
+                                for ch in 0..<4 {
+                                    ablPtr[ch].mNumberChannels = 1
+                                    ablPtr[ch].mDataByteSize = UInt32(blockFrames * MemoryLayout<Float>.size)
+                                    ablPtr[ch].mData = UnsafeMutableRawPointer(ptrs[ch])
+                                }
+                                var isSil: ObjCBool = false
+                                _ = mixState.render(isSilence: &isSil, frameCount: blockFrames, audioBufferList: abl)
+                            }
+                        }
+                    }
+                }
+                let chArr = [c0, c1, c2, c3]
+                for ch in 0..<4 {
+                    for s in chArr[ch] {
+                        let a = abs(s)
+                        if a > maxPerChannel[ch] { maxPerChannel[ch] = a }
+                    }
+                }
+            }
+            return maxPerChannel
+        }
+
+        let annDuration = 1.0
+        let annFrames = Int(round(annDuration * sampleRate))
+        let annBuf = try makeTestPCMBuffer(frequency: 660.0, frameCount: AVAudioFrameCount(annFrames), sampleRate: sampleRate)
+        let guideTrackId = UUID()
+        let mixState = RealTimeMixEngineState()
+
+        let songDur = 10.0
+        let songFrames = Int(round(songDur * sampleRate))
+        let dummySilent = try makeTestPCMBuffer(frequency: 0.0, frameCount: AVAudioFrameCount(songFrames), sampleRate: sampleRate)
+        if let d0 = dummySilent.floatChannelData?[0], let d1 = dummySilent.floatChannelData?[1] {
+            for i in 0..<songFrames { d0[i] = 0; d1[i] = 0 }
+        }
+        let nextStem = try makeTestPCMBuffer(frequency: 440.0, frameCount: AVAudioFrameCount(songFrames), sampleRate: sampleRate)
+
+        let guideEntry = RenderTrackEntry(
+            trackId: guideTrackId,
+            peakIndex: 0,
+            leftPtr: dummySilent.floatChannelData![0],
+            rightPtr: dummySilent.floatChannelData![1],
+            frameLength: Int64(songFrames),
+            gainL: 0.0,
+            gainR: 0.0,
+            isClickOrGuide: true,
+            isTimelineAligned: true,
+            outChannelL: 2,
+            outChannelR: 3
+        )
+        let nextMusicEntry = RenderTrackEntry(
+            trackId: UUID(),
+            peakIndex: 0,
+            leftPtr: nextStem.floatChannelData![0],
+            rightPtr: nextStem.floatChannelData![1],
+            frameLength: Int64(songFrames),
+            gainL: 1.0,
+            gainR: 1.0,
+            isClickOrGuide: false,
+            isTimelineAligned: false,
+            outChannelL: 0,
+            outChannelR: 1
+        )
+
+        let endingSections = [
+            SongSection(name: "Chorus", abbreviation: "C", startTime: 0.0, audioStartTime: 0.0, duration: 5.0, startMeasure: 1, measureCount: 2, playSectionGuideCue: false),
+            SongSection(name: "Ending", abbreviation: "E", startTime: 5.0, audioStartTime: 5.0, duration: 5.0, startMeasure: 3, measureCount: 3, playSectionGuideCue: false)
+        ]
+        let nextSong = Song(
+            title: "Who Else (Live)",
+            artist: "Band",
+            bpm: 120.0,
+            timeSignatureNumerator: 4,
+            timeSignatureDenominator: 4,
+            musicalKey: "Ab",
+            sections: [SongSection(name: "Count In", abbreviation: "Co", startTime: 0.0, duration: 2.0, startMeasure: 1, measureCount: 1)],
+            announceSongEnabled: true
+        )
+
+        // Verify all 3 modes (autoLink, overlap, crossfade) + excludesClickAndGuide outgoing song + deadline re-anchoring
+        for mode in [SongTransitionType.autoLink, .overlap, .crossfade] {
+            let songA = Song(
+                title: "Excluded Opener",
+                artist: "Band",
+                bpm: 120.0,
+                timeSignatureNumerator: 4,
+                timeSignatureDenominator: 4,
+                musicalKey: "C",
+                sections: endingSections,
+                transitionType: mode,
+                excludesClickAndGuide: true
+            )
+            let timing = try #require(
+                MultitrackAudioEngine.transitionAnnouncementTiming(
+                    from: songA,
+                    currentDuration: songDur,
+                    to: nextSong,
+                    announcementDuration: annDuration,
+                    nextSongCueFirstBeatTime: nil
+                )
+            )
+            let transitionSec: TimeInterval = {
+                switch mode {
+                case .autoLink: return 10.0
+                case .overlap: return 8.0
+                case .crossfade: return 6.0
+                default: return 10.0
+                }
+            }()
+            #expect(timing.startTime + annDuration <= transitionSec - 0.24)
+            #expect(timing.deadline <= transitionSec - 0.04)
+
+            let transFrame = Int64(round(transitionSec * sampleRate))
+            let startFrame = Int64(round(timing.startTime * sampleRate))
+            let deadlineFrame = Int64(round(timing.deadline * sampleRate))
+
+            mixState.configure(
+                sampleRate: sampleRate,
+                totalDuration: songDur,
+                slices: [RenderTimelineSlice(timelineStartFrame: 0, timelineEndFrame: Int64(songFrames), sourceStartFrame: 0)],
+                tracks: [guideEntry],
+                retainedBuffers: [dummySilent, nextStem],
+                loopActive: false,
+                loopIsSingle: false,
+                loopStart: 0.0,
+                loopEnd: 0.0,
+                masterGain: 1.0,
+                transitionMode: mode,
+                transitionStartFrame: transFrame,
+                nextTotalTimelineFrames: Int64(songFrames),
+                nextSlices: [RenderTimelineSlice(timelineStartFrame: 0, timelineEndFrame: Int64(songFrames), sourceStartFrame: 0)],
+                nextTracks: [nextMusicEntry]
+            )
+            mixState.configureTransitionAnnouncement(
+                enabled: true,
+                buffer: annBuf,
+                startFrame: startFrame,
+                deadlineFrame: deadlineFrame,
+                trackId: guideTrackId,
+                gainL: 1.0,
+                gainR: 1.0,
+                outL: 2,
+                outR: 3
+            )
+
+            // 1. Seek slightly AFTER scheduled start (leaving 0.1s extra headroom before deadline): still re-anchors and plays!
+            let lateButValidSeek = timing.startTime + 0.10
+            mixState.setPlayhead(seconds: lateButValidSeek, resumePlaying: true)
+            let beforeTransition = renderRange(mixState: mixState, totalSeconds: max(0.2, transitionSec - lateButValidSeek - 0.02))
+            #expect(beforeTransition[2] > 0.05)
+            #expect(beforeTransition[3] > 0.05)
+
+            // 2. Seek TOO late (after deadline - annDuration + 0.15s): stays disarmed so it won't crash into Song B
+            let tooLateSeek = min(songDur - 0.2, timing.deadline - annDuration + 0.15)
+            mixState.setPlayhead(seconds: tooLateSeek, resumePlaying: true)
+            let disarmedPeaks = renderRange(mixState: mixState, totalSeconds: max(0.1, transitionSec - tooLateSeek - 0.02))
+            #expect(disarmedPeaks[2] == 0.0)
+            #expect(disarmedPeaks[3] == 0.0)
+
+            // 3. Start via Section Pre-Roll (startPreRoll) earlier than scheduled start: arms cleanly!
+            let preRollStartFrame = max(0, startFrame - Int64(round(0.5 * sampleRate)))
+            mixState.startPreRoll(preRollStartFrame: preRollStartFrame, targetDownbeatFrame: preRollStartFrame + 4800)
+            mixState.setPlaying(true)
+            let preRollPeaks = renderRange(mixState: mixState, totalSeconds: 1.8)
+            #expect(preRollPeaks[2] > 0.05)
+            #expect(preRollPeaks[3] > 0.05)
+
+            _ = songA.id
+        }
+    }
 }

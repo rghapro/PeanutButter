@@ -335,6 +335,25 @@ public final class AudioSampleBank: @unchecked Sendable {
     }
     
     // MARK: - Rita Voice Phrases Loading
+
+    public func hasRitaPhraseSample(phrase: String) -> Bool {
+        let normalized = normalizePhraseKey(phrase)
+        guard !normalized.isEmpty, let base = audioBaseURL() else { return false }
+        let fm = FileManager.default
+        if let cueFilename = ritaDynamicCueMap[normalized] {
+            let cueURL = base.appendingPathComponent("Dynamic Cues").appendingPathComponent(cueFilename)
+            if fm.fileExists(atPath: cueURL.path) {
+                return true
+            }
+        }
+        if let secFilename = ritaSectionMap[normalized] {
+            let secURL = base.appendingPathComponent("Song Sections").appendingPathComponent(secFilename)
+            if fm.fileExists(atPath: secURL.path) {
+                return true
+            }
+        }
+        return false
+    }
     
     public func getRitaPhraseSample(
         phrase: String,
@@ -382,6 +401,44 @@ public final class AudioSampleBank: @unchecked Sendable {
         return loadPhraseData(at: url, targetFormat: targetFormat)
     }
     
+    /// Computes the perceptual vowel-attack onset offset (in seconds, clamped to 0...0.18s)
+    /// for a spoken guide buffer without running sample-trimming or syllable compression.
+    public func computePerceptualOnsetOffset(buffer: AVAudioPCMBuffer) -> TimeInterval {
+        computeOnsetOffset(buffer: buffer)
+    }
+
+    /// Returns prioritized studio Rita WAV URLs paired with exact spoken transcripts for zero-shot voice cloning.
+    public func ritaReferenceClipCandidates() -> [(url: URL, transcript: String)] {
+        guard let base = audioBaseURL() else { return [] }
+        let orderedKeys: [(key: String, spoken: String, isDynamic: Bool)] = [
+            ("key change up", "key change up", true),
+            ("worship freely", "worship freely", true),
+            ("slowly build", "slowly build", true),
+            ("big ending", "big ending", true),
+            ("pre chorus 1", "pre chorus one", false),
+            ("instrumental", "instrumental", false),
+            ("breakdown", "breakdown", false),
+            ("interlude", "interlude", false),
+            ("key change down", "key change down", true),
+            ("last time", "last time", true),
+            ("chorus 1", "chorus one", false),
+            ("bridge 1", "bridge one", false)
+        ]
+
+        var results: [(url: URL, transcript: String)] = []
+        let fm = FileManager.default
+        for item in orderedKeys {
+            let folderName = item.isDynamic ? "Dynamic Cues" : "Song Sections"
+            let filename = item.isDynamic ? ritaDynamicCueMap[item.key] : ritaSectionMap[item.key]
+            guard let filename else { continue }
+            let url = base.appendingPathComponent(folderName).appendingPathComponent(filename)
+            if fm.fileExists(atPath: url.path) {
+                results.append((url, item.spoken))
+            }
+        }
+        return results
+    }
+
     public func invalidateCachedBuffers(matchingPathPrefix prefix: String) {
         lock.lock()
         bufferCache = bufferCache.filter { !$0.key.hasPrefix(prefix) }

@@ -102,6 +102,18 @@ public final class GuideAudioGenerator: @unchecked Sendable {
     
     /// Returns formatted display name for the voice (e.g. "Rita", "Zoe (Premium)", "Nicky (Siri)", "Samantha")
     public func displayName(for voice: GuideVoice) -> String {
+        if voice.isCloneActive {
+            return "Match Guide Voice (AI Clone)"
+        }
+        if let clonedId = voice.clonedPackId {
+            if let packName = CustomSampleLibraryManager.shared.guidePack(forId: clonedId)?.name {
+                return "\(packName) (AI Clone)"
+            }
+            if clonedId.caseInsensitiveCompare("rita") == .orderedSame {
+                return "Rita (AI Clone)"
+            }
+            return "Custom Guide (AI Clone)"
+        }
         if let customId = voice.customPackId {
             return CustomSampleLibraryManager.shared.guidePack(forId: customId)?.name ?? "Custom Guide"
         }
@@ -365,12 +377,88 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         return Self.combineSpeechChunks(collectedChunks)
     }
     
+    public func clearSpeechCache() {
+        cacheLock.lock()
+        speechCache.removeAll()
+        cacheLock.unlock()
+    }
+
+    /// Resolves a primary `GuideVoice` to an actually installed voice/pack on disk so stale or missing
+    /// custom pack IDs degrade cleanly to the user's configured default guide voice instead of falling back on every cue.
+    public func effectivePrimaryVoice(for voice: GuideVoice) -> GuideVoice {
+        if let customPackId = voice.customPackId {
+            if CustomSampleLibraryManager.shared.guidePack(forId: customPackId) != nil {
+                return voice
+            }
+            return CustomSampleLibraryManager.shared.defaultGuideVoice
+        }
+        if voice == .rita || voice.rawValue.caseInsensitiveCompare("rita") == .orderedSame {
+            if AudioSampleBank.shared.hasSampledGuides {
+                return .rita
+            }
+            if CustomSampleLibraryManager.shared.guidePack(forId: "rita") != nil {
+                return .custom(packId: "rita")
+            }
+            return CustomSampleLibraryManager.shared.defaultGuideVoice
+        }
+        return voice
+    }
+
+    public func resolveCloneTargetPackId(primaryVoice: GuideVoice, fallbackVoice: GuideVoice) -> String? {
+        guard fallbackVoice.isVoiceClone else { return nil }
+        let resolvedPrimary = effectivePrimaryVoice(for: primaryVoice)
+        if fallbackVoice.isCloneActive {
+            if let packId = resolvedPrimary.customPackId {
+                return packId
+            }
+            if (resolvedPrimary == .rita || resolvedPrimary.rawValue.caseInsensitiveCompare("rita") == .orderedSame),
+               (AudioSampleBank.shared.hasSampledGuides || CustomSampleLibraryManager.shared.guidePack(forId: "rita") != nil) {
+                return "rita"
+            }
+            return nil
+        }
+        if let clonedId = fallbackVoice.clonedPackId {
+            if CustomSampleLibraryManager.shared.guidePack(forId: clonedId) != nil ||
+               (clonedId.caseInsensitiveCompare("rita") == .orderedSame && AudioSampleBank.shared.hasSampledGuides) {
+                return clonedId
+            }
+            return resolvedPrimary.customPackId
+        }
+        return nil
+    }
+
     private func resolveFallbackPhrase(
         _ cleanPhrase: String,
+        primaryVoice: GuideVoice,
         fallbackVoice: GuideVoice,
         allowRita: Bool,
         targetFormat: AVAudioFormat
     ) -> SpokenPhraseData? {
+        if let clonePackId = resolveCloneTargetPackId(primaryVoice: primaryVoice, fallbackVoice: fallbackVoice) {
+            if let existingInTarget = CustomSampleLibraryManager.shared.getGuidePhraseSample(
+                phrase: cleanPhrase,
+                packId: clonePackId,
+                targetFormat: targetFormat
+            ) {
+                return existingInTarget
+            }
+            if clonePackId.caseInsensitiveCompare("rita") == .orderedSame,
+               let legacyInTarget = AudioSampleBank.shared.getRitaPhraseSample(
+                   phrase: cleanPhrase,
+                   targetFormat: targetFormat
+               ) {
+                return legacyInTarget
+            }
+            if let cloned = VoiceCloneService.shared.resolvePhraseSync(
+                phrase: cleanPhrase,
+                targetPackId: clonePackId,
+                targetFormat: targetFormat,
+                allowCloningExistingPackPhrase: false
+            ) {
+                return cloned
+            }
+        }
+
         let isRitaFallback = fallbackVoice == .rita || fallbackVoice.rawValue.caseInsensitiveCompare("rita") == .orderedSame
         if let fbPackId = fallbackVoice.customPackId,
            let packSample = CustomSampleLibraryManager.shared.getGuidePhraseSample(
@@ -381,8 +469,8 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             return packSample
         }
         let primaryFallback: GuideVoice
-        if fallbackVoice.isCustom || (isRitaFallback && !allowRita) {
-            primaryFallback = .zoe
+        if fallbackVoice.isCustom || fallbackVoice.isVoiceClone || (isRitaFallback && !allowRita) {
+            primaryFallback = CustomSampleLibraryManager.shared.defaultSystemFallbackVoice
         } else {
             primaryFallback = fallbackVoice
         }
@@ -400,6 +488,158 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         return nil
     }
     
+    /// Returns true when the given phrase has a studio-recorded audio file in `primaryVoice`
+    /// (or in `fallbackVoice`'s AI clone target pack when cloning, since existing studio recordings are never cloned).
+    public func hasRecordedPhraseSample(
+        _ phrase: String,
+        for primaryVoice: GuideVoice,
+        fallbackVoice: GuideVoice? = nil
+    ) -> Bool {
+        let cleanPhrase = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanPhrase.isEmpty else { return false }
+        let normalized = AudioSampleBank.shared.normalizePhraseKey(cleanPhrase)
+        guard !normalized.isEmpty else { return false }
+
+        let resolvedPrimary = effectivePrimaryVoice(for: primaryVoice)
+
+        if let customPackId = resolvedPrimary.customPackId {
+            if let pack = CustomSampleLibraryManager.shared.guidePack(forId: customPackId) {
+                if pack.fileURL(forNormalizedPhrase: normalized) != nil {
+                    return true
+                }
+                if pack.isBundled,
+                   CustomSampleLibraryManager.shared.userCustomGuidePacks.contains(where: { $0.fileURL(forNormalizedPhrase: normalized) != nil }) {
+                    return true
+                }
+            }
+        } else if resolvedPrimary == .rita || resolvedPrimary.rawValue.caseInsensitiveCompare("rita") == .orderedSame {
+            if AudioSampleBank.shared.hasRitaPhraseSample(phrase: cleanPhrase) {
+                return true
+            }
+            if CustomSampleLibraryManager.shared.userCustomGuidePacks.contains(where: { $0.fileURL(forNormalizedPhrase: normalized) != nil }) {
+                return true
+            }
+            let defVoice = CustomSampleLibraryManager.shared.defaultGuideVoice
+            if defVoice != .rita && defVoice.rawValue.caseInsensitiveCompare("rita") != .orderedSame,
+               defVoice.customPackId != nil,
+               hasRecordedPhraseSample(cleanPhrase, for: defVoice) {
+                return true
+            }
+        } else {
+            return true
+        }
+
+        if let fb = fallbackVoice,
+           fb.isVoiceClone,
+           let clonePackId = resolveCloneTargetPackId(primaryVoice: resolvedPrimary, fallbackVoice: fb) {
+            if CustomSampleLibraryManager.shared.guidePack(forId: clonePackId)?.fileURL(forNormalizedPhrase: normalized) != nil {
+                return true
+            }
+            if clonePackId.caseInsensitiveCompare("rita") == .orderedSame,
+               AudioSampleBank.shared.hasRitaPhraseSample(phrase: cleanPhrase) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    /// Returns unique spoken phrases in the song that lack a recorded studio sample and will use fallback/AI clone synthesis.
+    public func fallbackPhrases(
+        sections: [SongSection],
+        directionalCues: [DirectionalCue],
+        primaryVoice: GuideVoice,
+        guideSource: GuideSource,
+        speakDirectionalCuesOnUploadedGuide: Bool,
+        uploadedOverlayVoice: GuideVoice,
+        fallbackVoice: GuideVoice? = nil
+    ) -> [String] {
+        var orderedCandidates: [(time: TimeInterval, kind: Int, label: String)] = []
+        let checkVoice: GuideVoice
+
+        switch guideSource {
+        case .uploaded:
+            guard speakDirectionalCuesOnUploadedGuide else { return [] }
+            checkVoice = uploadedOverlayVoice
+            for cue in directionalCues {
+                let label = cue.label.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !label.isEmpty {
+                    orderedCandidates.append((cue.time, 1, label))
+                }
+            }
+        case .generated:
+            checkVoice = primaryVoice
+            for sec in sections where !isSectionUnlabeled(sec.name) && sec.playSectionGuideCue {
+                let spoken = simplifySectionNameForSpeech(sec.name, includeNumber: sec.includeNumberInGuide)
+                if !spoken.isEmpty {
+                    orderedCandidates.append((sec.startTime, 0, spoken))
+                }
+            }
+            for cue in directionalCues {
+                let label = cue.label.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !label.isEmpty {
+                    orderedCandidates.append((cue.time, 1, label))
+                }
+            }
+        }
+
+        orderedCandidates.sort {
+            if $0.time != $1.time { return $0.time < $1.time }
+            return $0.kind < $1.kind
+        }
+
+        var seenKeys: Set<String> = []
+        var missing: [String] = []
+        for item in orderedCandidates {
+            let normKey = AudioSampleBank.shared.normalizePhraseKey(item.label)
+            guard !normKey.isEmpty, seenKeys.insert(normKey).inserted else { continue }
+            if !hasRecordedPhraseSample(item.label, for: checkVoice, fallbackVoice: fallbackVoice) {
+                missing.append(item.label)
+            }
+        }
+        return missing
+    }
+
+    /// Synthesizes or loads a single phrase specifically for preview/auditioning through the active fallback path.
+    /// Must be called off the main thread when AI voice clone synthesis is needed.
+    public func resolveFallbackPreviewPhrase(
+        _ phrase: String,
+        primaryVoice: GuideVoice,
+        fallbackVoice: GuideVoice,
+        targetFormat: AVAudioFormat
+    ) -> (data: SpokenPhraseData, usedAIClone: Bool, voiceDisplayName: String)? {
+        let cleanPhrase = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanPhrase.isEmpty else { return nil }
+        let effectivePrimary = effectivePrimaryVoice(for: primaryVoice)
+
+        if VoiceCloneModelManager.isPlatformSupported,
+           VoiceCloneModelManager.isSharedModelReady,
+           let clonePackId = resolveCloneTargetPackId(primaryVoice: effectivePrimary, fallbackVoice: fallbackVoice),
+           let cloned = VoiceCloneService.shared.resolvePhraseSync(
+               phrase: cleanPhrase,
+               targetPackId: clonePackId,
+               targetFormat: targetFormat,
+               allowCloningExistingPackPhrase: false
+           ) {
+            let packName = CustomSampleLibraryManager.shared.guidePack(forId: clonePackId)?.name ?? displayName(for: .clonePack(clonePackId))
+            return (cloned, true, packName)
+        }
+
+        let isRitaFallback = fallbackVoice == .rita || fallbackVoice.rawValue.caseInsensitiveCompare("rita") == .orderedSame
+        let sysVoice: GuideVoice = (fallbackVoice.isVoiceClone || fallbackVoice.isCustom || isRitaFallback)
+            ? CustomSampleLibraryManager.shared.defaultSystemFallbackVoice
+            : fallbackVoice
+        if let resolved = resolvePhraseWithFallbackInfo(
+            cleanPhrase,
+            voice: sysVoice,
+            fallbackVoice: .zoe,
+            targetFormat: targetFormat
+        ) {
+            return (resolved.data, false, displayName(for: sysVoice))
+        }
+        return nil
+    }
+
     /// Synthesizes or retrieves a cached spoken audio buffer for a given phrase and voice,
     /// along with whether resolution fell back from the primary voice/pack to `fallbackVoice`.
     public func resolvePhraseWithFallbackInfo(
@@ -410,9 +650,10 @@ public final class GuideAudioGenerator: @unchecked Sendable {
     ) -> (data: SpokenPhraseData, usedFallback: Bool)? {
         let cleanPhrase = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanPhrase.isEmpty else { return nil }
+        let effectiveVoice = effectivePrimaryVoice(for: voice)
         
         // 0. User & Included Custom Guide Voice sample pack handler
-        if let customPackId = voice.customPackId {
+        if let customPackId = effectiveVoice.customPackId {
             if let customSample = CustomSampleLibraryManager.shared.getGuidePhraseSample(
                 phrase: cleanPhrase,
                 packId: customPackId,
@@ -427,14 +668,14 @@ public final class GuideAudioGenerator: @unchecked Sendable {
                ) {
                 return (userSample, false)
             }
-            if let fb = resolveFallbackPhrase(cleanPhrase, fallbackVoice: fallbackVoice, allowRita: true, targetFormat: targetFormat) {
+            if let fb = resolveFallbackPhrase(cleanPhrase, primaryVoice: effectiveVoice, fallbackVoice: fallbackVoice, allowRita: true, targetFormat: targetFormat) {
                 return (fb, true)
             }
             return nil
         }
         
         // 1. Pre-recorded Rita voice handler
-        if voice == .rita || voice.rawValue.caseInsensitiveCompare("rita") == .orderedSame {
+        if effectiveVoice == .rita || effectiveVoice.rawValue.caseInsensitiveCompare("rita") == .orderedSame {
             if let ritaSample = AudioSampleBank.shared.getRitaPhraseSample(phrase: cleanPhrase, targetFormat: targetFormat) {
                 return (ritaSample, false)
             }
@@ -454,13 +695,13 @@ public final class GuideAudioGenerator: @unchecked Sendable {
                     return (defSample, true)
                 }
             }
-            if let fb = resolveFallbackPhrase(cleanPhrase, fallbackVoice: fallbackVoice, allowRita: false, targetFormat: targetFormat) {
+            if let fb = resolveFallbackPhrase(cleanPhrase, primaryVoice: effectiveVoice, fallbackVoice: fallbackVoice, allowRita: false, targetFormat: targetFormat) {
                 return (fb, true)
             }
             return nil
         }
         
-        let voiceId = systemVoiceIdentifier(for: voice)
+        let voiceId = systemVoiceIdentifier(for: effectiveVoice)
         let cacheKey = "\(voiceId)_\(cleanPhrase.lowercased())"
         
         cacheLock.lock()
@@ -497,7 +738,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         
         // If not cached on disk, synthesize via AVSpeechSynthesizer (neural Siri / natural TTS)
         if fileBuffer == nil {
-            if let synthBuf = synthesizeWithAVSpeech(phrase: cleanPhrase, voice: voice) {
+            if let synthBuf = synthesizeWithAVSpeech(phrase: cleanPhrase, voice: effectiveVoice) {
                 fileBuffer = synthBuf
                 try? FileManager.default.removeItem(at: wavURL)
                 if let file = try? AVAudioFile(forWriting: wavURL, settings: synthBuf.format.settings) {
@@ -505,7 +746,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
                 }
             } else {
                 // Fallback to legacy say CLI with relaxed speech rate (160 wpm)
-                let voiceName = systemVoiceName(for: voice)
+                let voiceName = systemVoiceName(for: effectiveVoice)
                 try? FileManager.default.removeItem(at: wavURL)
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/say")
@@ -1439,7 +1680,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
     }
     
     // Checks whether a section is considered unlabeled
-    private func isSectionUnlabeled(_ name: String) -> Bool {
+    public func isSectionUnlabeled(_ name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return true }
         let lower = trimmed.lowercased()
@@ -1447,7 +1688,7 @@ public final class GuideAudioGenerator: @unchecked Sendable {
     }
     
     // Simplifies section names for natural guide speech (e.g. "Verse 2" -> "Verse" when includeNumber is false)
-    private func simplifySectionNameForSpeech(_ name: String, includeNumber: Bool = true) -> String {
+    public func simplifySectionNameForSpeech(_ name: String, includeNumber: Bool = true) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = trimmed.lowercased()
         if lower.starts(with: "count") || lower.starts(with: "click") {
@@ -1460,5 +1701,217 @@ public final class GuideAudioGenerator: @unchecked Sendable {
             }
         }
         return trimmed
+    }
+
+    // MARK: - Song Announcement Speech Formatting & Resolution
+
+    public static func normalizedSongTitleForSpeech(_ title: String) -> String {
+        var working = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !working.isEmpty else { return "" }
+
+        working = working.replacingOccurrences(of: "&", with: " and ")
+        let fallbackWorking = working.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let strippedLive = fallbackWorking.replacingOccurrences(
+            of: #"(?i)\s*(?:\(\s*live\s*\)|\[\s*live\s*\])"#,
+            with: "",
+            options: .regularExpression
+        )
+        let removedLive = (strippedLive != fallbackWorking)
+        working = strippedLive.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let trailingChars = removedLive ? ".,;:-–—" : ".,;:"
+        while let last = working.last, trailingChars.contains(last) || last.isWhitespace {
+            working.removeLast()
+        }
+        working = working.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if working.isEmpty {
+            working = fallbackWorking
+            while let last = working.last, ".,;:".contains(last) || last.isWhitespace {
+                working.removeLast()
+            }
+            working = working.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !working.isEmpty else { return "" }
+
+        let tokens = working.split(whereSeparator: \.isWhitespace).map { rawSub -> String in
+            let token = String(rawSub)
+            let letters = token.unicodeScalars.filter { CharacterSet.letters.contains($0) }
+            if letters.count >= 2 && letters.allSatisfy({ CharacterSet.uppercaseLetters.contains($0) }) {
+                let lower = token.lowercased()
+                var out = ""
+                var didCap = false
+                for ch in lower {
+                    if !didCap && ch.isLetter {
+                        out.append(contentsOf: String(ch).uppercased())
+                        didCap = true
+                    } else {
+                        out.append(ch)
+                    }
+                }
+                return out
+            }
+            return token
+        }
+        return tokens.joined(separator: " ")
+    }
+
+    public static func songAnnouncementPhrase(title: String, key: String?) -> String {
+        let cleanTitle = normalizedSongTitleForSpeech(title)
+        guard !cleanTitle.isEmpty else { return "" }
+        if let key, let spokenKey = MusicalKeyHelper.spokenKeyName(for: key) {
+            return "\(cleanTitle), Key of \(spokenKey)"
+        }
+        return cleanTitle
+    }
+
+    public static func songAnnouncementPhrase(for song: Song, overrideTransposeSemitones: Int? = nil) -> String {
+        let resolvedKey: String = {
+            if let overrideSemitones = overrideTransposeSemitones {
+                let baseKey = song.musicalKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                if baseKey.isEmpty || baseKey == "—" {
+                    return overrideSemitones != 0
+                        ? MusicalKeyHelper.transposedKey(originalKey: "C", semitones: overrideSemitones)
+                        : ""
+                }
+                return MusicalKeyHelper.transposedKey(originalKey: baseKey, semitones: overrideSemitones)
+            }
+            let eff = song.currentTransposedKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !eff.isEmpty && eff != "—" {
+                return eff
+            }
+            return song.musicalKey
+        }()
+        return songAnnouncementPhrase(title: song.title, key: resolvedKey)
+    }
+
+    private func existingCloneablePackId(for voice: GuideVoice) -> String? {
+        if let clonedId = voice.clonedPackId {
+            if CustomSampleLibraryManager.shared.guidePack(forId: clonedId) != nil {
+                return clonedId
+            }
+            if clonedId.caseInsensitiveCompare("rita") == .orderedSame && AudioSampleBank.shared.hasSampledGuides {
+                return "rita"
+            }
+        }
+        if let packId = voice.customPackId,
+           CustomSampleLibraryManager.shared.guidePack(forId: packId) != nil {
+            return packId
+        }
+        if (voice == .rita || voice.rawValue.caseInsensitiveCompare("rita") == .orderedSame),
+           (AudioSampleBank.shared.hasSampledGuides || CustomSampleLibraryManager.shared.guidePack(forId: "rita") != nil) {
+            return "rita"
+        }
+        return nil
+    }
+
+    public func resolveSongAnnouncementClonePackId(for song: Song) -> String? {
+        if song.guideFallbackVoice.isVoiceClone,
+           let explicitClone = existingCloneablePackId(for: song.guideFallbackVoice) {
+            return explicitClone
+        }
+        if song.guideSource == .uploaded {
+            if let songPack = existingCloneablePackId(for: song.guideVoice) {
+                return songPack
+            }
+            if let defPack = existingCloneablePackId(for: CustomSampleLibraryManager.shared.defaultGuideVoice) {
+                return defPack
+            }
+        } else {
+            let effPrimary = effectivePrimaryVoice(for: song.guideVoice)
+            if let primaryPack = existingCloneablePackId(for: effPrimary) {
+                return primaryPack
+            }
+        }
+        if let prefPack = existingCloneablePackId(for: CustomSampleLibraryManager.shared.preferredDefaultVoiceCloneVoice) {
+            return prefPack
+        }
+        if let defPack = existingCloneablePackId(for: CustomSampleLibraryManager.shared.defaultGuideVoice) {
+            return defPack
+        }
+        return nil
+    }
+
+    public func resolveSongAnnouncementFallbackVoice(for song: Song) -> GuideVoice {
+        let fb = song.guideFallbackVoice
+        let isFbLegacy = fb == .rita || fb.rawValue.caseInsensitiveCompare("rita") == .orderedSame
+        if !fb.isVoiceClone && !fb.isCustom && !isFbLegacy {
+            return fb
+        }
+        let primary = song.guideVoice
+        let isPrimaryLegacy = primary == .rita || primary.rawValue.caseInsensitiveCompare("rita") == .orderedSame
+        if !primary.isVoiceClone && !primary.isCustom && !isPrimaryLegacy && !primary.rawValue.isEmpty {
+            return primary
+        }
+        return CustomSampleLibraryManager.shared.defaultSystemFallbackVoice
+    }
+
+    public func resolveSongAnnouncementSyncIfCached(
+        for song: Song,
+        targetFormat: AVAudioFormat
+    ) -> (data: SpokenPhraseData, usedAIClone: Bool, packId: String?)? {
+        let phrase = Self.songAnnouncementPhrase(for: song)
+        guard !phrase.isEmpty else { return nil }
+
+        if VoiceCloneModelManager.isPlatformSupported,
+           VoiceCloneModelManager.isSharedModelReady,
+           let packId = resolveSongAnnouncementClonePackId(for: song) {
+            if let cloned = VoiceCloneService.shared.resolvePhraseSync(
+                phrase: phrase,
+                targetPackId: packId,
+                targetFormat: targetFormat,
+                allowCloningExistingPackPhrase: false,
+                enqueueBackgroundIfMissing: false
+            ) {
+                return (cloned, true, packId)
+            }
+            return nil
+        }
+
+        let fallbackVoice = resolveSongAnnouncementFallbackVoice(for: song)
+        let effectiveSys = effectivePrimaryVoice(for: fallbackVoice)
+        let voiceId = systemVoiceIdentifier(for: effectiveSys)
+        let cacheKey = "\(voiceId)_\(phrase.lowercased())"
+        cacheLock.lock()
+        let cached = speechCache[cacheKey]
+        cacheLock.unlock()
+        if let cached, cached.buffer.format == targetFormat {
+            return (cached, false, nil)
+        }
+        return nil
+    }
+
+    public func resolveSongAnnouncement(
+        for song: Song,
+        targetFormat: AVAudioFormat
+    ) -> (data: SpokenPhraseData, usedAIClone: Bool, packId: String?)? {
+        let phrase = Self.songAnnouncementPhrase(for: song)
+        guard !phrase.isEmpty else { return nil }
+
+        if VoiceCloneModelManager.isPlatformSupported,
+           VoiceCloneModelManager.isSharedModelReady,
+           let packId = resolveSongAnnouncementClonePackId(for: song),
+           let cloned = VoiceCloneService.shared.resolvePhraseSync(
+               phrase: phrase,
+               targetPackId: packId,
+               targetFormat: targetFormat,
+               allowCloningExistingPackPhrase: false
+           ) {
+            return (cloned, true, packId)
+        }
+
+        let fallbackVoice = resolveSongAnnouncementFallbackVoice(for: song)
+        if let synth = getOrSynthesizePhrase(phrase, voice: fallbackVoice, fallbackVoice: .zoe, targetFormat: targetFormat) {
+            return (synth, false, nil)
+        }
+        for backup in [GuideVoice.zoe, GuideVoice(rawValue: "Samantha"), GuideVoice(rawValue: "system")] {
+            if let synth = getOrSynthesizePhrase(phrase, voice: backup, fallbackVoice: backup, targetFormat: targetFormat) {
+                return (synth, false, nil)
+            }
+        }
+        return nil
     }
 }

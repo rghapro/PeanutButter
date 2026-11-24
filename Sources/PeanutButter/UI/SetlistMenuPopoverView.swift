@@ -43,6 +43,7 @@ public struct SetlistMenuPopoverView: View {
     private enum PendingSaveTarget {
         case quick
         case cloudLibrary
+        case moveToCloud
     }
 
     @State private var statusMessage: String? = nil
@@ -89,12 +90,15 @@ public struct SetlistMenuPopoverView: View {
         .onAppear {
             library.refreshSetlists()
         }
-        .alert("Save Setlist", isPresented: $showSaveNotesAlert) {
+        .alert(
+            pendingSaveTarget == .moveToCloud ? "Move Setlist to Cloud" : "Save Setlist",
+            isPresented: $showSaveNotesAlert
+        ) {
             TextField("Describe your changes (optional)", text: $saveNotesText)
             Button("Cancel", role: .cancel) {
                 pendingSaveTarget = nil
             }
-            Button("Save") {
+            Button(pendingSaveTarget == .moveToCloud ? "Move to Cloud" : "Save") {
                 let notes = saveNotesText.trimmingCharacters(in: .whitespacesAndNewlines)
                 let desc = notes.isEmpty ? nil : notes
                 let target = pendingSaveTarget
@@ -104,12 +108,18 @@ public struct SetlistMenuPopoverView: View {
                     saveSessionQuick(changeDescription: desc)
                 case .cloudLibrary:
                     saveSessionToLibrary(cloud: true, changeDescription: desc)
+                case .moveToCloud:
+                    moveCurrentSetlistToCloud(changeDescription: desc)
                 case .none:
                     break
                 }
             }
         } message: {
-            Text("Add a short note describing your changes so other users know what was updated.")
+            Text(
+                pendingSaveTarget == .moveToCloud
+                    ? "This saves the setlist to Cloud Setlists and removes the duplicate local copy from this device. Add a short note for your team if needed."
+                    : "Add a short note describing your changes so other users know what was updated."
+            )
         }
         .alert("Cloud Update Available", isPresented: $showCloudUpdateConfirmAlert, presenting: pendingCloudUpdateItem) { item in
             Button("Cancel", role: .cancel) {
@@ -135,6 +145,59 @@ public struct SetlistMenuPopoverView: View {
         }
     }
     
+    private var currentSetlistLocation: SessionStorageLocation {
+        MultitrackAudioEngine.sessionStorageLocation(
+            for: engine.currentSessionURL,
+            cloudRootURL: library.cloudRootURL
+        )
+    }
+
+    @ViewBuilder
+    private func storageLocationBadge(_ location: SessionStorageLocation) -> some View {
+        let iconName: String = {
+            switch location {
+            case .cloud: return "icloud.fill"
+            case .local: return "internaldrive"
+            case .unsaved: return "doc"
+            }
+        }()
+        let fgColor: Color = {
+            switch location {
+            case .cloud: return Color(red: 0.45, green: 0.80, blue: 1.0)
+            case .local: return Color(white: 0.65)
+            case .unsaved: return Color(white: 0.60)
+            }
+        }()
+        let bgColor: Color = {
+            switch location {
+            case .cloud: return Color(red: 0.12, green: 0.24, blue: 0.34)
+            case .local: return Color(white: 0.20)
+            case .unsaved: return Color(white: 0.18)
+            }
+        }()
+        let helpText: String = {
+            switch location {
+            case .cloud: return "Loaded from Cloud Setlists"
+            case .local: return "Loaded from Local Setlists"
+            case .unsaved: return "Not yet saved to Local or Cloud Setlists"
+            }
+        }()
+
+        HStack(spacing: 3) {
+            Image(systemName: iconName)
+                .font(.system(size: 8.5))
+            Text(location.rawValue)
+                .font(.system(size: 9, weight: .bold))
+        }
+        .foregroundColor(fgColor)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1.5)
+        .background(bgColor)
+        .cornerRadius(3)
+        .fixedSize()
+        .help(helpText)
+    }
+
     // MARK: - 1. Main Setlists View
     
     private var mainSetlistsView: some View {
@@ -238,10 +301,14 @@ public struct SetlistMenuPopoverView: View {
                                 setlistThumbnail
                                 
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(engine.currentSetlist.name.isEmpty ? "Untitled Setlist" : engine.currentSetlist.name)
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .foregroundColor(.white)
-                                        .lineLimit(1)
+                                    HStack(spacing: 6) {
+                                        Text(engine.currentSetlist.name.isEmpty ? "Untitled Setlist" : engine.currentSetlist.name)
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .foregroundColor(.white)
+                                            .lineLimit(1)
+
+                                        storageLocationBadge(currentSetlistLocation)
+                                    }
                                     
                                     // User entered date and time!
                                     Text(engine.currentSetlist.formattedUserDateTime)
@@ -307,9 +374,16 @@ public struct SetlistMenuPopoverView: View {
                         
                         // Save
                         menuRow(title: "Save", showChevron: false) {
-                            saveNotesText = ""
-                            pendingSaveTarget = .quick
-                            showSaveNotesAlert = true
+                            switch currentSetlistLocation {
+                            case .cloud:
+                                saveNotesText = ""
+                                pendingSaveTarget = .quick
+                                showSaveNotesAlert = true
+                            case .local:
+                                saveSessionQuick(changeDescription: nil)
+                            case .unsaved:
+                                saveSessionToLibrary(cloud: false)
+                            }
                         }
                         
                         rowDivider
@@ -319,20 +393,34 @@ public struct SetlistMenuPopoverView: View {
                             saveSessionAsNew()
                         }
 
-                        if library.isCloudConnected {
-                            rowDivider
-
-                            menuRow(title: "Save to Cloud Setlists", showChevron: false) {
-                                saveNotesText = ""
-                                pendingSaveTarget = .cloudLibrary
-                                showSaveNotesAlert = true
+                        switch currentSetlistLocation {
+                        case .local:
+                            if library.isCloudConnected {
+                                rowDivider
+                                menuRow(title: "Move to Cloud", showChevron: false) {
+                                    saveNotesText = ""
+                                    pendingSaveTarget = .moveToCloud
+                                    showSaveNotesAlert = true
+                                }
                             }
-                        }
-
-                        rowDivider
-
-                        menuRow(title: "Save to Local Setlists", showChevron: false) {
-                            saveSessionToLibrary(cloud: false)
+                        case .cloud:
+                            rowDivider
+                            menuRow(title: "Duplicate to Local", showChevron: false) {
+                                duplicateCurrentSetlistToLocal()
+                            }
+                        case .unsaved:
+                            if library.isCloudConnected {
+                                rowDivider
+                                menuRow(title: "Save to Cloud Setlists", showChevron: false) {
+                                    saveNotesText = ""
+                                    pendingSaveTarget = .cloudLibrary
+                                    showSaveNotesAlert = true
+                                }
+                            }
+                            rowDivider
+                            menuRow(title: "Save to Local Setlists", showChevron: false) {
+                                saveSessionToLibrary(cloud: false)
+                            }
                         }
 
                         rowDivider
@@ -353,7 +441,7 @@ public struct SetlistMenuPopoverView: View {
                             showingDeleteConfirmation = true
                         }) {
                             HStack {
-                                Text("Delete All Setlists From Device")
+                                Text("Delete All Cloud Setlists From Device")
                                     .font(.system(size: 13.5, weight: .medium))
                                     .foregroundColor(Color(red: 0.95, green: 0.25, blue: 0.25))
                                 Spacer()
@@ -365,7 +453,7 @@ public struct SetlistMenuPopoverView: View {
                         }
                         .buttonStyle(.plain)
                         
-                        Text("Deleting Setlists only removes them from this device, your Setlists will still be available in saved files.")
+                        Text("Removes downloaded Cloud setlists and cached Cloud stems from this device. Your Cloud files and all Local setlists and songs stay untouched.")
                             .font(.system(size: 10))
                             .foregroundColor(Color(white: 0.48))
                             .padding(.horizontal, 16)
@@ -383,15 +471,25 @@ public struct SetlistMenuPopoverView: View {
                 }
             }
         }
-        .alert("Delete All Setlists From Device?", isPresented: $showingDeleteConfirmation) {
+        .alert("Delete All Cloud Setlists From Device?", isPresented: $showingDeleteConfirmation) {
             Button("Cancel", role: .cancel) { }
-            Button("Delete All", role: .destructive) {
-                library.deleteAllCloudSetlistsFromDevice()
-                engine.newSession(name: "New Setlist")
+            Button("Remove Cloud Data", role: .destructive) {
+                let wasCloudSession = (currentSetlistLocation == .cloud)
+                if wasCloudSession {
+                    library.deleteAllCloudSetlistsFromDevice(isActiveSessionCloud: true)
+                    engine.newSession(name: "New Setlist")
+                } else {
+                    let activeIds = engine.activeSessionSongAndTrackIds()
+                    library.deleteAllCloudSetlistsFromDevice(
+                        additionalProtectedSongIds: activeIds.songIds,
+                        additionalProtectedTrackIds: activeIds.trackIds,
+                        isActiveSessionCloud: false
+                    )
+                }
                 onDismiss()
             }
         } message: {
-            Text("Local setlist changes not saved to Cloud will be lost, and all downloaded content will be deleted.")
+            Text("Downloaded Cloud setlists, Cloud song stems, and cached Cloud audio will be removed from this Mac. Your files remain in Cloud, and all Local setlists and Local songs will stay untouched.")
         }
     }
     
@@ -604,10 +702,14 @@ public struct SetlistMenuPopoverView: View {
                         setlistThumbnail
                         
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(engine.currentSetlist.name.isEmpty ? "Untitled Setlist" : engine.currentSetlist.name)
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundColor(.white)
-                                .lineLimit(1)
+                            HStack(spacing: 6) {
+                                Text(engine.currentSetlist.name.isEmpty ? "Untitled Setlist" : engine.currentSetlist.name)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .lineLimit(1)
+
+                                storageLocationBadge(currentSetlistLocation)
+                            }
                             
                             Text(engine.currentSetlist.formattedUserDateTime)
                                 .font(.system(size: 10.5))
@@ -1086,17 +1188,7 @@ public struct SetlistMenuPopoverView: View {
                                                     .foregroundColor(.white)
                                                     .lineLimit(1)
 
-                                                HStack(spacing: 3) {
-                                                    Image(systemName: item.source == .cloud ? "icloud.fill" : "internaldrive")
-                                                        .font(.system(size: 8.5))
-                                                    Text(item.source.rawValue)
-                                                        .font(.system(size: 9, weight: .bold))
-                                                }
-                                                .foregroundColor(item.source == .cloud ? Color(red: 0.45, green: 0.80, blue: 1.0) : Color(white: 0.65))
-                                                .padding(.horizontal, 5)
-                                                .padding(.vertical, 1.5)
-                                                .background(item.source == .cloud ? Color(red: 0.12, green: 0.24, blue: 0.34) : Color(white: 0.2))
-                                                .cornerRadius(3)
+                                                storageLocationBadge(item.source == .cloud ? .cloud : .local)
 
                                                 if setlistHasCloudUpdate(item) {
                                                     HStack(spacing: 3) {
@@ -1140,17 +1232,33 @@ public struct SetlistMenuPopoverView: View {
                                         let fileName = LibraryBrowserManager.sanitizedPackageFilename(item.name, ext: "pbsession")
                                         let src = item.url
                                         let dest = cloudSetlistsDir.appendingPathComponent(fileName)
-                                        statusMessage = "Copying to Cloud..."
+                                        let localRootPath = library.setlistsDirectory.standardizedFileURL.path
+                                        let wasCurrent = (engine.currentSessionURL?.standardizedFileURL == src.standardizedFileURL)
+                                        statusMessage = "Moving to Cloud..."
                                         Task.detached(priority: .userInitiated) {
                                             do {
                                                 try PlaybackFileManager.shared.copyLibraryPackage(from: src, to: dest, isSong: false)
+                                                let fm = FileManager.default
+                                                if fm.fileExists(atPath: dest.path),
+                                                   src.standardizedFileURL != dest.standardizedFileURL {
+                                                    let localPrefix = localRootPath.hasSuffix("/") ? localRootPath : localRootPath + "/"
+                                                    if src.standardizedFileURL.path.hasPrefix(localPrefix) {
+                                                        try? fm.removeItem(at: src)
+                                                    }
+                                                }
                                                 await MainActor.run {
+                                                    if wasCurrent {
+                                                        engine.currentSessionURL = dest
+                                                        engine.currentSessionLoadedModDate = LibraryBrowserManager.packageModificationDate(at: dest)
+                                                        UserDefaults.standard.set(dest.path, forKey: "Playback_LastSessionPath")
+                                                        engine.updateCloudSetlistUpdateFlag(from: library.setlists)
+                                                    }
                                                     statusMessage = nil
                                                     library.refreshSetlists()
                                                 }
                                             } catch {
                                                 await MainActor.run {
-                                                    statusMessage = "Copy to Cloud failed: \(error.localizedDescription)"
+                                                    statusMessage = "Move to Cloud failed: \(error.localizedDescription)"
                                                 }
                                             }
                                         }
@@ -1163,23 +1271,30 @@ public struct SetlistMenuPopoverView: View {
                                             .cornerRadius(5)
                                     }
                                     .buttonStyle(.plain)
-                                    .help("Copy Setlist to Cloud Library")
+                                    .help("Move Setlist to Cloud Library")
                                 } else if item.source == .cloud {
                                     Button(action: {
-                                        let fileName = LibraryBrowserManager.sanitizedPackageFilename(item.name, ext: "pbsession")
+                                        let localDir = library.setlistsDirectory
+                                        let uniqueName = LibraryBrowserManager.uniqueLocalCopyName(baseName: item.name, in: localDir)
+                                        let fileName = LibraryBrowserManager.sanitizedPackageFilename(uniqueName, ext: "pbsession")
                                         let src = item.url
-                                        let dest = library.setlistsDirectory.appendingPathComponent(fileName)
-                                        statusMessage = "Downloading to Local..."
+                                        let dest = localDir.appendingPathComponent(fileName)
+                                        statusMessage = "Duplicating to Local..."
                                         Task.detached(priority: .userInitiated) {
                                             do {
-                                                try PlaybackFileManager.shared.copyLibraryPackage(from: src, to: dest, isSong: false)
+                                                try PlaybackFileManager.shared.copyLibraryPackage(
+                                                    from: src,
+                                                    to: dest,
+                                                    isSong: false,
+                                                    overrideSetlistName: uniqueName
+                                                )
                                                 await MainActor.run {
                                                     statusMessage = nil
                                                     library.refreshSetlists()
                                                 }
                                             } catch {
                                                 await MainActor.run {
-                                                    statusMessage = "Copy to Local failed: \(error.localizedDescription)"
+                                                    statusMessage = "Duplicate to Local failed: \(error.localizedDescription)"
                                                 }
                                             }
                                         }
@@ -1192,7 +1307,7 @@ public struct SetlistMenuPopoverView: View {
                                             .cornerRadius(5)
                                     }
                                     .buttonStyle(.plain)
-                                    .help("Copy Setlist to Local Library")
+                                    .help("Duplicate Setlist to Local Library")
                                 }
 
                                 Image(systemName: "chevron.right")
@@ -1212,14 +1327,14 @@ public struct SetlistMenuPopoverView: View {
     // MARK: - 5. Library Setlist Detail View
 
     private var currentSetlistCloudUpdateItem: SetlistLibraryItem? {
-        let currentFileName = engine.currentSessionURL?.lastPathComponent.lowercased()
-            ?? LibraryBrowserManager.sanitizedPackageFilename(engine.currentSetlist.name, ext: "pbsession").lowercased()
+        guard currentSetlistLocation == .cloud,
+              let curURL = engine.currentSessionURL?.standardizedFileURL else {
+            return nil
+        }
         return library.setlists.first { item in
-            guard item.source == .cloud, setlistHasCloudUpdate(item) else { return false }
-            if let curURL = engine.currentSessionURL, curURL == item.url {
-                return true
-            }
-            return item.url.lastPathComponent.lowercased() == currentFileName
+            item.source == .cloud &&
+            item.url.standardizedFileURL == curURL &&
+            setlistHasCloudUpdate(item)
         }
     }
 
@@ -1303,10 +1418,14 @@ public struct SetlistMenuPopoverView: View {
                             setlistLibraryThumbnail(item.artworks)
 
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(item.name)
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundColor(.white)
-                                    .lineLimit(1)
+                                HStack(spacing: 6) {
+                                    Text(item.name)
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundColor(.white)
+                                        .lineLimit(1)
+
+                                    storageLocationBadge(item.source == .cloud ? .cloud : .local)
+                                }
 
                                 if !item.formattedDate.isEmpty {
                                     Text(item.formattedDate)
@@ -1614,6 +1733,67 @@ public struct SetlistMenuPopoverView: View {
                 library.refreshSetlists()
             } catch {
                 print("Save error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func moveCurrentSetlistToCloud(changeDescription: String? = nil) {
+        guard let targetDir = library.cloudSetlistsDirectory else {
+            statusMessage = "Cloud Library is not connected."
+            return
+        }
+        let previousLocalURL = engine.currentSessionURL
+        let localRootPath = library.setlistsDirectory.standardizedFileURL.path
+        let defaultName = engine.currentSetlist.name.isEmpty ? "Untitled Session" : engine.currentSetlist.name
+        let fileName = LibraryBrowserManager.sanitizedPackageFilename(defaultName, ext: "pbsession")
+        let destURL = targetDir.appendingPathComponent(fileName)
+        let revisionId = UUID()
+        engine.clearSaveAndCloudUpdateIndicators(revisionId: revisionId, targetURLs: [destURL])
+        onDismiss()
+        Task { @MainActor in
+            do {
+                try await engine.saveSessionAsync(
+                    to: destURL,
+                    changeDescription: changeDescription,
+                    revisionId: revisionId
+                )
+                let fm = FileManager.default
+                if fm.fileExists(atPath: destURL.path),
+                   let oldURL = previousLocalURL,
+                   !LibraryBrowserManager.isURLInCloudLibrary(oldURL),
+                   oldURL.standardizedFileURL != destURL.standardizedFileURL {
+                    let localPrefix = localRootPath.hasSuffix("/") ? localRootPath : localRootPath + "/"
+                    if oldURL.standardizedFileURL.path.hasPrefix(localPrefix) {
+                        try? fm.removeItem(at: oldURL)
+                    }
+                }
+                library.refreshSetlists()
+            } catch {
+                engine.hasUnsavedChanges = true
+                statusMessage = "Move to Cloud failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func duplicateCurrentSetlistToLocal() {
+        let localDir = library.setlistsDirectory
+        let previousName = engine.currentSetlist.name
+        let baseName = previousName.isEmpty ? "Untitled Session" : previousName
+        let uniqueName = LibraryBrowserManager.uniqueLocalCopyName(baseName: baseName, in: localDir)
+        let fileName = LibraryBrowserManager.sanitizedPackageFilename(uniqueName, ext: "pbsession")
+        let destURL = localDir.appendingPathComponent(fileName)
+        let revisionId = UUID()
+        engine.currentSetlist.name = uniqueName
+        engine.clearSaveAndCloudUpdateIndicators(revisionId: revisionId, targetURLs: [destURL])
+        onDismiss()
+        Task { @MainActor in
+            do {
+                try await engine.saveSessionAsync(to: destURL, revisionId: revisionId)
+                library.refreshSetlists()
+            } catch {
+                engine.currentSetlist.name = previousName
+                engine.hasUnsavedChanges = true
+                statusMessage = "Duplicate to Local failed: \(error.localizedDescription)"
             }
         }
     }

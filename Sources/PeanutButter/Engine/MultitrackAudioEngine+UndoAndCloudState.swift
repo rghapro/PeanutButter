@@ -563,14 +563,7 @@ extension MultitrackAudioEngine {
         }
 
         let isSameURL = currentSessionURL.map { $0.standardizedFileURL == item.url.standardizedFileURL } ?? false
-        let matchesOpenSession: Bool = {
-            guard let curURL = currentSessionURL else { return false }
-            if isSameURL { return true }
-            let isLocalSession = !LibraryBrowserManager.isURLInCloudLibrary(curURL)
-            return isLocalSession && item.url.lastPathComponent.lowercased() == curURL.lastPathComponent.lowercased()
-        }()
-
-        guard matchesOpenSession else {
+        guard isSameURL else {
             return item.hasCloudUpdate
         }
 
@@ -589,10 +582,7 @@ extension MultitrackAudioEngine {
             return true
         }
         if let itemRev = item.lastSavedRevisionId, let loadedRev = currentSessionLoadedRevisionId {
-            if isSameURL {
-                return itemRev != loadedRev
-            }
-            return itemRev != loadedRev && (currentSessionLoadedModDate.map { item.modifiedDate > $0 } ?? true)
+            return itemRev != loadedRev
         }
         if let loadedMod = currentSessionLoadedModDate {
             return item.modifiedDate.timeIntervalSince(loadedMod) > 2.0
@@ -601,17 +591,17 @@ extension MultitrackAudioEngine {
     }
 
     public func updateCloudSetlistUpdateFlag(from setlists: [SetlistLibraryItem]) {
-        guard let curURL = currentSessionURL else {
+        guard let curURL = currentSessionURL,
+              LibraryBrowserManager.isURLInCloudLibrary(curURL) else {
             hasCloudSetlistUpdate = false
             return
         }
-        let currentFileName = curURL.lastPathComponent.lowercased()
-        let isLocalSession = !LibraryBrowserManager.isURLInCloudLibrary(curURL)
+        let stdCurURL = curURL.standardizedFileURL
         hasCloudSetlistUpdate = setlists.contains { item in
-            guard item.source == .cloud else { return false }
-            let matchesOpenSession = (curURL.standardizedFileURL == item.url.standardizedFileURL)
-                || (isLocalSession && item.url.lastPathComponent.lowercased() == currentFileName)
-            guard matchesOpenSession else { return false }
+            guard item.source == .cloud,
+                  stdCurURL == item.url.standardizedFileURL else {
+                return false
+            }
             return shouldShowCloudUpdate(for: item)
         }
     }

@@ -696,6 +696,167 @@ public struct SettingsMenuPopoverView: View {
                         .padding(.horizontal, 12)
                         .padding(.bottom, 4)
 
+                        if VoiceCloneModelManager.isPlatformSupported {
+                            let isDefaultClone = customSamples.defaultGuideFallbackVoice.isVoiceClone
+                            let totalSongs = max(1, engine.currentSetlist.songs.count)
+                            VStack(alignment: .leading, spacing: 7) {
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("AI Voice Clone by Default")
+                                            .font(.system(size: 11, weight: .semibold))
+                                            .foregroundColor(.white)
+                                        Text("Applies to default songs (\(engine.defaultFallbackSyncedSongCount) of \(totalSongs))")
+                                            .font(.system(size: 9.5))
+                                            .foregroundColor(Color(white: 0.56))
+                                    }
+
+                                    Spacer(minLength: 4)
+
+                                    Toggle("", isOn: Binding(
+                                        get: { customSamples.defaultGuideFallbackVoice.isVoiceClone },
+                                        set: { enabled in
+                                            if enabled {
+                                                let chosen = resolvedPreferredCloneVoice()
+                                                engine.setDefaultGuideFallbackVoice(chosen, syncDefaultSongs: true)
+                                                onStatus("AI Voice Clone enabled for default songs (\(engine.defaultFallbackSyncedSongCount) of \(totalSongs))")
+                                            } else {
+                                                let sys = customSamples.defaultSystemFallbackVoice
+                                                engine.setDefaultGuideFallbackVoice(sys, syncDefaultSongs: true)
+                                                onStatus("Default Fallback: \(engine.guideAudioGenerator.displayName(for: sys))")
+                                            }
+                                        }
+                                    ))
+                                    .labelsHidden()
+                                    .toggleStyle(SwitchToggleStyle(tint: Color.cyan))
+                                }
+
+                                if isDefaultClone {
+                                    HStack {
+                                        Text("Clone Source")
+                                            .font(.system(size: 10.5, weight: .medium))
+                                            .foregroundColor(Color(white: 0.72))
+                                        Spacer()
+
+                                        Picker("", selection: Binding<String>(
+                                            get: { resolvedDefaultCloneSourceTag() },
+                                            set: { tag in
+                                                let chosen = GuideVoice(rawValue: tag)
+                                                engine.setDefaultGuideFallbackVoice(chosen, syncDefaultSongs: true)
+                                                onStatus("Default Clone Source: \(engine.guideAudioGenerator.displayName(for: chosen))")
+                                            }
+                                        )) {
+                                            Text("Match Guide Voice").tag(GuideVoice.cloneActive.rawValue)
+                                            if AudioSampleBank.shared.hasSampledGuides {
+                                                Text("Studio Voice").tag(GuideVoice.clonePack("rita").rawValue)
+                                            }
+                                            ForEach(customSamples.includedGuidePacks) { pack in
+                                                Text(pack.name).tag(GuideVoice.clonePack(pack.id).rawValue)
+                                            }
+                                            ForEach(customSamples.userCustomGuidePacks) { pack in
+                                                Text(pack.name).tag(GuideVoice.clonePack(pack.id).rawValue)
+                                            }
+                                        }
+                                        .labelsHidden()
+                                        .pickerStyle(.menu)
+                                        .frame(width: 126)
+                                    }
+                                }
+
+                                HStack {
+                                    Text(isDefaultClone ? "System Backup" : "Default Fallback")
+                                        .font(.system(size: 10.5, weight: .medium))
+                                        .foregroundColor(Color(white: 0.72))
+                                    Spacer()
+
+                                    Picker("", selection: Binding<String>(
+                                        get: { resolvedDefaultSystemFallbackTag() },
+                                        set: { tag in
+                                            let chosen = GuideVoice(rawValue: tag)
+                                            engine.setDefaultSystemFallbackVoice(chosen)
+                                            onStatus("\(isDefaultClone ? "System Backup" : "Default Fallback"): \(engine.guideAudioGenerator.displayName(for: chosen))")
+                                        }
+                                    )) {
+                                        if !installedVoices.isEmpty {
+                                            ForEach(installedVoices) { voiceInfo in
+                                                Text(voiceInfo.displayName).tag(voiceInfo.id)
+                                            }
+                                        } else {
+                                            Text("Zoe (Premium)").tag(GuideVoice.zoe.rawValue)
+                                        }
+                                    }
+                                    .labelsHidden()
+                                    .pickerStyle(.menu)
+                                    .frame(width: 126)
+                                }
+
+                                if engine.overriddenFallbackSongCount > 0 {
+                                    let overridden = engine.overriddenFallbackSongCount
+                                    Divider()
+                                        .background(Color.white.opacity(0.08))
+                                    HStack {
+                                        Text("\(overridden) \(overridden == 1 ? "song" : "songs") overridden")
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundColor(Color.orange.opacity(0.95))
+                                        Spacer()
+                                        Button("Apply to All") {
+                                            engine.applyDefaultGuideFallbackToAllSongs()
+                                            onStatus("Applied fallback settings to all \(totalSongs) songs")
+                                        }
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundColor(.cyan)
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                            .padding(8)
+                            .background(Color(white: 0.14))
+                            .cornerRadius(6)
+                            .padding(.leading, 18)
+                            .padding(.trailing, 12)
+                            .padding(.bottom, 2)
+
+                            VoiceCloneModelStatusView(
+                                style: .settingsMenu,
+                                isFeatureActive: isDefaultClone || engine.currentSong.guideFallbackVoice.isVoiceClone
+                            ) {
+                                engine.handleVoiceCloneModelOrPhraseUpdated()
+                                onStatus("Cleared AI voice clone phrase cache")
+                            }
+                            .padding(.leading, 18)
+                            .padding(.trailing, 12)
+                            .padding(.vertical, 2)
+                        } else {
+                            HStack {
+                                Text("Default Fallback")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundColor(Color(white: 0.85))
+                                    .padding(.leading, 32)
+                                Spacer()
+
+                                Picker("", selection: Binding<String>(
+                                    get: { resolvedDefaultSystemFallbackTag() },
+                                    set: { tag in
+                                        let chosen = GuideVoice(rawValue: tag)
+                                        engine.setDefaultSystemFallbackVoice(chosen)
+                                        onStatus("Default Fallback: \(engine.guideAudioGenerator.displayName(for: chosen))")
+                                    }
+                                )) {
+                                    if !installedVoices.isEmpty {
+                                        ForEach(installedVoices) { voiceInfo in
+                                            Text(voiceInfo.displayName).tag(voiceInfo.id)
+                                        }
+                                    } else {
+                                        Text("Zoe (Premium)").tag(GuideVoice.zoe.rawValue)
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
+                                .frame(width: 140)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 4)
+                        }
+
                         Button(action: {
                             isPresented = false
                             withAnimation(.spring(response: 0.25, dampingFraction: 0.88)) {
@@ -1143,6 +1304,42 @@ public struct SettingsMenuPopoverView: View {
             return sysId
         }
         return installedVoices.first?.id ?? GuideVoice.rita.rawValue
+    }
+
+    private func resolvedPreferredCloneVoice() -> GuideVoice {
+        let preferred = customSamples.preferredDefaultVoiceCloneVoice
+        if preferred.isCloneActive {
+            return .cloneActive
+        }
+        if let clonedId = preferred.clonedPackId,
+           customSamples.guidePack(forId: clonedId) != nil ||
+           (clonedId.caseInsensitiveCompare("rita") == .orderedSame && AudioSampleBank.shared.hasSampledGuides) {
+            return preferred
+        }
+        return .cloneActive
+    }
+
+    private func resolvedDefaultCloneSourceTag() -> String {
+        let current = customSamples.defaultGuideFallbackVoice
+        if current.isCloneActive {
+            return current.rawValue
+        }
+        if let clonedId = current.clonedPackId {
+            if customSamples.guidePack(forId: clonedId) != nil ||
+               (clonedId.caseInsensitiveCompare("rita") == .orderedSame && AudioSampleBank.shared.hasSampledGuides) {
+                return current.rawValue
+            }
+        }
+        return GuideVoice.cloneActive.rawValue
+    }
+
+    private func resolvedDefaultSystemFallbackTag() -> String {
+        let sysVoice = customSamples.defaultSystemFallbackVoice
+        let sysId = engine.guideAudioGenerator.systemVoiceIdentifier(for: sysVoice)
+        if installedVoices.contains(where: { $0.id == sysId }) {
+            return sysId
+        }
+        return installedVoices.first?.id ?? GuideVoice.zoe.rawValue
     }
     
     private func menuRow(icon: String, title: String, action: @escaping () -> Void) -> some View {

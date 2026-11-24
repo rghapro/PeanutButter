@@ -8,6 +8,12 @@ import QuartzCore
 import SwiftUI
 import os
 
+public enum GuideFallbackPreviewPhase: Equatable, Sendable {
+    case idle
+    case preparing(phrase: String, isAIClone: Bool)
+    case playing(phrase: String, isAIClone: Bool, voiceName: String)
+}
+
 @MainActor
 extension MultitrackAudioEngine {
     public func rebuildPrecomputedBeatGrid() {
@@ -433,9 +439,11 @@ extension MultitrackAudioEngine {
     }
     
     public func clearAllMIDICues() {
-        currentSong.midiCues.removeAll()
         selectedMIDICueId = nil
         isNudgingMIDICue = false
+        requestedEditMIDICueId = nil
+        guard !currentSong.midiCues.isEmpty else { return }
+        currentSong.midiCues.removeAll()
         syncCurrentSongMIDICuesToSetlist()
     }
     
@@ -1596,10 +1604,11 @@ extension MultitrackAudioEngine {
                 var overlayMeterEvents: [GuideCueMeterEvent] = []
                 let activeDirCues = currentSong.directionalCues.filter { !isDirectionalCueTrimmedOut($0) }
                 if currentSong.speakDirectionalCuesOnUploadedGuide && !activeDirCues.isEmpty {
+                    let overlayVoice = effectiveUploadedOverlayVoice(for: currentSong)
                     let dirRes = guideAudioGenerator.overlayDirectionalCuesWithMeterEvents(
                         onto: finalBuf,
                         directionalCues: activeDirCues,
-                        voice: .rita, // directional cues default to Rita, with macOS TTS fallback
+                        voice: overlayVoice,
                         fallbackVoice: currentSong.guideFallbackVoice,
                         cueVolume: currentSong.guideDirectionsVolume,
                         cueEnabled: currentSong.guideDirectionsEnabled,
@@ -1684,6 +1693,8 @@ extension MultitrackAudioEngine {
             currentSetlist.songs[currentSongIndex].usesDefaultGuideVoice = false
         }
         markSessionChanged()
+        songAnnouncementCache.removeValue(forKey: currentSong.id)
+        warmSongAnnouncementsForActiveWindow()
         regenerateGuideTrack()
     }
     
@@ -1696,15 +1707,22 @@ extension MultitrackAudioEngine {
             currentSetlist.songs[currentSongIndex].usesDefaultGuideVoice = true
         }
         markSessionChanged()
+        songAnnouncementCache.removeValue(forKey: currentSong.id)
+        warmSongAnnouncementsForActiveWindow()
         regenerateGuideTrack()
     }
     
     public func setDefaultGuideVoice(_ voice: GuideVoice, syncDefaultSongs: Bool = true) {
         CustomSampleLibraryManager.shared.setDefaultGuideVoice(voice)
-        guard syncDefaultSongs else { return }
+        guard syncDefaultSongs else {
+            songAnnouncementCache.removeAll()
+            warmSongAnnouncementsForActiveWindow()
+            return
+        }
         var updatedCurrent = false
         for i in currentSetlist.songs.indices where currentSetlist.songs[i].usesDefaultGuideVoice {
             currentSetlist.songs[i].guideVoice = voice
+            songAnnouncementCache.removeValue(forKey: currentSetlist.songs[i].id)
             if i == currentSongIndex {
                 currentSong.guideVoice = voice
                 updatedCurrent = true
@@ -1712,8 +1730,10 @@ extension MultitrackAudioEngine {
         }
         if currentSong.usesDefaultGuideVoice && currentSong.guideVoice != voice {
             currentSong.guideVoice = voice
+            songAnnouncementCache.removeValue(forKey: currentSong.id)
             updatedCurrent = true
         }
+        warmSongAnnouncementsForActiveWindow()
         if updatedCurrent {
             markSessionChanged()
             regenerateGuideTrack()
@@ -1728,16 +1748,273 @@ extension MultitrackAudioEngine {
         }
         currentSong.guideVoice = defaultVoice
         currentSong.usesDefaultGuideVoice = true
+        songAnnouncementCache.removeAll()
+        warmSongAnnouncementsForActiveWindow()
         markSessionChanged()
         regenerateGuideTrack()
     }
     
+    public func effectiveUploadedOverlayVoice(for song: Song) -> GuideVoice {
+        if song.guideFallbackVoice.isVoiceClone {
+            if let clonePackId = song.guideFallbackVoice.clonedPackId {
+                return clonePackId.caseInsensitiveCompare("rita") == .orderedSame
+                    ? .rita
+                    : .custom(packId: clonePackId)
+            } else if song.guideVoice.isCustom || song.guideVoice == .rita {
+                return song.guideVoice
+            } else {
+                return CustomSampleLibraryManager.shared.defaultGuideVoice
+            }
+        } else {
+            return .rita
+        }
+    }
+
     public func setGuideFallbackVoice(_ voice: GuideVoice) {
+        let matchesDefault = (voice == CustomSampleLibraryManager.shared.defaultGuideFallbackVoice)
         currentSong.guideFallbackVoice = voice
+        currentSong.usesDefaultGuideFallback = matchesDefault
         if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {
             currentSetlist.songs[currentSongIndex].guideFallbackVoice = voice
+            currentSetlist.songs[currentSongIndex].usesDefaultGuideFallback = matchesDefault
         }
-        regenerateGuideTrack()
+        markSessionChanged()
+        songAnnouncementCache.removeValue(forKey: currentSong.id)
+        warmSongAnnouncementsForActiveWindow()
+        if currentSong.guideSource == .uploaded {
+            applyGuideBuffer()
+        } else {
+            regenerateGuideTrack()
+        }
+    }
+
+    public func useDefaultGuideFallbackForCurrentSong() {
+        let defaultVoice = CustomSampleLibraryManager.shared.defaultGuideFallbackVoice
+        currentSong.guideFallbackVoice = defaultVoice
+        currentSong.usesDefaultGuideFallback = true
+        if currentSongIndex >= 0 && currentSongIndex < currentSetlist.songs.count {
+            currentSetlist.songs[currentSongIndex].guideFallbackVoice = defaultVoice
+            currentSetlist.songs[currentSongIndex].usesDefaultGuideFallback = true
+        }
+        markSessionChanged()
+        songAnnouncementCache.removeValue(forKey: currentSong.id)
+        warmSongAnnouncementsForActiveWindow()
+        if currentSong.guideSource == .uploaded {
+            applyGuideBuffer()
+        } else {
+            regenerateGuideTrack()
+        }
+    }
+
+    public func setDefaultGuideFallbackVoice(_ voice: GuideVoice, syncDefaultSongs: Bool = true) {
+        CustomSampleLibraryManager.shared.defaultGuideFallbackVoice = voice
+        if syncDefaultSongs {
+            var updatedCurrent = false
+            for i in currentSetlist.songs.indices where currentSetlist.songs[i].usesDefaultGuideFallback {
+                currentSetlist.songs[i].guideFallbackVoice = voice
+                let sid = currentSetlist.songs[i].id
+                songAnnouncementCache.removeValue(forKey: sid)
+                if i == currentSongIndex || sid == currentSong.id {
+                    currentSong.guideFallbackVoice = voice
+                    updatedCurrent = true
+                } else {
+                    generatedGuideBuffers.removeValue(forKey: sid)
+                    generatedGuideLoopStates.removeValue(forKey: sid)
+                }
+            }
+            if currentSong.usesDefaultGuideFallback && currentSong.guideFallbackVoice != voice {
+                currentSong.guideFallbackVoice = voice
+                songAnnouncementCache.removeValue(forKey: currentSong.id)
+                updatedCurrent = true
+            }
+            warmSongAnnouncementsForActiveWindow()
+            if updatedCurrent {
+                markSessionChanged()
+                guideAudioGenerator.clearSpeechCache()
+                if currentSong.guideSource == .uploaded {
+                    applyGuideBuffer()
+                } else {
+                    regenerateGuideTrack()
+                }
+            }
+        } else {
+            songAnnouncementCache.removeAll()
+            warmSongAnnouncementsForActiveWindow()
+        }
+        objectWillChange.send()
+    }
+
+    public func applyDefaultGuideFallbackToAllSongs() {
+        let defaultVoice = CustomSampleLibraryManager.shared.defaultGuideFallbackVoice
+        for i in currentSetlist.songs.indices {
+            currentSetlist.songs[i].guideFallbackVoice = defaultVoice
+            currentSetlist.songs[i].usesDefaultGuideFallback = true
+            let sid = currentSetlist.songs[i].id
+            songAnnouncementCache.removeValue(forKey: sid)
+            if i != currentSongIndex && sid != currentSong.id {
+                generatedGuideBuffers.removeValue(forKey: sid)
+                generatedGuideLoopStates.removeValue(forKey: sid)
+            }
+        }
+        currentSong.guideFallbackVoice = defaultVoice
+        currentSong.usesDefaultGuideFallback = true
+        warmSongAnnouncementsForActiveWindow()
+        markSessionChanged()
+        guideAudioGenerator.clearSpeechCache()
+        if currentSong.guideSource == .uploaded {
+            applyGuideBuffer()
+        } else {
+            regenerateGuideTrack()
+        }
+        objectWillChange.send()
+    }
+
+    public func setDefaultSystemFallbackVoice(_ voice: GuideVoice) {
+        CustomSampleLibraryManager.shared.defaultSystemFallbackVoice = voice
+        if !CustomSampleLibraryManager.shared.defaultGuideFallbackVoice.isVoiceClone {
+            setDefaultGuideFallbackVoice(voice, syncDefaultSongs: true)
+            return
+        }
+        if !VoiceCloneModelManager.isSharedModelReady {
+            guideAudioGenerator.clearSpeechCache()
+            for i in currentSetlist.songs.indices where currentSetlist.songs[i].guideFallbackVoice.isVoiceClone {
+                let sid = currentSetlist.songs[i].id
+                if sid != currentSong.id {
+                    generatedGuideBuffers.removeValue(forKey: sid)
+                    generatedGuideLoopStates.removeValue(forKey: sid)
+                }
+            }
+            if currentSong.guideFallbackVoice.isVoiceClone {
+                if currentSong.guideSource == .uploaded {
+                    applyGuideBuffer()
+                } else {
+                    regenerateGuideTrack()
+                }
+            }
+        }
+        objectWillChange.send()
+    }
+
+    public var defaultFallbackSyncedSongCount: Int {
+        guard !currentSetlist.songs.isEmpty else {
+            return currentSong.usesDefaultGuideFallback ? 1 : 0
+        }
+        return currentSetlist.songs.filter(\.usesDefaultGuideFallback).count
+    }
+
+    public var overriddenFallbackSongCount: Int {
+        guard !currentSetlist.songs.isEmpty else {
+            return currentSong.usesDefaultGuideFallback ? 0 : 1
+        }
+        return currentSetlist.songs.filter { !$0.usesDefaultGuideFallback }.count
+    }
+
+    public func currentSongFallbackPhrases() -> [String] {
+        let activeDirCues = currentSong.directionalCues.filter { !isDirectionalCueTrimmedOut($0) }
+        return guideAudioGenerator.fallbackPhrases(
+            sections: currentSong.sections,
+            directionalCues: activeDirCues,
+            primaryVoice: currentSong.guideVoice,
+            guideSource: currentSong.guideSource,
+            speakDirectionalCuesOnUploadedGuide: currentSong.speakDirectionalCuesOnUploadedGuide,
+            uploadedOverlayVoice: effectiveUploadedOverlayVoice(for: currentSong),
+            fallbackVoice: currentSong.guideFallbackVoice
+        )
+    }
+
+    public func previewGuideFallbackPhrase(
+        _ phrase: String = "Drop to Piano",
+        onPhaseChange: @escaping @MainActor (GuideFallbackPreviewPhase) -> Void
+    ) {
+        let cleanPhrase = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanPhrase.isEmpty else { return }
+
+        guidePreviewGeneration &+= 1
+        let gen = guidePreviewGeneration
+        CustomSampleLibraryManager.shared.stopPreview()
+
+        let song = currentSong
+        let primaryForResolve = (song.guideSource == .uploaded)
+            ? effectiveUploadedOverlayVoice(for: song)
+            : song.guideVoice
+        let fallbackVoice = song.guideFallbackVoice
+        let willTryAI = VoiceCloneModelManager.isPlatformSupported
+            && VoiceCloneModelManager.isSharedModelReady
+            && fallbackVoice.isVoiceClone
+            && (guideAudioGenerator.resolveCloneTargetPackId(primaryVoice: primaryForResolve, fallbackVoice: fallbackVoice) != nil)
+
+        onPhaseChange(.preparing(phrase: cleanPhrase, isAIClone: willTryAI))
+
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { () -> (url: URL, usedAIClone: Bool, voiceName: String, duration: TimeInterval)? in
+                guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000.0, channels: 1, interleaved: false),
+                      let resolved = GuideAudioGenerator.shared.resolveFallbackPreviewPhrase(
+                          cleanPhrase,
+                          primaryVoice: primaryForResolve,
+                          fallbackVoice: fallbackVoice,
+                          targetFormat: format
+                      )
+                else { return nil }
+
+                let previewURL = FileManager.default.temporaryDirectory.appendingPathComponent("pb_guide_preview.wav")
+                let buffer = resolved.data.buffer
+                let settings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: buffer.format.sampleRate,
+                    AVNumberOfChannelsKey: Int(buffer.format.channelCount),
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsNonInterleaved: false
+                ]
+                try? FileManager.default.removeItem(at: previewURL)
+                do {
+                    let outFile = try AVAudioFile(
+                        forWriting: previewURL,
+                        settings: settings,
+                        commonFormat: .pcmFormatFloat32,
+                        interleaved: false
+                    )
+                    try outFile.write(from: buffer)
+                } catch {
+                    return nil
+                }
+                let duration = Double(buffer.frameLength) / max(1.0, buffer.format.sampleRate)
+                return (previewURL, resolved.usedAIClone, resolved.voiceDisplayName, duration)
+            }.value
+
+            guard self.guidePreviewGeneration == gen else { return }
+            guard let result else {
+                onPhaseChange(.idle)
+                return
+            }
+
+            CustomSampleLibraryManager.shared.previewAudioFile(at: result.url)
+            onPhaseChange(.playing(phrase: cleanPhrase, isAIClone: result.usedAIClone, voiceName: result.voiceName))
+
+            let waitNs = UInt64(max(1.4, result.duration + 0.25) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: waitNs)
+            guard self.guidePreviewGeneration == gen else { return }
+            onPhaseChange(.idle)
+        }
+    }
+
+    public func handleVoiceCloneModelOrPhraseUpdated() {
+        let hasAnyAnnouncement = currentSong.announceSongEnabled || currentSetlist.songs.contains(where: { $0.announceSongEnabled })
+        if hasAnyAnnouncement {
+            songAnnouncementCache.removeAll()
+            warmSongAnnouncementsForActiveWindow()
+            syncMixState()
+        }
+        guard currentSong.guideFallbackVoice.isVoiceClone else { return }
+        guideAudioGenerator.clearSpeechCache()
+        generatedGuideBuffers.removeAll()
+        generatedGuideLoopStates.removeAll()
+        if currentSong.guideSource == .uploaded {
+            applyGuideBuffer()
+        } else {
+            regenerateGuideTrack()
+        }
     }
     
     public func setClickSubdivisions(accent: Bool, quarter: Bool, eighth: Bool, sixteenth: Bool) {

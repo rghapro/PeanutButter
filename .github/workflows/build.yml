@@ -14,7 +14,7 @@ jobs:
       - name: Show Swift version
         run: swift --version
       - name: Run unit tests
-        run: swift test
+        run: swift test --no-parallel
       - name: Build release (arm64 + x86_64)
         run: |
           swift build -c release --arch arm64
