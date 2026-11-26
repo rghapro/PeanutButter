@@ -32,14 +32,14 @@ Every feature ships unlocked under the GNU General Public License v3.0 (`GPL-3.0
 
 ### Your Own Stems, Pads, Click Sounds, and Guide Voices
 PeanutButter does not lock your audio library into a closed store.
-- Load `.wav`, `.m4a`, `.mp3`, `.aiff`, or `.flac` stems from any source. `Auto-Sort Stems` and role detection organize stems into your mix buses automatically.
+- Load `.wav`, `.m4a`, `.mp3`, `.aiff`, or `.flac` stems from any source, or use **Import Song From Folder...** (and main-window drag-and-drop) to load stems, default cover artwork, and parsed title, key, and BPM from a folder automatically. `Auto-Sort Stems` and role detection organize stems into your mix buses automatically.
 - The app ships with two stock 12-key pads (`Simple` and `Soft`) and lets you import any 12-key custom pad folder. Imported pads are RMS loudness-normalized so switching pad packs keeps stage volume consistent.
 - Seven synthesized click engines (*Classic*, *Woodblock*, *Beep / Synth*, *Sticks / Rimshot*, *Cowbell*, *Shaker*, *Tambourine*) are built in, or you can upload your own Accent, 1/4, 1/8, and 1/16 samples.
 - Seven bundled human guide voice packs (**Sam**, **Caleb**, **Claire**, **Daniel**, **Hannah**, **Marcus**, and **Maya**) are included. You can upload your own recorded voice packs, enable optional **Local AI Voice Cloning** (on-device CoreML LuxTTS on Apple Silicon, ~348 MB download) so custom cues and announcements speak in your active guide voice, and keep macOS system/Siri TTS as backup.
 
 ### Faster-Than-Real-Time Rehearsal and Practice Tracks
 Skip recording real-time reference tracks in an external DAW.
-- Export an entire setlist run-through as MP3, M4A, or WAV in seconds, with independent Include Click Track and Include Guide Track toggles and automatic 5-second gaps after manual-stop songs.
+- Export an entire setlist run-through as MP3 (built-in native `libmp3lame` 256 kbps, no external `lame` or `ffmpeg` install required), M4A, or WAV in seconds, with independent Include Click Track and Include Guide Track toggles and automatic 5-second gaps after manual-stop songs.
 - Batch-export part-dominant practice mixes (`[Song] - [Instrument] - Key of [Key]`) for Electric Guitars (All), Bass, Drums, Acoustic, Piano, and Vocals. Click/Guide and the player's instrument stay at `0 dB`, core instruments sit at `-10 dB`, and background beds sit at `-20 dB`.
 
 ### Wireless Stage Remote (`PeanutButter Remote`)
@@ -52,7 +52,7 @@ Turn on the built-in local Wi-Fi server (`_peanutbutter._tcp` via Bonjour, with 
 Use the built-in 4-step **Import from Playback...** wizard to read your local MultiTracks Playback database and migrate setlists, saved arrangements, section trims, keys, tempos, mixes, MIDI cues, ProPresenter triggers, and automation. The importer matches your unprotected `.wav` or `.m4a` stem folders on disk. Encrypted `.pmt` store stems are never decrypted or imported.
 
 ### Performance and Reliability
-- On-device Rubber Band R3 processing pre-renders key and BPM changes to a disk cache so vocals sound natural and sets stay dropout-free.
+- On-device Rubber Band R3 processing pre-renders key and BPM changes to a disk cache, and mastering-quality offline sample rate conversion (`44.1` through `192 kHz`) keeps mixed-rate stems, guides, pads, and exports phase-clean and beat-locked.
 - Your active setlist loads into RAM for zero-latency song switching, with automatic macOS memory-pressure safeguards on lower-RAM Macs.
 - `CADisplayLink` metering and GPU-cached waveforms keep scrolling and live fader drags smooth.
 
@@ -114,6 +114,7 @@ swift build -c release
 
 - Bundled royalty-free 12-key pads (`Simple`, `Soft`), 7 human guide voice packs, and 7 synthesized click engines work out of the box. Third-party commercial samples are excluded via `.gitignore`.
 - **Rubber Band Library (`Sources/CRubberBand`):** Used for pitch shifting and time stretching under GPLv2+ (`Sources/CRubberBand/vendor/COPYING`).
+- **LAME (`Sources/CLame`, [LAME-COPYING](ThirdPartyLicenses/LAME-COPYING)):** Embedded LGPL-2.0+ MP3 encoder for native zero-dependency 256 kbps MP3 export.
 - **LuxTTS CoreML & English G2P (`Sources/PeanutButter/Engine/VoiceClone`, [LuxTTS-LICENSE.md](ThirdPartyLicenses/LuxTTS-LICENSE.md)):** Optional on-device Apple Silicon voice cloning downloads the compiled CoreML model bundle on demand without bundling large weights inside the app.
 
 ---

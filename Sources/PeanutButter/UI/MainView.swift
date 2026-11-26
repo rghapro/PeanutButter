@@ -27,6 +27,7 @@ public struct MainView: View {
     @State private var isPlaybackImportWizardPresented: Bool = false
     @State private var isCreatingNewSongInBuilder: Bool = false
     @State private var previousSongIndexBeforeNewSong: Int? = nil
+    @State private var pendingFolderImportForBuilder: SongFolderScanResult? = nil
     @State private var isBussesDrawerPresented: Bool = false
     @State private var isFileImporterPresented: Bool = false
     @State private var statusMessage: String?
@@ -454,11 +455,14 @@ public struct MainView: View {
                 isPlaybackImportWizardPresented = false
             }
         }
-        .sheet(isPresented: $isSongBuilderPresented) {
+        .sheet(isPresented: $isSongBuilderPresented, onDismiss: {
+            pendingFolderImportForBuilder = nil
+        }) {
             SongBuilderView(
                 engine: engine,
                 isCreatingNewSong: isCreatingNewSongInBuilder,
-                previousSongIndex: previousSongIndexBeforeNewSong
+                previousSongIndex: previousSongIndexBeforeNewSong,
+                initialImportFolder: pendingFolderImportForBuilder
             )
         }
         .sheet(isPresented: $isBussesDrawerPresented) {
@@ -2357,6 +2361,7 @@ public struct MainView: View {
                 }
                 isCreatingNewSongInBuilder = false
                 previousSongIndexBeforeNewSong = nil
+                pendingFolderImportForBuilder = nil
                 isSongBuilderPresented = true
             }
         )
@@ -2463,9 +2468,13 @@ public struct MainView: View {
                         onImportFromFinder: {
                             importSongDialog()
                         },
+                        onImportFromFolder: {
+                            importSongFromFolderDialog()
+                        },
                         onBuildNewSong: {
                             previousSongIndexBeforeNewSong = engine.beginBuildingNewSong()
                             isCreatingNewSongInBuilder = true
+                            pendingFolderImportForBuilder = nil
                             isSongBuilderPresented = true
                         },
                         onDismiss: {
@@ -2913,7 +2922,7 @@ public struct MainView: View {
         panel.message = "Choose a Song Package (.pbsong or .multitrack)"
         panel.prompt = "Import Song"
         
-        if panel.runModal() == .OK, let url = panel.url {
+                if panel.runModal() == .OK, let url = panel.url {
             do {
                 try engine.importSongPackage(from: url)
                 showStatus("Imported song: \(url.deletingPathExtension().lastPathComponent)")
@@ -2921,6 +2930,32 @@ public struct MainView: View {
                 showStatus("Import error: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func importSongFromFolderDialog() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = false
+        panel.message = "Choose a folder containing audio stems (and optional cover artwork)"
+        panel.prompt = "Import Folder"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            beginImportingSongFolder(at: url)
+        }
+    }
+
+    private func beginImportingSongFolder(at folderURL: URL) {
+        let scan = SongFolderImporter.scan(folderURL: folderURL)
+        guard !scan.audioURLs.isEmpty else {
+            showStatus("No supported audio stems found in \(folderURL.lastPathComponent)")
+            return
+        }
+        previousSongIndexBeforeNewSong = engine.beginBuildingNewSong()
+        isCreatingNewSongInBuilder = true
+        pendingFolderImportForBuilder = scan
+        isSongBuilderPresented = true
     }
     
     // MARK: - Album Art Stylers
@@ -3070,6 +3105,7 @@ public struct MainView: View {
                     }
                     return nil
                 case "e":
+                    pendingFolderImportForBuilder = nil
                     isSongBuilderPresented = true
                     return nil
                 case "b":
@@ -3144,8 +3180,12 @@ public struct MainView: View {
     }
     
     private func handleDroppedURL(_ url: URL) {
-        guard url.startAccessingSecurityScopedResource() else { return }
-        defer { url.stopAccessingSecurityScopedResource() }
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessed {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
         
         let ext = url.pathExtension.lowercased()
         do {
@@ -3155,7 +3195,9 @@ public struct MainView: View {
             } else if ext == "pbsession" {
                 try engine.loadSession(from: url)
                 showStatus("Loaded session: \(url.deletingPathExtension().lastPathComponent)")
-            } else if ["wav", "mp3", "m4a", "aif", "aiff"].contains(ext) {
+            } else if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                beginImportingSongFolder(at: url)
+            } else if ["wav", "mp3", "m4a", "aif", "aiff", "flac"].contains(ext) {
                 handleImportedFiles(.success([url]))
             } else {
                 showStatus("Unsupported file type: .\(ext)")

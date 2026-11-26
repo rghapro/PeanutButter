@@ -31,9 +31,25 @@ let package = Package(
                 .linkedFramework("Accelerate")
             ]
         ),
+        .target(
+            name: "CLame",
+            path: "Sources/CLame",
+            exclude: [
+                "COPYING"
+            ],
+            sources: [
+                "src"
+            ],
+            publicHeadersPath: "include",
+            cSettings: [
+                .headerSearchPath("src"),
+                .headerSearchPath("include"),
+                .define("HAVE_CONFIG_H", to: "1")
+            ]
+        ),
         .executableTarget(
             name: "PeanutButter",
-            dependencies: ["CRubberBand"],
+            dependencies: ["CRubberBand", "CLame"],
             path: "Sources/PeanutButter",
             resources: [
                 .copy("Resources")

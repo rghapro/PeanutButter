@@ -1219,34 +1219,8 @@ public final class MultitrackAudioEngine: ObservableObject {
             return stereoBuffer
         }
         
-        // Step 3: resample cleanly with AVAudioConverter
-        guard let converter = AVAudioConverter(from: stereoBuffer.format, to: targetFormat) else {
-            return stereoBuffer
-        }
-        
-        let ratio = targetFormat.sampleRate / stereoBuffer.format.sampleRate
-        let targetCapacity = AVAudioFrameCount(Double(stereoBuffer.frameLength) * ratio) + 2048
-        guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: targetCapacity) else {
-            return stereoBuffer
-        }
-        
-        var error: NSError?
-        var isDone = false
-        let status = converter.convert(to: converted, error: &error) { _, outStatus in
-            if isDone {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-            isDone = true
-            outStatus.pointee = .haveData
-            return stereoBuffer
-        }
-        
-        if status != .error && error == nil && converted.frameLength > 0 {
-            return converted
-        } else {
-            return stereoBuffer
-        }
+        // Step 3: resample cleanly with MasteringAudioResampler
+        return MasteringAudioResampler.convertBuffer(stereoBuffer, to: targetFormat) ?? stereoBuffer
     }
     
     /// Loads an audio file from disk into a stem track, converting it into a sample-accurate RAM buffer

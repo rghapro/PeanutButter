@@ -680,36 +680,9 @@ public final class LuxTtsCoreEngine: @unchecked Sendable {
     private func resampleTo24k(samples: [Float], fromRate: Double) throws -> [Float] {
         let targetRate = Double(LuxTtsConstants.melSampleRate)
         if abs(fromRate - targetRate) < 1.0 { return samples }
-        guard let srcFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: fromRate, channels: 1, interleaved: false),
-              let dstFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: targetRate, channels: 1, interleaved: false),
-              let srcBuf = AVAudioPCMBuffer(pcmFormat: srcFmt, frameCapacity: AVAudioFrameCount(samples.count)),
-              let converter = AVAudioConverter(from: srcFmt, to: dstFmt)
-        else {
-            throw LuxTtsError.inferenceFailed(stage: "continuation resample", underlying: "converter setup failed")
+        guard let resampled = MasteringAudioResampler.resampleMonoFloat(samples, fromRate: fromRate, toRate: targetRate) else {
+            throw LuxTtsError.inferenceFailed(stage: "continuation resample", underlying: "conversion failed")
         }
-        srcBuf.frameLength = AVAudioFrameCount(samples.count)
-        _ = samples.withUnsafeBufferPointer { sPtr in
-            memcpy(srcBuf.floatChannelData![0], sPtr.baseAddress!, samples.count * MemoryLayout<Float>.size)
-        }
-        let cap = AVAudioFrameCount(Double(samples.count) * (targetRate / fromRate)) + 1024
-        guard let dstBuf = AVAudioPCMBuffer(pcmFormat: dstFmt, frameCapacity: cap) else {
-            throw LuxTtsError.inferenceFailed(stage: "continuation resample", underlying: "buffer alloc failed")
-        }
-        nonisolated(unsafe) let srcRef = srcBuf
-        nonisolated(unsafe) var done = false
-        var err: NSError?
-        let status = converter.convert(to: dstBuf, error: &err) { _, outStatus in
-            if done {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-            done = true
-            outStatus.pointee = .haveData
-            return srcRef
-        }
-        guard status != .error, err == nil, dstBuf.frameLength > 0, let ch0 = dstBuf.floatChannelData?[0] else {
-            throw LuxTtsError.inferenceFailed(stage: "continuation resample", underlying: err?.localizedDescription ?? "conversion failed")
-        }
-        return Array(UnsafeBufferPointer(start: ch0, count: Int(dstBuf.frameLength)))
+        return resampled
     }
 }

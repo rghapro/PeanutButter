@@ -9,6 +9,7 @@ public struct AddSongMenuPopoverView: View {
     @ObservedObject private var padManager = PadLibraryManager.shared
 
     let onImportFromFinder: () -> Void
+    let onImportFromFolder: () -> Void
     let onBuildNewSong: () -> Void
     let onDismiss: () -> Void
 
@@ -72,11 +73,13 @@ public struct AddSongMenuPopoverView: View {
     public init(
         engine: MultitrackAudioEngine,
         onImportFromFinder: @escaping () -> Void,
+        onImportFromFolder: @escaping () -> Void = {},
         onBuildNewSong: @escaping () -> Void,
         onDismiss: @escaping () -> Void
     ) {
         self.engine = engine
         self.onImportFromFinder = onImportFromFinder
+        self.onImportFromFolder = onImportFromFolder
         self.onBuildNewSong = onBuildNewSong
         self.onDismiss = onDismiss
 
@@ -109,6 +112,7 @@ public struct AddSongMenuPopoverView: View {
                 SongLibraryBrowserView(
                     engine: engine,
                     onImportFromFinder: onImportFromFinder,
+                    onImportFromFolder: onImportFromFolder,
                     onBuildNewSong: onBuildNewSong,
                     onDismiss: onDismiss,
                     onBack: {
@@ -187,6 +191,13 @@ public struct AddSongMenuPopoverView: View {
                     rootMenuRow(title: "Build Song From Stems") {
                         onDismiss()
                         onBuildNewSong()
+                    }
+
+                    rowDivider
+
+                    rootMenuRow(title: "Import Song From Folder...") {
+                        onDismiss()
+                        onImportFromFolder()
                     }
 
                     rowDivider

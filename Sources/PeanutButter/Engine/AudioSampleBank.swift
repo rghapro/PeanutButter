@@ -781,25 +781,7 @@ public final class AudioSampleBank: @unchecked Sendable {
         }
         
         // Format Conversion
-        guard let converter = AVAudioConverter(from: srcFormat, to: targetFormat) else { return nil }
-        let ratio = targetFormat.sampleRate / srcFormat.sampleRate
-        let targetFrames = AVAudioFrameCount(Double(frameCount) * ratio + 100)
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: targetFrames) else { return nil }
-        
-        var error: NSError?
-        var hasProvided = false
-        converter.convert(to: outBuffer, error: &error) { _, outStatus in
-            if !hasProvided {
-                hasProvided = true
-                outStatus.pointee = .haveData
-                return srcBuffer
-            } else {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-        }
-        
-        guard error == nil, outBuffer.frameLength > 0 else { return nil }
+        guard let outBuffer = MasteringAudioResampler.convertBuffer(srcBuffer, to: targetFormat) else { return nil }
         
         lock.lock()
         bufferCache[cacheKey] = outBuffer

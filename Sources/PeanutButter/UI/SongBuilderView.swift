@@ -8,6 +8,7 @@ public struct SongBuilderView: View {
     @ObservedObject var libraryManager = LibraryBrowserManager.shared
     let isCreatingNewSong: Bool
     let previousSongIndex: Int?
+    let initialImportFolder: SongFolderScanResult?
     
     // Local editable song state
     @State private var songTitle: String
@@ -23,6 +24,8 @@ public struct SongBuilderView: View {
     @State private var confirmedTempoGridBanner: String? = nil
     @State private var isImportingStems: Bool = false
     @State private var importProgressText: String = ""
+    @State private var didRunInitialFolderImport: Bool = false
+    @State private var folderImportError: String? = nil
     @FocusState private var isBPMFieldFocused: Bool
     
     // Tap tempo helper
@@ -36,25 +39,35 @@ public struct SongBuilderView: View {
     @State private var customSectionName: String = ""
     @State private var newSectionMeasures: Int = 8
     
-    private let availableKeys = [
+    private static let availableKeys = [
         "C", "C#", "Db", "D", "Eb", "E", "F", "F#", "Gb", "G", "Ab", "A", "Bb", "B",
         "Cm", "C#m", "Dm", "Ebm", "Em", "Fm", "F#m", "Gm", "Abm", "Am", "Bbm", "Bm"
     ]
     
-    public init(engine: MultitrackAudioEngine, isCreatingNewSong: Bool = false, previousSongIndex: Int? = nil) {
+    public init(
+        engine: MultitrackAudioEngine,
+        isCreatingNewSong: Bool = false,
+        previousSongIndex: Int? = nil,
+        initialImportFolder: SongFolderScanResult? = nil
+    ) {
         self.engine = engine
         self.isCreatingNewSong = isCreatingNewSong
         self.previousSongIndex = previousSongIndex
+        self.initialImportFolder = initialImportFolder
         let s = engine.currentSong
-        self._songTitle = State(initialValue: s.title)
+        let trimmedTitle = s.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        self._songTitle = State(initialValue: trimmedTitle.isEmpty ? (initialImportFolder?.inferredTitle ?? s.title) : s.title)
         self._artist = State(initialValue: s.artist)
-        self._bpm = State(initialValue: s.bpm)
-        self._bpmText = State(initialValue: Self.formatBPM(s.bpm))
-        self._musicalKey = State(initialValue: s.musicalKey == "—" ? "C" : s.musicalKey)
+        let initialBPM = (isCreatingNewSong ? initialImportFolder?.inferredBPM : nil) ?? s.bpm
+        self._bpm = State(initialValue: initialBPM)
+        self._bpmText = State(initialValue: Self.formatBPM(initialBPM))
+        let baseKey = s.musicalKey == "—" ? "C" : s.musicalKey
+        let initialKey = (isCreatingNewSong ? initialImportFolder?.inferredKey : nil).flatMap { Self.availableKeys.contains($0) ? $0 : nil } ?? baseKey
+        self._musicalKey = State(initialValue: initialKey)
         self._timeSigNum = State(initialValue: s.timeSignatureNumerator)
         self._timeSigDen = State(initialValue: s.timeSignatureDenominator)
         self._sections = State(initialValue: s.sections)
-        self._artworkData = State(initialValue: s.artworkData)
+        self._artworkData = State(initialValue: s.artworkData ?? initialImportFolder?.artworkData)
     }
 
     private static func formatBPM(_ val: Double) -> String {
@@ -95,6 +108,20 @@ public struct SongBuilderView: View {
         }
         .frame(width: 720, height: 615)
         .background(Color(white: 0.08))
+        .onAppear {
+            if !didRunInitialFolderImport,
+               let folder = initialImportFolder,
+               !folder.audioURLs.isEmpty {
+                didRunInitialFolderImport = true
+                importAudioStems(
+                    from: folder.audioURLs,
+                    inferredTitle: folder.inferredTitle,
+                    inferredKey: folder.inferredKey,
+                    inferredBPM: folder.inferredBPM,
+                    defaultArtworkData: folder.artworkData
+                )
+            }
+        }
         .fileImporter(
             isPresented: $isAudioPickerPresented,
             allowedContentTypes: [.audio],
@@ -102,32 +129,94 @@ public struct SongBuilderView: View {
         ) { result in
             do {
                 let urls = try result.get()
-                guard !urls.isEmpty else { return }
-                if songTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   let firstURL = urls.first {
-                    let folderName = firstURL.deletingLastPathComponent().lastPathComponent
-                    let genericNames: Set<String> = ["stems", "multitracks", "audio", "tracks", "files", "downloads", "desktop", "documents"]
-                    if !folderName.isEmpty && !genericNames.contains(folderName.lowercased()) {
-                        songTitle = folderName
-                    }
-                }
-                isImportingStems = true
-                importProgressText = "Importing \(urls.count) \(urls.count == 1 ? "stem" : "stems")..."
-                Task { @MainActor in
-                    await engine.addTracksConcurrentlyAsync(from: urls) { done, total in
-                        importProgressText = "Importing stems (\(done)/\(total))..."
-                    }
-                    engine.ensureClickAndGuideTracksExist()
-                    engine.autoSortTracks()
-                    engine.recalculateAggregateWaveform(samplesCount: 4000)
-                    engine.updateMatrix()
-                    isImportingStems = false
-                    importProgressText = ""
-                }
+                importAudioStems(from: urls)
             } catch {
                 isImportingStems = false
                 importProgressText = ""
                 print("Failed to import audio: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func importAudioStems(
+        from urls: [URL],
+        inferredTitle: String? = nil,
+        inferredKey: String? = nil,
+        inferredBPM: Double? = nil,
+        defaultArtworkData: Data? = nil
+    ) {
+        guard !urls.isEmpty else { return }
+        folderImportError = nil
+        let fallbackMeta = urls.first.map { SongFolderImporter.parseMetadata(from: $0.deletingLastPathComponent()) }
+        if songTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let inferredTitle, !inferredTitle.isEmpty {
+                songTitle = inferredTitle
+            } else if let parsedTitle = fallbackMeta?.title, !parsedTitle.isEmpty {
+                songTitle = parsedTitle
+            }
+        }
+        if artworkData == nil {
+            if let defaultArtworkData {
+                artworkData = defaultArtworkData
+            } else if let firstURL = urls.first,
+                      let found = SongFolderImporter.findDefaultArtwork(in: firstURL.deletingLastPathComponent()) {
+                artworkData = found.data
+            }
+        }
+        let hadNoTracksBeforeImport = engine.tracks.isEmpty
+        var appliedInferredGrid = false
+        if isCreatingNewSong || hadNoTracksBeforeImport {
+            if let resolvedKey = inferredKey ?? fallbackMeta?.musicalKey,
+               Self.availableKeys.contains(resolvedKey) {
+                musicalKey = resolvedKey
+                appliedInferredGrid = true
+            }
+            if let resolvedBPM = inferredBPM ?? fallbackMeta?.bpm {
+                bpm = resolvedBPM
+                bpmText = Self.formatBPM(resolvedBPM)
+                appliedInferredGrid = true
+            }
+        }
+        isImportingStems = true
+        importProgressText = "Importing \(urls.count) \(urls.count == 1 ? "stem" : "stems")..."
+        Task { @MainActor in
+            await engine.addTracksConcurrentlyAsync(from: urls) { done, total in
+                importProgressText = "Importing stems (\(done)/\(total))..."
+            }
+            engine.ensureClickAndGuideTracksExist()
+            engine.autoSortTracks()
+            engine.recalculateAggregateWaveform(samplesCount: 4000)
+            engine.updateMatrix()
+            if (isCreatingNewSong || hadNoTracksBeforeImport) && appliedInferredGrid {
+                confirmTempoAndUpdateGrid(showFeedback: false)
+            }
+            isImportingStems = false
+            importProgressText = ""
+        }
+    }
+
+    private func importFromFolderDialog() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = false
+        panel.message = "Choose a folder containing audio stems (and optional cover artwork)"
+        panel.prompt = "Import Folder"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            let scan = SongFolderImporter.scan(folderURL: url)
+            if scan.audioURLs.isEmpty {
+                folderImportError = "No supported audio stems found in \(url.lastPathComponent)"
+            } else {
+                folderImportError = nil
+                importAudioStems(
+                    from: scan.audioURLs,
+                    inferredTitle: scan.inferredTitle,
+                    inferredKey: scan.inferredKey,
+                    inferredBPM: scan.inferredBPM,
+                    defaultArtworkData: scan.artworkData
+                )
             }
         }
     }
@@ -293,7 +382,7 @@ public struct SongBuilderView: View {
                             .foregroundColor(Color(white: 0.5))
                         
                         Picker("", selection: $musicalKey) {
-                            ForEach(availableKeys, id: \.self) { key in
+                            ForEach(Self.availableKeys, id: \.self) { key in
                                 Text(key).tag(key)
                             }
                         }
@@ -555,7 +644,7 @@ public struct SongBuilderView: View {
                     }
                 }
                 
-                HStack {
+                HStack(spacing: 14) {
                     Button(action: { isAudioPickerPresented = true }) {
                         HStack(spacing: 4) {
                             Image(systemName: "plus.circle.fill")
@@ -563,6 +652,18 @@ public struct SongBuilderView: View {
                         }
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(isImportingStems ? Color.blue.opacity(0.45) : .blue)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isImportingStems)
+                    .padding(.top, 4)
+
+                    Button(action: importFromFolderDialog) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "folder.badge.plus")
+                            Text("Import From Folder...")
+                        }
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(isImportingStems ? Color.cyan.opacity(0.45) : .cyan)
                     }
                     .buttonStyle(.plain)
                     .disabled(isImportingStems)
@@ -576,11 +677,18 @@ public struct SongBuilderView: View {
                                 .font(.system(size: 11, weight: .semibold))
                                 .foregroundColor(Color(red: 0.35, green: 0.78, blue: 1.0))
                         }
-                        .padding(.leading, 12)
+                        .padding(.leading, 8)
                         .padding(.top, 4)
                     }
                     
                     Spacer()
+                }
+
+                if let folderImportError {
+                    Text(folderImportError)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundColor(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .padding(8)

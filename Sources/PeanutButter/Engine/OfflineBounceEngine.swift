@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Accelerate
+import CLame
 
 public enum PracticeInstrument: String, CaseIterable, Identifiable, Sendable {
     case electricGuitars = "Electric Guitars (All)"
@@ -765,19 +766,7 @@ public final class OfflineBounceEngine {
                 AVEncoderBitRateKey: 256_000
             ]
         case .mp3:
-            let tempWAV = fm.temporaryDirectory.appendingPathComponent("pb_mp3_src_\(UUID().uuidString).wav")
-            defer { try? fm.removeItem(at: tempWAV) }
-            let wavSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: sampleRate,
-                AVNumberOfChannelsKey: 2,
-                AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsFloatKey: false,
-                AVLinearPCMIsBigEndianKey: false
-            ]
-            let wavFile = try AVAudioFile(forWriting: tempWAV, settings: wavSettings, commonFormat: .pcmFormatFloat32, interleaved: false)
-            try wavFile.write(from: pcmBuffer)
-            try encodeWAVToMP3(wavURL: tempWAV, mp3URL: url)
+            try encodeStereoFloatToMP3(left: left, right: right, sampleRate: sampleRate, to: url)
             return
         }
 
@@ -785,60 +774,130 @@ public final class OfflineBounceEngine {
         try audioFile.write(from: pcmBuffer)
     }
 
-    private static func encodeWAVToMP3(wavURL: URL, mp3URL: URL) throws {
-        let fm = FileManager.default
-        let lamePaths = ["/opt/homebrew/bin/lame", "/usr/local/bin/lame"]
-        let ffmpegPaths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-
-        let process = Process()
-        let errPipe = Pipe()
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = errPipe
-
-        if let lamePath = lamePaths.first(where: { fm.isExecutableFile(atPath: $0) }) {
-            process.executableURL = URL(fileURLWithPath: lamePath)
-            process.arguments = ["-b", "256", "--quiet", wavURL.path, mp3URL.path]
-        } else if let ffmpegPath = ffmpegPaths.first(where: { fm.isExecutableFile(atPath: $0) }) {
-            process.executableURL = URL(fileURLWithPath: ffmpegPath)
-            process.arguments = ["-nostdin", "-nostats", "-loglevel", "error", "-y", "-i", wavURL.path, "-codec:a", "libmp3lame", "-b:a", "256k", mp3URL.path]
-        } else {
+    static func encodeStereoFloatToMP3(
+        left: [Float],
+        right: [Float],
+        sampleRate: Double,
+        to mp3URL: URL
+    ) throws {
+        guard left.count == right.count, !left.isEmpty else {
             throw NSError(
                 domain: "OfflineBounceEngine",
                 code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "MP3 export requires 'lame' or 'ffmpeg' (e.g. brew install lame). Use M4A or WAV otherwise."]
+                userInfo: [NSLocalizedDescriptionKey: "Invalid audio buffer for MP3 export."]
             )
         }
 
-        let errHolder = LockedDataBox()
-        let readGroup = DispatchGroup()
-        readGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            let data = errPipe.fileHandleForReading.readDataToEndOfFile()
-            errHolder.set(data)
-            readGroup.leave()
-        }
-
-        try process.run()
-        process.waitUntilExit()
-        readGroup.wait()
-
-        if process.terminationStatus != 0 {
-            let errText = String(data: errHolder.get(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let detail = errText.isEmpty ? "" : " (\(errText))"
+        guard let gfp = lame_init() else {
             throw NSError(
                 domain: "OfflineBounceEngine",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "MP3 encoder exited with status \(process.terminationStatus)\(detail)."]
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to initialize LAME MP3 encoder."]
             )
         }
-    }
+        defer { lame_close(gfp) }
 
-    private final class LockedDataBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var data = Data()
-        func set(_ d: Data) { lock.lock(); data = d; lock.unlock() }
-        func get() -> Data { lock.lock(); defer { lock.unlock() }; return data }
+        let targetSR = MasteringAudioResampler.targetMP3SampleRate(for: sampleRate)
+        let encodeLeft: [Float]
+        let encodeRight: [Float]
+        if abs(targetSR - sampleRate) > 0.5 {
+            guard let resampled = MasteringAudioResampler.resampleStereoFloat(
+                left: left,
+                right: right,
+                fromRate: sampleRate,
+                toRate: targetSR
+            ) else {
+                throw NSError(
+                    domain: "OfflineBounceEngine",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to resample audio from \(Int(sampleRate)) Hz to \(Int(targetSR)) Hz for MP3 export."]
+                )
+            }
+            encodeLeft = resampled.left
+            encodeRight = resampled.right
+        } else {
+            encodeLeft = left
+            encodeRight = right
+        }
+
+        let srInt = Int32(targetSR.rounded())
+        lame_set_in_samplerate(gfp, srInt)
+        lame_set_out_samplerate(gfp, srInt)
+        lame_set_num_channels(gfp, 2)
+        lame_set_mode(gfp, JOINT_STEREO)
+        lame_set_brate(gfp, 256)
+        lame_set_quality(gfp, 2)
+        lame_set_bWriteVbrTag(gfp, 0)
+
+        guard lame_init_params(gfp) >= 0 else {
+            throw NSError(
+                domain: "OfflineBounceEngine",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to configure LAME MP3 encoder parameters."]
+            )
+        }
+
+        let totalSamples = encodeLeft.count
+        let chunkSize = 16_384
+        var leftChunk = [Float](repeating: 0, count: chunkSize)
+        var rightChunk = [Float](repeating: 0, count: chunkSize)
+        var mp3Chunk = [UInt8](repeating: 0, count: 32_768)
+        var mp3Data = Data()
+        mp3Data.reserveCapacity(max(8_192, totalSamples / 6))
+
+        var offset = 0
+        while offset < totalSamples {
+            let count = min(chunkSize, totalSamples - offset)
+            for i in 0..<count {
+                let l = encodeLeft[offset + i]
+                let r = encodeRight[offset + i]
+                leftChunk[i] = l.isFinite ? max(-1.0, min(1.0, l)) : 0
+                rightChunk[i] = r.isFinite ? max(-1.0, min(1.0, r)) : 0
+            }
+
+            let bytesWritten: Int32 = leftChunk.withUnsafeMutableBufferPointer { lPtr in
+                rightChunk.withUnsafeMutableBufferPointer { rPtr in
+                    mp3Chunk.withUnsafeMutableBufferPointer { outPtr in
+                        lame_encode_buffer_ieee_float(
+                            gfp,
+                            lPtr.baseAddress,
+                            rPtr.baseAddress,
+                            Int32(count),
+                            outPtr.baseAddress,
+                            Int32(outPtr.count)
+                        )
+                    }
+                }
+            }
+
+            if bytesWritten < 0 {
+                throw NSError(
+                    domain: "OfflineBounceEngine",
+                    code: Int(bytesWritten),
+                    userInfo: [NSLocalizedDescriptionKey: "LAME MP3 encoder failed with code \(bytesWritten)."]
+                )
+            }
+            if bytesWritten > 0 {
+                mp3Data.append(contentsOf: mp3Chunk[0..<Int(bytesWritten)])
+            }
+            offset += count
+        }
+
+        let flushedBytes: Int32 = mp3Chunk.withUnsafeMutableBufferPointer { outPtr in
+            lame_encode_flush(gfp, outPtr.baseAddress, Int32(outPtr.count))
+        }
+        if flushedBytes < 0 {
+            throw NSError(
+                domain: "OfflineBounceEngine",
+                code: Int(flushedBytes),
+                userInfo: [NSLocalizedDescriptionKey: "LAME MP3 flush failed with code \(flushedBytes)."]
+            )
+        }
+        if flushedBytes > 0 {
+            mp3Data.append(contentsOf: mp3Chunk[0..<Int(flushedBytes)])
+        }
+
+        try mp3Data.write(to: mp3URL, options: .atomic)
     }
 
     private static func sanitizeFileComponent(_ name: String) -> String {

@@ -777,37 +777,7 @@ public final class VoiceCloneService: @unchecked Sendable {
     }
 
     private func resampleMonoFloat(_ samples: [Float], fromRate: Double, toRate: Double) -> [Float] {
-        guard !samples.isEmpty else { return [] }
-        if abs(fromRate - toRate) < 1.0 { return samples }
-        guard let srcFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: fromRate, channels: 1, interleaved: false),
-              let dstFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: toRate, channels: 1, interleaved: false),
-              let srcBuf = AVAudioPCMBuffer(pcmFormat: srcFmt, frameCapacity: AVAudioFrameCount(samples.count)),
-              let converter = AVAudioConverter(from: srcFmt, to: dstFmt)
-        else { return samples }
-
-        srcBuf.frameLength = AVAudioFrameCount(samples.count)
-        _ = samples.withUnsafeBufferPointer { sPtr in
-            memcpy(srcBuf.floatChannelData![0], sPtr.baseAddress!, samples.count * MemoryLayout<Float>.size)
-        }
-        let cap = AVAudioFrameCount(Double(samples.count) * (toRate / fromRate)) + 1024
-        guard let dstBuf = AVAudioPCMBuffer(pcmFormat: dstFmt, frameCapacity: cap) else { return samples }
-
-        nonisolated(unsafe) let srcRef = srcBuf
-        nonisolated(unsafe) var done = false
-        var err: NSError?
-        let status = converter.convert(to: dstBuf, error: &err) { _, outStatus in
-            if done {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-            done = true
-            outStatus.pointee = .haveData
-            return srcRef
-        }
-        guard status != .error, err == nil, dstBuf.frameLength > 0, let ch0 = dstBuf.floatChannelData?[0] else {
-            return samples
-        }
-        return Array(UnsafeBufferPointer(start: ch0, count: Int(dstBuf.frameLength)))
+        MasteringAudioResampler.resampleMonoFloat(samples, fromRate: fromRate, toRate: toRate) ?? samples
     }
 
     private func trimSilence(

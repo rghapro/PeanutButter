@@ -10,6 +10,7 @@ public struct SongLibraryBrowserView: View {
     @ObservedObject private var library = LibraryBrowserManager.shared
 
     let onImportFromFinder: () -> Void
+    let onImportFromFolder: () -> Void
     let onBuildNewSong: () -> Void
     let onDismiss: () -> Void
     let onBack: (() -> Void)?
@@ -27,12 +28,14 @@ public struct SongLibraryBrowserView: View {
     public init(
         engine: MultitrackAudioEngine,
         onImportFromFinder: @escaping () -> Void,
+        onImportFromFolder: @escaping () -> Void = {},
         onBuildNewSong: @escaping () -> Void,
         onDismiss: @escaping () -> Void,
         onBack: (() -> Void)? = nil
     ) {
         self.engine = engine
         self.onImportFromFinder = onImportFromFinder
+        self.onImportFromFolder = onImportFromFolder
         self.onBuildNewSong = onBuildNewSong
         self.onDismiss = onDismiss
         self.onBack = onBack
@@ -465,6 +468,13 @@ public struct SongLibraryBrowserView: View {
                 onBuildNewSong()
             }) {
                 Label("Build from Stems", systemImage: "waveform.badge.plus")
+            }
+
+            Button(action: {
+                onDismiss()
+                onImportFromFolder()
+            }) {
+                Label("Import Song From Folder...", systemImage: "folder.badge.plus")
             }
 
             Button(action: {

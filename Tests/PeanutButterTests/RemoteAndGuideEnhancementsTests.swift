@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import AVFoundation
+import AppKit
 @testable import PeanutButter
 
 @Suite("Remote, Pad Lock & Custom Guide Labeling Tests", .serialized)
@@ -3209,5 +3210,293 @@ struct RemoteAndGuideEnhancementsTests {
 
             _ = songA.id
         }
+    }
+
+    @Test
+    func songFolderImporterScansStemsAndDefaultsArtwork() throws {
+        let fm = FileManager.default
+        let rootDir = fm.temporaryDirectory.appendingPathComponent("pb_folder_import_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: rootDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: rootDir) }
+
+        func makeValidPNGData(color: NSColor) throws -> Data {
+            let rep = try #require(NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: 8,
+                pixelsHigh: 8,
+                bitsPerSample: 8,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bytesPerRow: 0,
+                bitsPerPixel: 0
+            ))
+            NSGraphicsContext.saveGraphicsState()
+            if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
+                NSGraphicsContext.current = ctx
+                color.setFill()
+                NSRect(x: 0, y: 0, width: 8, height: 8).fill()
+            }
+            NSGraphicsContext.restoreGraphicsState()
+            return try #require(rep.representation(using: .png, properties: [:]))
+        }
+
+        let validPNG = try makeValidPNGData(color: .systemBlue)
+        let secondaryPNG = try makeValidPNGData(color: .systemGreen)
+
+        // 1. Folder with nested stems, __MACOSX / ._ noise, corrupt album.jpg, valid cover.png, and valid random.png
+        let songDir = rootDir.appendingPathComponent("Holy Forever", isDirectory: true)
+        let nestedStems = songDir.appendingPathComponent("Stems", isDirectory: true)
+        let macosxDir = songDir.appendingPathComponent("__MACOSX", isDirectory: true)
+        try fm.createDirectory(at: nestedStems, withIntermediateDirectories: true)
+        try fm.createDirectory(at: macosxDir, withIntermediateDirectories: true)
+
+        try Data([0x00, 0x01]).write(to: songDir.appendingPathComponent("Drums.wav"))
+        try Data([0x00, 0x01]).write(to: songDir.appendingPathComponent("Bass.m4a"))
+        try Data([0x00, 0x01]).write(to: nestedStems.appendingPathComponent("Keys.mp3"))
+        try Data([0x00, 0x01]).write(to: songDir.appendingPathComponent("._Drums.wav"))
+        try Data([0x00, 0x01]).write(to: macosxDir.appendingPathComponent("Drums.wav"))
+
+        try Data("not-an-image".utf8).write(to: songDir.appendingPathComponent("album.jpg"))
+        try validPNG.write(to: songDir.appendingPathComponent("cover.png"))
+        try secondaryPNG.write(to: songDir.appendingPathComponent("random.png"))
+
+        let scan = SongFolderImporter.scan(folderURL: songDir)
+        #expect(scan.inferredTitle == "Holy Forever")
+        #expect(scan.audioURLs.map(\.lastPathComponent) == ["Bass.m4a", "Drums.wav", "Keys.mp3"])
+        #expect(scan.artworkURL?.lastPathComponent == "cover.png")
+        #expect(scan.artworkData != nil)
+        if let artData = scan.artworkData {
+            #expect(NSImage(data: artData) != nil)
+        }
+
+        // 2. Folder with only a non-cover-named image still defaults to it
+        let photoOnlyDir = rootDir.appendingPathComponent("Praise", isDirectory: true)
+        try fm.createDirectory(at: photoOnlyDir, withIntermediateDirectories: true)
+        try Data([0x00, 0x01]).write(to: photoOnlyDir.appendingPathComponent("Click.wav"))
+        try secondaryPNG.write(to: photoOnlyDir.appendingPathComponent("photo.png"))
+
+        let photoScan = SongFolderImporter.scan(folderURL: photoOnlyDir)
+        #expect(photoScan.inferredTitle == "Praise")
+        #expect(photoScan.audioURLs.map(\.lastPathComponent) == ["Click.wav"])
+        #expect(photoScan.artworkURL?.lastPathComponent == "photo.png")
+        #expect(photoScan.artworkData != nil)
+
+        // 3. Generic folder names fall back to parent title, and findDefaultArtwork ignores Downloads
+        let parentSongDir = rootDir.appendingPathComponent("Goodness of God", isDirectory: true)
+        let genericStemsDir = parentSongDir.appendingPathComponent("Stems", isDirectory: true)
+        try fm.createDirectory(at: genericStemsDir, withIntermediateDirectories: true)
+        #expect(SongFolderImporter.inferSongTitle(from: genericStemsDir) == "Goodness of God")
+
+        let downloadsDir = rootDir.appendingPathComponent("Downloads", isDirectory: true)
+        try fm.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
+        try validPNG.write(to: downloadsDir.appendingPathComponent("cover.png"))
+        #expect(SongFolderImporter.findDefaultArtwork(in: downloadsDir) == nil)
+    }
+
+    @Test
+    func songFolderImporterParsesTitleKeyAndTempoFromFolderNames() throws {
+        let gratitude = SongFolderImporter.parseMetadata(fromFolderName: "Gratitude-House of Miracles-B-78.00bpm")
+        #expect(gratitude.title == "Gratitude")
+        #expect(gratitude.musicalKey == "B")
+        #expect(gratitude.bpm == 78.0)
+
+        let holyForever = SongFolderImporter.parseMetadata(fromFolderName: "Holy Forever - Chris Tomlin - Bb - 72 BPM")
+        #expect(holyForever.title == "Holy Forever")
+        #expect(holyForever.musicalKey == "Bb")
+        #expect(holyForever.bpm == 72.0)
+
+        let goodness = SongFolderImporter.parseMetadata(fromFolderName: "Goodness of God - Eb - 63bpm")
+        #expect(goodness.title == "Goodness of God")
+        #expect(goodness.musicalKey == "Eb")
+        #expect(goodness.bpm == 63.0)
+
+        let wayMaker = SongFolderImporter.parseMetadata(fromFolderName: "Way Maker - C#m - 68")
+        #expect(wayMaker.title == "Way Maker")
+        #expect(wayMaker.musicalKey == "C#m")
+        #expect(wayMaker.bpm == 68.0)
+
+        let amazingGrace = SongFolderImporter.parseMetadata(fromFolderName: "This Is Amazing Grace_F#_98.5bpm")
+        #expect(amazingGrace.title == "This Is Amazing Grace")
+        #expect(amazingGrace.musicalKey == "F#")
+        #expect(amazingGrace.bpm == 98.5)
+
+        let oceans = SongFolderImporter.parseMetadata(fromFolderName: "Oceans | D# | 66 BPM")
+        #expect(oceans.title == "Oceans")
+        #expect(oceans.musicalKey == "Eb")
+        #expect(oceans.bpm == 66.0)
+
+        let graves = SongFolderImporter.parseMetadata(fromFolderName: "Graves Into Gardens (Live) - Elevation Worship - B - 70.00 BPM - 6-8")
+        #expect(graves.title == "Graves Into Gardens (Live)")
+        #expect(graves.musicalKey == "B")
+        #expect(graves.bpm == 70.0)
+
+        let tenThousand = SongFolderImporter.parseMetadata(fromFolderName: "10,000 Reasons")
+        #expect(tenThousand.title == "10,000 Reasons")
+        #expect(tenThousand.musicalKey == nil)
+        #expect(tenThousand.bpm == nil)
+
+        let thousand = SongFolderImporter.parseMetadata(fromFolderName: "A Thousand Hallelujahs")
+        #expect(thousand.title == "A Thousand Hallelujahs")
+        #expect(thousand.musicalKey == nil)
+        #expect(thousand.bpm == nil)
+
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("pb_gratitude_scan_\(UUID().uuidString)", isDirectory: true)
+        let gratitudeDir = tempDir.appendingPathComponent("Gratitude-House of Miracles-B-78.00bpm", isDirectory: true)
+        try fm.createDirectory(at: gratitudeDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+        try Data([0x00, 0x01]).write(to: gratitudeDir.appendingPathComponent("Drums.wav"))
+
+        let scan = SongFolderImporter.scan(folderURL: gratitudeDir)
+        #expect(scan.inferredTitle == "Gratitude")
+        #expect(scan.inferredKey == "B")
+        #expect(scan.inferredBPM == 78.0)
+    }
+
+    @Test
+    func offlineBounceExportsValidMP3NativelyWithEmbeddedLame() throws {
+        let fm = FileManager.default
+        let mp3URL = fm.temporaryDirectory.appendingPathComponent("pb_native_lame_\(UUID().uuidString).mp3")
+        defer { try? fm.removeItem(at: mp3URL) }
+
+        let sampleRate = 48_000.0
+        let count = Int(sampleRate * 1.0)
+        let phaseStep = 2.0 * Float.pi * 440.0 / Float(sampleRate)
+        let left = (0..<count).map { Float(0.25) * sin(phaseStep * Float($0)) }
+        let right = (0..<count).map { Float(0.25) * cos(phaseStep * Float($0)) }
+
+        try OfflineBounceEngine.encodeStereoFloatToMP3(
+            left: left,
+            right: right,
+            sampleRate: sampleRate,
+            to: mp3URL
+        )
+
+        let attrs = try fm.attributesOfItem(atPath: mp3URL.path)
+        let fileSize = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        #expect(fileSize > 4_000)
+
+        let decodedFile = try AVAudioFile(forReading: mp3URL)
+        #expect(decodedFile.processingFormat.channelCount == 2)
+        let decodedFrames = AVAudioFrameCount(decodedFile.length)
+        let dur = Double(decodedFrames) / decodedFile.processingFormat.sampleRate
+        #expect(dur >= 0.8 && dur <= 1.5)
+
+        let buf = try #require(AVAudioPCMBuffer(pcmFormat: decodedFile.processingFormat, frameCapacity: decodedFrames))
+        try decodedFile.read(into: buf)
+        let ch0 = try #require(buf.floatChannelData?[0])
+        var sumSq: Double = 0
+        for i in 0..<Int(buf.frameLength) {
+            let s = Double(ch0[i])
+            sumSq += s * s
+        }
+        let rms = sqrt(sumSq / Double(max(1, Int(buf.frameLength))))
+        #expect(rms >= 0.05)
+    }
+
+    @Test
+    func masteringResamplerPreservesDurationLevelAndTimingAcrossSampleRates() throws {
+        let ratePairs: [(from: Double, to: Double)] = [
+            (44_100, 48_000),
+            (48_000, 44_100),
+            (44_100, 88_200),
+            (48_000, 96_000),
+            (48_000, 192_000),
+            (96_000, 48_000),
+            (96_000, 44_100),
+            (192_000, 48_000)
+        ]
+
+        for pair in ratePairs {
+            let srcCount = Int(round(0.5 * pair.from))
+            let onsetIdx = Int(round(0.100 * pair.from))
+            let endIdx = Int(round(0.400 * pair.from))
+            let phaseStep = 2.0 * Float.pi * 1000.0 / Float(pair.from)
+
+            var left = [Float](repeating: 0, count: srcCount)
+            var right = [Float](repeating: 0, count: srcCount)
+            for i in onsetIdx..<endIdx {
+                let s = Float(0.4) * sin(phaseStep * Float(i - onsetIdx))
+                left[i] = s
+                right[i] = -s
+            }
+
+            let res = try #require(
+                MasteringAudioResampler.resampleStereoFloat(
+                    left: left,
+                    right: right,
+                    fromRate: pair.from,
+                    toRate: pair.to
+                )
+            )
+            #expect(res.left.count == res.right.count)
+
+            let outDur = Double(res.left.count) / pair.to
+            #expect(abs(outDur - 0.5) <= 0.025)
+
+            let midStart = Int(round(0.15 * pair.to))
+            let midEnd = min(res.left.count, Int(round(0.35 * pair.to)))
+            var sumSq: Double = 0
+            for i in midStart..<midEnd {
+                let v = Double(res.left[i])
+                sumSq += v * v
+            }
+            let rms = sqrt(sumSq / Double(max(1, midEnd - midStart)))
+            #expect(rms >= 0.24 && rms <= 0.33)
+
+            if let firstHit = res.left.firstIndex(where: { abs($0) > 0.05 }) {
+                let onsetSec = Double(firstHit) / pair.to
+                #expect(abs(onsetSec - 0.100) <= 0.003)
+            } else {
+                Issue.record("No onset detected for \(pair.from) -> \(pair.to)")
+            }
+        }
+    }
+
+    @Test
+    func offlineBounceMP3ExportHandles96kHzAnd176kHzSources() throws {
+        #expect(MasteringAudioResampler.targetMP3SampleRate(for: 44_100) == 44_100)
+        #expect(MasteringAudioResampler.targetMP3SampleRate(for: 48_000) == 48_000)
+        #expect(MasteringAudioResampler.targetMP3SampleRate(for: 88_200) == 44_100)
+        #expect(MasteringAudioResampler.targetMP3SampleRate(for: 176_400) == 44_100)
+        #expect(MasteringAudioResampler.targetMP3SampleRate(for: 96_000) == 48_000)
+        #expect(MasteringAudioResampler.targetMP3SampleRate(for: 192_000) == 48_000)
+
+        let fm = FileManager.default
+        let mp3URL = fm.temporaryDirectory.appendingPathComponent("pb_96k_lame_\(UUID().uuidString).mp3")
+        defer { try? fm.removeItem(at: mp3URL) }
+
+        let sampleRate = 96_000.0
+        let count = Int(sampleRate * 1.0)
+        let phaseStep = 2.0 * Float.pi * 440.0 / Float(sampleRate)
+        let left = (0..<count).map { Float(0.25) * sin(phaseStep * Float($0)) }
+        let right = (0..<count).map { Float(0.25) * cos(phaseStep * Float($0)) }
+
+        try OfflineBounceEngine.encodeStereoFloatToMP3(
+            left: left,
+            right: right,
+            sampleRate: sampleRate,
+            to: mp3URL
+        )
+
+        let decodedFile = try AVAudioFile(forReading: mp3URL)
+        #expect(decodedFile.processingFormat.sampleRate == 48_000.0)
+        #expect(decodedFile.processingFormat.channelCount == 2)
+        let decodedFrames = AVAudioFrameCount(decodedFile.length)
+        let dur = Double(decodedFrames) / decodedFile.processingFormat.sampleRate
+        #expect(dur >= 0.90 && dur <= 1.15)
+
+        let buf = try #require(AVAudioPCMBuffer(pcmFormat: decodedFile.processingFormat, frameCapacity: decodedFrames))
+        try decodedFile.read(into: buf)
+        let ch0 = try #require(buf.floatChannelData?[0])
+        var sumSq: Double = 0
+        for i in 0..<Int(buf.frameLength) {
+            let s = Double(ch0[i])
+            sumSq += s * s
+        }
+        let rms = sqrt(sumSq / Double(max(1, Int(buf.frameLength))))
+        #expect(rms >= 0.05)
     }
 }

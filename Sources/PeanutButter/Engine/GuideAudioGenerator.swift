@@ -792,24 +792,8 @@ public final class GuideAudioGenerator: @unchecked Sendable {
         let normalizedBuffer: AVAudioPCMBuffer
         if sourceBuffer.format == targetFormat {
             normalizedBuffer = sourceBuffer
-        } else if let converter = AVAudioConverter(from: sourceBuffer.format, to: targetFormat) {
-            let outCapacity = AVAudioFrameCount(Double(sourceBuffer.frameLength) * (targetFormat.sampleRate / sourceBuffer.format.sampleRate) + 2048)
-            guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else { return nil }
-            var error: NSError?
-            var isConsumed = false
-            converter.convert(to: converted, error: &error) { _, outStatus in
-                if !isConsumed {
-                    isConsumed = true
-                    outStatus.pointee = .haveData
-                    return sourceBuffer
-                } else {
-                    outStatus.pointee = .noDataNow
-                    return nil
-                }
-            }
-            normalizedBuffer = converted
         } else {
-            normalizedBuffer = sourceBuffer
+            normalizedBuffer = MasteringAudioResampler.convertBuffer(sourceBuffer, to: targetFormat) ?? sourceBuffer
         }
         
         // Auto-trim dead silence, compress mid-word syllable breaks, and calculate perceptual onset advance
